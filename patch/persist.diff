@@ -1,0 +1,22 @@
+--- a/src/agents/agent-runner.ts
++++ b/src/agents/agent-runner.ts
+@@ -395,9 +395,18 @@
+   );
+   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel;
+   const agentDir = getAgentDir();
++  // Don fork: persist each subagent's session (with parent lineage) into a
++  // dedicated subdir so usage/session scrapers can classify subagent runs.
++  // Falls back to in-memory when there is no parent session (e.g. `pi -p`),
++  // preserving upstream behavior. See docs/CUTOVER.md and patch/persist.diff.
++  const parent = ctx.sessionManager.getSessionFile();
++  const subagentDir = path.join(agentDir, "sessions-subagents");
++  const sessionManager = parent
++    ? SessionManager.create(cwd, subagentDir, { parentSession: parent })
++    : SessionManager.inMemory(cwd);
+   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
+     cwd, agentDir,
+-    sessionManager: SessionManager.inMemory(cwd),
++    sessionManager,
+     settingsManager: SettingsManager.create(cwd, agentDir),
+     modelRegistry: ctx.modelRegistry, model,
+     tools: getToolNamesForType(type), resourceLoader: loader,

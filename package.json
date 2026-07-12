@@ -1,0 +1,58 @@
+{
+  "name": "pi-subagents-lite",
+  "version": "1.4.6",
+  "description": "Lightweight sub-agents for pi — spawn specialized agents with isolated sessions, tools, and models.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-agent",
+    "pi-coding-agent",
+    "pi-extension",
+    "subagents",
+    "ai",
+    "agents"
+  ],
+  "author": "AlexParamonov",
+  "license": "MIT",
+  "packageManager": "bun@1",
+  "engines": {
+    "bun": ">=1.0.0",
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlexParamonov/pi-subagents-lite.git"
+  },
+  "homepage": "https://github.com/AlexParamonov/pi-subagents-lite#readme",
+  "bugs": {
+    "url": "https://github.com/AlexParamonov/pi-subagents-lite/issues"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^0.80.1",
+    "@earendil-works/pi-coding-agent": "^0.80.1",
+    "@earendil-works/pi-tui": "^0.80.1"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.80.1",
+    "@sinclair/typebox": "^0.34.49"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  }
+}

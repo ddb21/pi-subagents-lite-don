@@ -14,6 +14,7 @@ import {
   type AgentStatus,
   type CompactionInfo,
   type RunCallbacks,
+  type StopInitiator,
   SHORT_ID_LENGTH,
   type SpawnConfig,
   type ToolActivity,
@@ -72,6 +73,8 @@ export interface SpawnOptions extends SpawnConfig, RunCallbacks {
   isBackground?: boolean;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
+  /** Don fork: parent session captured when the spawn was requested. */
+  parentSessionFile?: string;
 }
 
 export class AgentManager {
@@ -267,7 +270,7 @@ export class AgentManager {
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
     if (options.signal) {
-      options.signal.addEventListener("abort", () => this.abort(id), { once: true });
+      options.signal.addEventListener("abort", () => this.abort(id, "agent"), { once: true });
     }
 
     const promise = runAgent(ctx, type, prompt, {
@@ -280,6 +283,7 @@ export class AgentManager {
       cwd: options.worktreePath,
       graceTurns: options.graceTurns,
       signal: record.execution.abortController!.signal,
+      parentSessionFile: options.parentSessionFile,
       ...this.createRecordCallbacks(record, options),
       onTurnEnd: (turnCount) => {
         record.stats.turnCount = turnCount;
@@ -456,7 +460,17 @@ export class AgentManager {
   }
 
   getRecord(id: string): AgentRecord | undefined {
-    return this.agents.get(id);
+    const exact = this.agents.get(id);
+    if (exact) return exact;
+
+    const matches = [...this.agents.values()].filter((record) => record.id.startsWith(id));
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw new Error(
+        `Agent ID ${id} is ambiguous. Candidates: ${matches.map((record) => record.id).join(", ")}`,
+      );
+    }
+    return undefined;
   }
 
   listAgents(): AgentRecord[] {
@@ -465,18 +479,18 @@ export class AgentManager {
     );
   }
 
-  abort(id: string): boolean {
+  abort(id: string, stoppedBy?: StopInitiator): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
 
-    return this.stopAgent(record);
+    return this.stopAgent(record, stoppedBy);
   }
 
   /**
    * Stop an agent by aborting its session or removing it from the queue.
    * Returns true if the agent was stopped, false if it wasn't running/queued.
    */
-  private stopAgent(record: AgentRecord): boolean {
+  private stopAgent(record: AgentRecord, stoppedBy?: StopInitiator): boolean {
     if (record.lifecycle.status === "queued") {
       this.queue = this.queue.filter(q => q.id !== record.id);
     } else if (record.lifecycle.status !== "running") {
@@ -485,6 +499,7 @@ export class AgentManager {
       record.execution.abortController?.abort();
     }
     record.lifecycle.status = "stopped";
+    record.lifecycle.stoppedBy = stoppedBy;
     record.lifecycle.completedAt = Date.now();
     return true;
   }
@@ -501,6 +516,10 @@ export class AgentManager {
     for (const [id, record] of this.agents) {
       if (!isTerminalStatus(record.lifecycle.status)) continue;
       if ((record.lifecycle.completedAt ?? 0) >= cutoff) continue;
+      // Keep the record until the LLM has read the result (foreground return or
+      // background nudge). Otherwise a completed background agent can be wiped
+      // before its nudge is emitted.
+      if (!record.lifecycle.resultConsumed) continue;
       this.removeRecord(id, record);
     }
   }

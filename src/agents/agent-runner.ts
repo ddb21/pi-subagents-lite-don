@@ -46,6 +46,8 @@ interface RunOptions extends RunTunables, RunCallbacks {
   cwd?: string;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
+  /** Don fork: parent session captured when the Agent tool was invoked. */
+  parentSessionFile?: string;
 }
 
 interface RunResult {
@@ -399,7 +401,7 @@ async function initSession(
   // dedicated subdir so usage/session scrapers can classify subagent runs.
   // Falls back to in-memory when there is no parent session (e.g. `pi -p`),
   // preserving upstream behavior. See docs/CUTOVER.md and patch/persist.diff.
-  const parent = ctx.sessionManager.getSessionFile();
+  const parent = options.parentSessionFile ?? ctx.sessionManager.getSessionFile();
   const subagentDir = path.join(agentDir, "sessions-subagents");
   const sessionManager = parent
     ? SessionManager.create(cwd, subagentDir, { parentSession: parent })
@@ -408,7 +410,7 @@ async function initSession(
     cwd, agentDir,
     sessionManager,
     settingsManager: SettingsManager.create(cwd, agentDir),
-    modelRegistry: ctx.modelRegistry, model,
+    model,
     tools: getToolNamesForType(type), resourceLoader: loader,
   };
   if (thinkingLevel) sessionOpts.thinkingLevel = thinkingLevel;

@@ -1,5 +1,11 @@
-import { getStatusNote } from "../status-note.js";
 import { getPiInstance, getSessionCtx, getWidget } from "../shell.js";
+import { SHORT_ID_LENGTH } from "../types.js";
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentRecord, SpawnConfig, ToolActivity } from "../types.js";
+import type { AgentManager, SpawnOptions } from "../agents/agent-manager.js";
+import { buildAgentDetails, formatResultContent } from "../agents/tool-execution.js";
+
 /**
  * spawn-coordinator.ts — Spawn-and-track coordination for subagents.
  *
@@ -10,11 +16,6 @@ import { getPiInstance, getSessionCtx, getWidget } from "../shell.js";
  * Decision refs: D3 (forward events to live-view), D4 (stats on record only),
  * D6 (Nudge owned here), D2 (peers with AgentManager).
  */
-
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentRecord, SpawnConfig, ToolActivity } from "../types.js";
-import type { AgentManager, SpawnOptions } from "../agents/agent-manager.js";
-import { buildAgentDetails } from "../agents/tool-execution.js";
 
 // ============================================================================
 // Types
@@ -33,6 +34,10 @@ export interface SpawnIntent extends SpawnConfig {
   runInBackground: boolean;
   /** Narrowed to required — all callers resolve this before spawn. */
   graceTurns: number;
+  /** Parent abort signal for foreground tool spawns. */
+  signal?: AbortSignal;
+  /** Don fork: parent session captured when the spawn was requested. */
+  parentSessionFile?: string;
 }
 
 export interface SpawnResult {
@@ -120,6 +125,10 @@ export class SpawnCoordinator {
     if (!intent.runInBackground) {
       // Foreground: await completion
       await record.execution.promise;
+
+      // Foreground tool handler reads the result inline on return — mark it
+      // consumed so the cleanup timer may evict the record once it ages out.
+      record.lifecycle.resultConsumed = true;
 
       // Clean up live view (foreground completion handled inline)
       this.liveViews.delete(agentId);
@@ -234,7 +243,7 @@ export class SpawnCoordinator {
       pi.sendMessage(
         {
           customType: "subagent-result",
-          content: `[Subagent "${record.display.type}" ${record.lifecycle.status}]\n\n${record.result ?? ""} ${getStatusNote(record.lifecycle.status)}`,
+          content: `[Subagent "${record.display.type}" ${record.id.slice(0, SHORT_ID_LENGTH)} ${record.lifecycle.status}]\n\n${formatResultContent(record)}`,
           details,
           display: true,
         },
@@ -243,6 +252,10 @@ export class SpawnCoordinator {
           triggerTurn: true,
         },
       );
+
+      // Full result delivered to the LLM — record is now safe for the cleanup
+      // timer to evict once it ages out.
+      record.lifecycle.resultConsumed = true;
     } catch (error) {
       // sendMessage failed (shared runtime overwritten by subagent bindCore).
       // Fall back to UI notification using the captured spawning-session context.

@@ -113,6 +113,21 @@ export async function executeAgentTool(
   // Don fork: capture lineage before a queued spawn can outlive this session.
   const parentSessionFile = ctx.sessionManager.getSessionFile();
 
+  // Don fork: named executors cannot combine resumable state with fork-style state.
+  const rawSessionKey = params.session_key as string | undefined;
+  const sessionKey = rawSessionKey;
+  if (rawSessionKey !== undefined) {
+    if (!sessionKey.trim()) return errorResult("session_key must be a non-empty string");
+    if (params.worktree_path !== undefined) {
+      return errorResult("session_key cannot be used with worktree_path");
+    }
+    const forkStyleParam = ["context", "fork", "fork_from", "parent_session", "parentSession"]
+      .find((name) => params[name] !== undefined);
+    if (forkStyleParam) {
+      return errorResult(`session_key cannot be used with ${forkStyleParam}`);
+    }
+  }
+
   // Validate worktree_path early — needed for on-demand agent discovery
   const rawWorktreePath = params.worktree_path as string | undefined;
   let validatedWorktreePath: string | undefined;
@@ -169,22 +184,30 @@ export async function executeAgentTool(
 
   // Use SpawnCoordinator for unified spawn path
   const coordinator = getCoordinator()!;
-  const result = await coordinator.spawn(getPiInstance(), ctx, {
-    type: resolvedType,
-    prompt,
-    description,
-    model,
-    modelKey,
-    maxTurns,
-    thinkingLevel,
-    graceTurns: getStore().agent.graceTurns,
-    worktreePath: validatedWorktreePath,
-    worktreeLabel,
-    invocation: { modelName },
-    ...(isBackground ? {} : { signal }),
-    parentSessionFile,
-    runInBackground: isBackground,
-  });
+  let result: Awaited<ReturnType<typeof coordinator.spawn>>;
+  try {
+    result = await coordinator.spawn(getPiInstance(), ctx, {
+      type: resolvedType,
+      prompt,
+      description,
+      model,
+      modelKey,
+      maxTurns,
+      thinkingLevel,
+      graceTurns: getStore().agent.graceTurns,
+      worktreePath: validatedWorktreePath,
+      worktreeLabel,
+      invocation: { modelName },
+      ...(isBackground ? {} : { signal }),
+      parentSessionFile,
+      // Don fork: scope named executors to the parent session's cwd.
+      ...(sessionKey ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd } : {}),
+      runInBackground: isBackground,
+    });
+  } catch (err: unknown) {
+    // Don fork: surface manager-level executor contention as a normal tool error.
+    return errorResult(err instanceof Error ? err.message : String(err));
+  }
 
   const { agentId, record } = result;
 

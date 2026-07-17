@@ -29,6 +29,11 @@ import { type EnvInfo, type RunCallbacks, type RunTunables, SHORT_ID_LENGTH } fr
 import type { SubagentType, SystemPromptMode } from "./types.js";
 import { getStore, enterSubagentSpawn, exitSubagentSpawn } from "../shell.js";
 import { DEFAULT_GRACE_TURNS, CUSTOM_PROMPT_PATH } from "../config/config-io.js";
+import {
+  getSubagentSessionDir,
+  recordSessionKey,
+  sanitizeDanglingToolCalls,
+} from "./persistent-executor.js";
 
 /** Normalize max turns. undefined or 0 = unlimited, otherwise minimum 1. */
 function normalizeMaxTurns(n: number | undefined): number | undefined {
@@ -48,6 +53,12 @@ interface RunOptions extends RunTunables, RunCallbacks {
   signal?: AbortSignal;
   /** Don fork: parent session captured when the Agent tool was invoked. */
   parentSessionFile?: string;
+  /** Don fork: optional named persistent executor session. */
+  sessionKey?: string;
+  /** Don fork: parent cwd component used to scope sessionKey. */
+  sessionKeyCwd?: string;
+  /** Don fork: existing keyed session file to reopen. */
+  resumeSessionFile?: string;
 }
 
 interface RunResult {
@@ -402,10 +413,22 @@ async function initSession(
   // Falls back to in-memory when there is no parent session (e.g. `pi -p`),
   // preserving upstream behavior. See docs/CUTOVER.md and patch/persist.diff.
   const parent = options.parentSessionFile ?? ctx.sessionManager.getSessionFile();
-  const subagentDir = path.join(agentDir, "sessions-subagents");
-  const sessionManager = parent
-    ? SessionManager.create(cwd, subagentDir, { parentSession: parent })
-    : SessionManager.inMemory(cwd);
+  const subagentDir = getSubagentSessionDir(agentDir);
+  // Don fork: a key forces persistence even when an in-memory parent has no lineage.
+  const sessionManager = options.resumeSessionFile
+    ? SessionManager.open(options.resumeSessionFile, subagentDir)
+    : (parent || options.sessionKey)
+      ? SessionManager.create(cwd, subagentDir, parent ? { parentSession: parent } : undefined)
+      : SessionManager.inMemory(cwd);
+  if (options.resumeSessionFile) {
+    // Don fork: pi loads/indexes existing entries but does not repair unfinished tool calls.
+    sanitizeDanglingToolCalls(sessionManager);
+  } else if (options.sessionKey) {
+    const sessionFile = sessionManager.getSessionFile();
+    if (!sessionFile) throw new Error("persistent executor session has no session file");
+    // Don fork: the SessionManager target is known before its first lazy file write.
+    recordSessionKey(agentDir, options.sessionKeyCwd ?? cwd, options.sessionKey, sessionFile);
+  }
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd, agentDir,
     sessionManager,

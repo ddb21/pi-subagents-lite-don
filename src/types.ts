@@ -140,6 +140,10 @@ export interface AgentDisplayInfo {
  */
 export interface AgentExecutionState {
   session?: AgentSession;
+  /** Don fork: resolved persistent executor session file, when known. */
+  sessionFile?: string;
+  /** Don fork: scoped session key reserved by this live record. */
+  sessionKey?: string;
   abortController?: AbortController;
   promise?: Promise<string>;
   /** Steering messages queued before the session was ready. */
@@ -171,5 +175,4 @@ export interface AgentAccumulatedStats {
   /** Last-known context usage percentage (0–100), captured at completion. */
   contextPercent?: number | null;
 }
-
 

@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { runAgent } from "./agent-runner.js";
 import { AgentOutputLog } from "./output-file.js";
 import { getStore } from "../shell.js";
@@ -22,6 +22,7 @@ import {
 import type { SubagentType } from "./types.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type AgentUsage } from "./usage.js";
 import { errorMessage } from "../utils.js";
+import { getSessionKeyIndexKey, resolveSessionKey } from "./persistent-executor.js";
 
 /** How often to check for expired agent records (milliseconds). */
 const CLEANUP_INTERVAL_MS = 60_000;
@@ -75,6 +76,12 @@ export interface SpawnOptions extends SpawnConfig, RunCallbacks {
   signal?: AbortSignal;
   /** Don fork: parent session captured when the spawn was requested. */
   parentSessionFile?: string;
+  /** Don fork: optional named persistent executor session. */
+  sessionKey?: string;
+  /** Don fork: parent cwd component used to scope sessionKey. */
+  sessionKeyCwd?: string;
+  /** Don fork: existing keyed session file to reopen, if its mapping resolves. */
+  resumeSessionFile?: string;
 }
 
 export class AgentManager {
@@ -191,6 +198,23 @@ export class AgentManager {
     prompt: string,
     options: SpawnOptions,
   ): string {
+    // Don fork: resolve and reserve keyed executor sessions before queuing so two
+    // live records can never write the same append-only JSONL file.
+    if (options.sessionKey) {
+      const sessionKeyCwd = options.sessionKeyCwd ?? ctx.cwd;
+      const sessionKeyId = getSessionKeyIndexKey(sessionKeyCwd, options.sessionKey);
+      const resumeSessionFile = resolveSessionKey(getAgentDir(), sessionKeyCwd, options.sessionKey);
+      const busyRecord = [...this.agents.values()].find((record) => {
+        if (record.lifecycle.status !== "queued" && record.lifecycle.status !== "running") return false;
+        return record.execution.sessionKey === sessionKeyId
+          || (!!resumeSessionFile && record.execution.sessionFile === resumeSessionFile);
+      });
+      if (busyRecord) {
+        throw new Error(`Executor '${options.sessionKey}' is busy (agent ${busyRecord.id.slice(0, SHORT_ID_LENGTH)}). Wait for it to finish.`);
+      }
+      options.resumeSessionFile = resumeSessionFile;
+    }
+
     const id = randomUUID().slice(0, AGENT_ID_PREFIX_LENGTH);
     const abortController = new AbortController();
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
@@ -223,6 +247,11 @@ export class AgentManager {
       },
       execution: {
         abortController,
+        // Don fork: reserve an uncreated key too, preventing same-key queue races.
+        ...(options.sessionKey ? {
+          sessionKey: getSessionKeyIndexKey(options.sessionKeyCwd ?? ctx.cwd, options.sessionKey),
+          sessionFile: options.resumeSessionFile,
+        } : {}),
       },
       stats: {
         lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
@@ -284,6 +313,9 @@ export class AgentManager {
       graceTurns: options.graceTurns,
       signal: record.execution.abortController!.signal,
       parentSessionFile: options.parentSessionFile,
+      sessionKey: options.sessionKey,
+      sessionKeyCwd: options.sessionKeyCwd,
+      resumeSessionFile: options.resumeSessionFile,
       ...this.createRecordCallbacks(record, options),
       onTurnEnd: (turnCount) => {
         record.stats.turnCount = turnCount;
@@ -292,6 +324,8 @@ export class AgentManager {
       onTextDelta: options.onTextDelta,
       onSessionCreated: (session) => {
         record.execution.session = session;
+        // Don fork: retain the opened/created path so busy checks are O(records).
+        record.execution.sessionFile = session.sessionManager.getSessionFile();
         // Flush any steers that arrived before the session was ready
         if (record.execution.pendingSteers?.length) {
           for (const msg of record.execution.pendingSteers) {

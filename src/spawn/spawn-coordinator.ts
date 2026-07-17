@@ -32,6 +32,10 @@ export interface SpawnIntent extends SpawnConfig {
   type: string;
   prompt: string;
   runInBackground: boolean;
+  /** Don fork: optional named persistent executor session. */
+  sessionKey?: string;
+  /** Don fork: parent cwd component used to scope sessionKey. */
+  sessionKeyCwd?: string;
   /** Narrowed to required — all callers resolve this before spawn. */
   graceTurns: number;
   /** Parent abort signal for foreground tool spawns. */

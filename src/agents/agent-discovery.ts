@@ -300,8 +300,9 @@ export async function scanAgentFilesInDir(
   }
 
   const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+  // Don fork: follow symlinks so agent files can be deployed via ln -s.
   const mdFiles = entries.filter(
-    (e) => e.isFile() && e.name.endsWith(".md"),
+    (e) => (e.isFile() || e.isSymbolicLink()) && e.name.endsWith(".md"),
   );
 
   const agents: AgentConfigFromMd[] = [];

@@ -117,7 +117,7 @@ export async function executeAgentTool(
   const rawSessionKey = params.session_key as string | undefined;
   const sessionKey = rawSessionKey;
   if (rawSessionKey !== undefined) {
-    if (!sessionKey.trim()) return errorResult("session_key must be a non-empty string");
+    if (!rawSessionKey.trim()) return errorResult("session_key must be a non-empty string");
     if (params.worktree_path !== undefined) {
       return errorResult("session_key cannot be used with worktree_path");
     }

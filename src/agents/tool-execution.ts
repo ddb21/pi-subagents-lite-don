@@ -88,6 +88,17 @@ export function buildAgentDetails(
   return details;
 }
 
+/**
+ * Result text plus status note, for display.
+ *
+ * Shared by the foreground tool result and the subagent-result nudge so both
+ * callers stay in sync on the nullish default and separator handling — they
+ * have diverged before. getStatusNote owns the leading separator.
+ */
+export function formatResultContent(record: AgentRecord): string {
+  return (record.result ?? "") + getStatusNote(record.lifecycle);
+}
+
 // ============================================================================
 // Tool execute handlers
 // ============================================================================
@@ -95,10 +106,28 @@ export function buildAgentDetails(
 export async function executeAgentTool(
   _toolCallId: string,
   params: Record<string, unknown>,
-  _signal: AbortSignal | undefined,
+  signal: AbortSignal | undefined,
   _onUpdate: ((update: any) => void) | undefined,
   ctx: ExtensionContext,
 ): Promise<any> {
+  // Don fork: capture lineage before a queued spawn can outlive this session.
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+
+  // Don fork: named executors cannot combine resumable state with fork-style state.
+  const rawSessionKey = params.session_key as string | undefined;
+  const sessionKey = rawSessionKey;
+  if (rawSessionKey !== undefined) {
+    if (!sessionKey.trim()) return errorResult("session_key must be a non-empty string");
+    if (params.worktree_path !== undefined) {
+      return errorResult("session_key cannot be used with worktree_path");
+    }
+    const forkStyleParam = ["context", "fork", "fork_from", "parent_session", "parentSession"]
+      .find((name) => params[name] !== undefined);
+    if (forkStyleParam) {
+      return errorResult(`session_key cannot be used with ${forkStyleParam}`);
+    }
+  }
+
   // Validate worktree_path early — needed for on-demand agent discovery
   const rawWorktreePath = params.worktree_path as string | undefined;
   let validatedWorktreePath: string | undefined;
@@ -139,6 +168,7 @@ export async function executeAgentTool(
   const prompt = params.prompt as string;
   const description = (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
   const runInBackground = params.run_in_background as boolean | undefined;
+  const isBackground = runInBackground || getStore().agent.forceBackground;
   const maxTurns = params.max_turns as number | undefined ?? getAgentConfig(resolvedType)?.maxTurns;
 
   const modelStr = params.model as string | undefined;
@@ -154,24 +184,34 @@ export async function executeAgentTool(
 
   // Use SpawnCoordinator for unified spawn path
   const coordinator = getCoordinator()!;
-  const result = await coordinator.spawn(getPiInstance(), ctx, {
-    type: resolvedType,
-    prompt,
-    description,
-    model,
-    modelKey,
-    maxTurns,
-    thinkingLevel,
-    graceTurns: getStore().agent.graceTurns,
-    worktreePath: validatedWorktreePath,
-    worktreeLabel,
-    invocation: { modelName },
-    runInBackground: runInBackground || getStore().agent.forceBackground,
-  });
+  let result: Awaited<ReturnType<typeof coordinator.spawn>>;
+  try {
+    result = await coordinator.spawn(getPiInstance(), ctx, {
+      type: resolvedType,
+      prompt,
+      description,
+      model,
+      modelKey,
+      maxTurns,
+      thinkingLevel,
+      graceTurns: getStore().agent.graceTurns,
+      worktreePath: validatedWorktreePath,
+      worktreeLabel,
+      invocation: { modelName },
+      ...(isBackground ? {} : { signal }),
+      parentSessionFile,
+      // Don fork: scope named executors to the parent session's cwd.
+      ...(sessionKey ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd } : {}),
+      runInBackground: isBackground,
+    });
+  } catch (err: unknown) {
+    // Don fork: surface manager-level executor contention as a normal tool error.
+    return errorResult(err instanceof Error ? err.message : String(err));
+  }
 
   const { agentId, record } = result;
 
-  if (runInBackground || getStore().agent.forceBackground) {
+  if (isBackground) {
     // Background: return immediately
     const suffix = `A notification will arrive when done - User asks you not to poll, check status or duplicate the delegated work.\n\nAgent ID: ${agentId}`;
     const label = record.lifecycle.status === "queued" ? "Agent queued" : "Agent running";
@@ -186,8 +226,7 @@ export async function executeAgentTool(
     return errorResult(`Agent failed: ${record.error || "unknown error"}`, details);
   }
 
-  const statusNote = getStatusNote(record.lifecycle.status);
-  return successResult((record.result ?? "") + statusNote, details);
+  return successResult(formatResultContent(record), details);
 }
 
 // ============================================================================
@@ -227,7 +266,13 @@ export async function executeStopAgentTool(
     return errorResult("agent_id is required");
   }
 
-  const record = getManager()!.getRecord(agentId);
+  let record: AgentRecord | undefined;
+  try {
+    record = getManager()!.getRecord(agentId);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return errorResult(message);
+  }
 
   if (!record) {
     // Agent not found → return error + list of running agents
@@ -244,7 +289,7 @@ export async function executeStopAgentTool(
   }
 
   // Attempt to stop the running/queued agent
-  if (getManager()!.abort(agentId)) {
+  if (getManager()!.abort(record.id, "agent")) {
     return successResult(`Stopped agent ${agentId.slice(0, SHORT_ID_LENGTH)}`);
   }
 

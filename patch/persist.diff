@@ -1,6 +1,15 @@
 --- a/src/agents/agent-runner.ts
 +++ b/src/agents/agent-runner.ts
-@@ -395,9 +395,18 @@
+@@ -46,6 +46,8 @@
+   cwd?: string;
+   /** Parent abort signal — when aborted, the subagent is also stopped. */
+   signal?: AbortSignal;
++  /** Don fork: parent session captured when the Agent tool was invoked. */
++  parentSessionFile?: string;
+ }
+ 
+ interface RunResult {
+@@ -395,9 +397,18 @@
    );
    const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel;
    const agentDir = getAgentDir();
@@ -8,7 +17,7 @@
 +  // dedicated subdir so usage/session scrapers can classify subagent runs.
 +  // Falls back to in-memory when there is no parent session (e.g. `pi -p`),
 +  // preserving upstream behavior. See docs/CUTOVER.md and patch/persist.diff.
-+  const parent = ctx.sessionManager.getSessionFile();
++  const parent = options.parentSessionFile ?? ctx.sessionManager.getSessionFile();
 +  const subagentDir = path.join(agentDir, "sessions-subagents");
 +  const sessionManager = parent
 +    ? SessionManager.create(cwd, subagentDir, { parentSession: parent })
@@ -18,5 +27,5 @@
 -    sessionManager: SessionManager.inMemory(cwd),
 +    sessionManager,
      settingsManager: SettingsManager.create(cwd, agentDir),
-     modelRegistry: ctx.modelRegistry, model,
+     model,
      tools: getToolNamesForType(type), resourceLoader: loader,

@@ -33,6 +33,8 @@ export function registerAgentTool(pi: ExtensionAPI): void {
       agent: agentParam,
       run_in_background: Type.Optional(Type.Boolean()),
       worktree_path: Type.Optional(Type.String()),
+      // Don fork: optional named, resumable child-session executor.
+      session_key: Type.Optional(Type.String()),
     }),
     execute: executeAgentTool,
 

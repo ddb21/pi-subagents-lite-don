@@ -1,5 +1,6 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_AGENTS } from "./agents/default-agents.js";
 import { registerAgents, getAvailableTypes, setAgentScanDirs } from "./agents/agent-types.js";
 import { scanAgentFilesInDir, mergeAgents } from "./agents/agent-discovery.js";
@@ -19,6 +20,27 @@ import {
   setWidget,
   setCoordinator,
 } from "./shell.js";
+
+// Don fork: retain persistent subagent session logs for two weeks.
+const SUBAGENT_SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+let hasSweptSubagentSessions = false;
+
+function sweepSubagentSessions(): void {
+  if (hasSweptSubagentSessions) return;
+  hasSweptSubagentSessions = true;
+
+  try {
+    const subagentDir = path.join(getAgentDir(), "sessions-subagents");
+    const cutoff = Date.now() - SUBAGENT_SESSION_MAX_AGE_MS;
+    for (const entry of fs.readdirSync(subagentDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const sessionFile = path.join(subagentDir, entry.name);
+      if (fs.statSync(sessionFile).mtimeMs < cutoff) fs.unlinkSync(sessionFile);
+    }
+  } catch {
+    // Session cleanup is best-effort and must never block startup.
+  }
+}
 
 // ============================================================================
 // Config loader — session_start handler logic
@@ -134,6 +156,7 @@ export function setupEventListeners(pi: ExtensionAPI): void {
   let unregisterTerminalInput: (() => void) | undefined;
 
   pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
+    sweepSubagentSessions();
     setSessionCtx(ctx);
     await loadConfigAndRegisterAgents(ctx);
     // Re-register with updated agent type list (now includes user/project agents)

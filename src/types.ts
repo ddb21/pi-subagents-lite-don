@@ -2,14 +2,14 @@
  * Type definitions for the subagent system.
  */
 
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentOutputLog } from "./agents/output-file.js";
 import type { LifetimeUsage, AgentUsage } from "./agents/usage.js";
 import type { SubagentType, AgentInvocation } from "./agents/types.js";
 
-/** Thinking level for agent models. */
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+/** Thinking level for agent models (sourced from @earendil-works/pi-ai). */
+export type ThinkingLevel = ModelThinkingLevel;
 
 /** Tool activity event: start/end of a tool invocation. */
 export interface ToolActivity {
@@ -95,6 +95,9 @@ export interface CompactionInfo {
 /** Possible agent lifecycle statuses. */
 export type AgentStatus = "queued" | "running" | "completed" | "turn_limited" | "aborted" | "stopped" | "error";
 
+/** Who initiated an agent stop: "user" via UI menu, or "agent" via StopAgent tool. */
+export type StopInitiator = "user" | "agent";
+
 /**
  * Lifecycle state: when the agent started, completed, and its current status.
  * Used by agent-manager (lifecycle control), menus (status display), widget (linger logic).
@@ -103,6 +106,13 @@ export interface AgentLifecycle {
   status: AgentStatus;
   startedAt: number;
   completedAt?: number;
+  stoppedBy?: StopInitiator;
+  /**
+   * Whether the result has been read by the LLM (foreground return or background nudge).
+   * cleanup() preserves terminal records until this is set, so a completed background
+   * agent whose nudge hasn't fired yet isn't evicted before the LLM reads the result.
+   */
+  resultConsumed?: boolean;
 }
 
 /**
@@ -130,6 +140,10 @@ export interface AgentDisplayInfo {
  */
 export interface AgentExecutionState {
   session?: AgentSession;
+  /** Don fork: resolved persistent executor session file, when known. */
+  sessionFile?: string;
+  /** Don fork: scoped session key reserved by this live record. */
+  sessionKey?: string;
   abortController?: AbortController;
   promise?: Promise<string>;
   /** Steering messages queued before the session was ready. */
@@ -161,5 +175,4 @@ export interface AgentAccumulatedStats {
   /** Last-known context usage percentage (0–100), captured at completion. */
   contextPercent?: number | null;
 }
-
 

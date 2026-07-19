@@ -301,7 +301,11 @@ export async function scanAgentFilesInDir(
 
   const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
   const mdFiles = entries.filter(
-    (e) => e.isFile() && e.name.endsWith(".md"),
+    // Agent definitions are commonly deployed as symlinks so updates to the
+    // source repository take effect without copying files. Dirent#isFile()
+    // is false for symlinks, but readFile below safely follows valid links and
+    // already skips broken or unreadable entries.
+    (e) => (e.isFile() || e.isSymbolicLink()) && e.name.endsWith(".md"),
   );
 
   const agents: AgentConfigFromMd[] = [];

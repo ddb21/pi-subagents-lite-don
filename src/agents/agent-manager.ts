@@ -562,6 +562,13 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     this.queue = [];
     for (const record of this.agents.values()) {
+      // Abort running loops explicitly before disposing the session. Relying on
+      // session.dispose() alone left in-process children running when the parent
+      // shut down mid-delegation (observed as orphans burning provider quota
+      // until their socket idle-timed out — issue #3).
+      if (record.lifecycle.status === "running" || record.lifecycle.status === "queued") {
+        this.stopAgent(record, "user");
+      }
       record.execution.session?.dispose();
     }
     this.agents.clear();

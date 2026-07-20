@@ -168,7 +168,13 @@ export async function executeAgentTool(
   const prompt = params.prompt as string;
   const description = (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
   const runInBackground = params.run_in_background as boolean | undefined;
-  const isBackground = runInBackground || getStore().agent.forceBackground;
+  let isBackground = runInBackground || getStore().agent.forceBackground;
+  // Don fork: in one-shot mode (no UI: pi -p / --mode json) the parent process
+  // exits when the turn ends, killing any background child mid-work. There is
+  // no later turn to collect the result, so background delegation can never
+  // succeed — force foreground instead of losing the work.
+  const forcedForeground = isBackground && !ctx.hasUI;
+  if (forcedForeground) isBackground = false;
   const maxTurns = params.max_turns as number | undefined ?? getAgentConfig(resolvedType)?.maxTurns;
 
   const modelStr = params.model as string | undefined;
@@ -226,7 +232,10 @@ export async function executeAgentTool(
     return errorResult(`Agent failed: ${record.error || "unknown error"}`, details);
   }
 
-  return successResult(formatResultContent(record), details);
+  const note = forcedForeground
+    ? "[note: run_in_background was ignored — one-shot mode has no later turn to collect background results, so the agent ran in the foreground]\n\n"
+    : "";
+  return successResult(note + formatResultContent(record), details);
 }
 
 // ============================================================================

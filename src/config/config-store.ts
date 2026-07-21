@@ -13,8 +13,8 @@
  * at session_start. `dispose()` drops deps at session_shutdown.
  */
 
-import type { SubagentsConfig, SessionModelOverrides } from "../models/model-precedence.js";
-import { resolveModel } from "../models/model-precedence.js";
+import type { SubagentsConfig, SessionModelOverrides, ResolvedSpawn } from "../models/model-precedence.js";
+import { resolveSpawn } from "../models/model-precedence.js";
 import type { AgentWidget } from "../ui/agent-widget.js";
 import type { AgentManager } from "../agents/agent-manager.js";
 import { CONFIG_AGENT_NON_MODEL_KEYS } from "./types.js";
@@ -168,15 +168,25 @@ export class ConfigStore {
   /**
    * Resolve the effective model for a spawn, hiding resolveModel's option
    * assembly. Precedence: session per-type → session default → config per-type
-   * → config default → agentConfig (frontmatter) → parentModelId.
+   * → config default → explicit per-call param → providerAgents follow map
+   * → agentConfig (frontmatter) → parentModelId.
    */
-  modelFor(type: string, parentModelId: string, agentConfig?: { model?: string }): string {
-    return resolveModel({
+  modelFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string): string {
+    return this.spawnFor(type, parentModelId, agentConfig, explicitModel).model;
+  }
+
+  /**
+   * Resolve model + travelling settings for a spawn. `thinking` is set only
+   * when a providerAgents entry won the model resolution.
+   */
+  spawnFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string): ResolvedSpawn {
+    return resolveSpawn({
       subagentType: type,
       agentConfig,
       config: this.config,
       parentModelId,
       sessionOverrides: this.sessionOverrides,
+      explicitModel,
     });
   }
 

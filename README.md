@@ -1,9 +1,11 @@
 # pi-subagents-lite-don
 
-BLUF: A Don-owned vendored fork of `pi-subagents-lite@1.4.6` with exactly one
-behavioral change: each subagent now runs on a **persisted** session (with
-parent lineage) instead of an in-memory one, so usage/session scrapers can see
-and classify subagent runs. Everything else is byte-identical to upstream.
+BLUF: A Don-owned vendored fork of `pi-subagents-lite@1.4.6`. The original
+change: each subagent runs on a **persisted** session (with parent lineage)
+instead of an in-memory one, so usage/session scrapers can see and classify
+subagent runs. Later fork extensions (session_key executors, one-shot
+foreground enforcement, provider-follow model map) are listed under
+"Fork extensions" below.
 
 - Provenance: forked from `pi-subagents-lite` version **1.4.6**
   (`git+https://github.com/AlexParamonov/pi-subagents-lite.git`, MIT).
@@ -51,6 +53,64 @@ Note on style: the patch reuses the `agentDir` local already computed two lines
 above (`const agentDir = getAgentDir();`) rather than calling `getAgentDir()`
 again. This is semantically identical to the findings-doc snippet and matches
 the surrounding code, which already uses `agentDir`.
+
+## Fork extensions beyond the persistence change
+
+Added after the original fork (see git log for details):
+
+- **`session_key`** on the Agent tool: named, persistent, per-project executor
+  sessions that survive across parent sessions (the two-tier architecture's
+  Terra executor).
+- **Forced foreground in one-shot mode**: `run_in_background` is ignored when
+  there is no UI (`pi -p` / `--mode json`) — the process exits at turn end, so
+  a background child could never deliver its result.
+- **`dispose()` aborts running children** so a SIGTERMed parent doesn't leave
+  orphans burning provider quota.
+- **Provider-follow model map** (`providerAgents`) — below.
+
+### Provider-follow model map
+
+Problem: agent frontmatter pins concrete models (`model: openai-codex/gpt-5.6-terra`),
+so switching the orchestrator to another provider (quota exhausted, trying a
+new model) leaves every subagent behind on the old provider.
+
+`~/.pi/agent/subagents-lite.json` may now carry a `providerAgents` map, keyed
+by the **orchestrator's provider**, giving per-agent-type entries (plus
+`"default"`). An entry is a model key or `{ "model": ..., "thinking": ... }`:
+
+```json
+{
+  "providerAgents": {
+    "github-copilot": {
+      "default": "github-copilot/gpt-5.2",
+      "reviewer-adversarial": { "model": "github-copilot/claude-opus-4.8", "thinking": "medium" }
+    },
+    "my-custom-vllm": {
+      "default": { "model": "my-custom-vllm/qwen3-max", "thinking": "low" }
+    }
+  }
+}
+```
+
+With this in place, `/model` is the single lever: switch the orchestrator's
+provider and the next spawn resolves executor/reviewers from that provider's
+entries. Unmapped providers fall back to frontmatter (the openai-codex pins).
+
+Model precedence (`src/models/model-precedence.ts`): session override →
+`subagents-lite.json` pin → explicit per-call `model` param → providerAgents
+map → frontmatter → parent model. The per-call param slot is also a fork
+change: upstream clobbered it; it now wins over the map and frontmatter
+(enabling targeted overrides, e.g. a Luna trial) but still loses to user-set
+pins. A model that isn't in the registry fails the Agent call instead of
+silently falling back to the parent model.
+
+`thinking` travels with the model: a map entry's thinking applies only when
+that entry supplied the resolved model (never leaking onto a model chosen by
+a session override or per-call param), and always loses to an explicit
+per-call `thinking` param.
+
+Config edits apply at the next session start (`/agents` session overrides
+cover mid-session changes).
 
 ## How pi loads this fork (no build step)
 

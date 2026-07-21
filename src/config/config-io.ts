@@ -59,9 +59,17 @@ export function loadConfig(): SubagentsConfig {
 
   // @ts-expect-error TS2783: spread may override 'default', which is intentional (loaded value wins)
   const concurrency = { default: 4, ...(raw.concurrency ?? {}) } as SubagentsConfig["concurrency"];
+  // Carry through (saveConfigAtomic writes this whole object back, so dropping
+  // the key here would erase providerAgents on the next menu save), but only
+  // if it is a plain object — per-entry junk is normalized at resolve time.
+  const providerAgents =
+    raw.providerAgents && typeof raw.providerAgents === "object" && !Array.isArray(raw.providerAgents)
+      ? raw.providerAgents
+      : undefined;
   return {
     agent: { ...DEFAULT_AGENT, ...raw.agent },
     concurrency,
+    ...(providerAgents ? { providerAgents } : {}),
   };
 }
 

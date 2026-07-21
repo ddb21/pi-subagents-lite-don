@@ -35,6 +35,12 @@ export function registerAgentTool(pi: ExtensionAPI): void {
       worktree_path: Type.Optional(Type.String()),
       // Don fork: optional named, resumable child-session executor.
       session_key: Type.Optional(Type.String()),
+      // Don fork: per-call overrides. These were always read by the executor
+      // but absent from the schema, so constrained providers could never emit
+      // them. model: "provider/model-id"; thinking: off..max.
+      model: Type.Optional(Type.String()),
+      thinking: Type.Optional(Type.String()),
+      max_turns: Type.Optional(Type.Number()),
     }),
     execute: executeAgentTool,
 

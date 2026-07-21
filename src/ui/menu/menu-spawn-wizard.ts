@@ -195,10 +195,13 @@ export async function showSpawnAgentMenu(
   const parentModelId = session?.model
     ? `${session.model.provider}/${session.model.id}`
     : "";
-  const effectiveModelStr = store.modelFor(selectedType, parentModelId, agentConfig);
+  const effectiveSpawn = store.spawnFor(selectedType, parentModelId, agentConfig);
 
-  let currentModelStr = effectiveModelStr || "";
-  let currentThinking: ThinkingLevel | undefined = agentConfig.thinkingLevel ?? store.agent.defaultThinking;
+  let currentModelStr = effectiveSpawn.model || "";
+  // Same resolution as tool-spawned agents: settings travelling with the
+  // resolved model (follow-map entry) beat frontmatter/default thinking.
+  let currentThinking: ThinkingLevel | undefined =
+    effectiveSpawn.thinking ?? agentConfig.thinkingLevel ?? store.agent.defaultThinking;
   let currentMaxTurns: number | undefined = agentConfig.maxTurns ?? store.agent.defaultMaxTurns;
   let currentMaxTokens: number | undefined = agentConfig.maxTokens;
   let currentGraceTurns: number = store.agent.graceTurns ?? DEFAULT_GRACE_TURNS;

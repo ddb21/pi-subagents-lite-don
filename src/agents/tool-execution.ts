@@ -168,11 +168,24 @@ export async function executeAgentTool(
   const prompt = params.prompt as string;
   const description = (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
   const runInBackground = params.run_in_background as boolean | undefined;
-  const isBackground = runInBackground || getStore().agent.forceBackground;
+  let isBackground = runInBackground || getStore().agent.forceBackground;
+  // Don fork: in one-shot mode (no UI: pi -p / --mode json) the parent process
+  // exits when the turn ends, killing any background child mid-work. There is
+  // no later turn to collect the result, so background delegation can never
+  // succeed — force foreground instead of losing the work.
+  const forcedForeground = isBackground && !ctx.hasUI;
+  if (forcedForeground) isBackground = false;
   const maxTurns = params.max_turns as number | undefined ?? getAgentConfig(resolvedType)?.maxTurns;
 
   const modelStr = params.model as string | undefined;
-  const model = findModelInRegistry(modelStr, ctx.modelRegistry, ctx.model);
+  // Don fork: a requested model that isn't in the registry is an error, not a
+  // silent fallback to the parent model — a typo in a providerAgents entry or
+  // per-call override would otherwise run the wrong model (and any thinking
+  // that traveled with the configured entry would disagree with it).
+  const model = findModelInRegistry(modelStr, ctx.modelRegistry, modelStr ? undefined : ctx.model);
+  if (modelStr && !model) {
+    return errorResult(`Model not found in registry: ${modelStr}`);
+  }
   const modelKey = model ? `${model.provider}/${model.id}` : undefined;
 
   // Determine modelName for invocation (always capture for display)
@@ -226,7 +239,10 @@ export async function executeAgentTool(
     return errorResult(`Agent failed: ${record.error || "unknown error"}`, details);
   }
 
-  return successResult(formatResultContent(record), details);
+  const note = forcedForeground
+    ? "[note: run_in_background was ignored — one-shot mode has no later turn to collect background results, so the agent ran in the foreground]\n\n"
+    : "";
+  return successResult(note + formatResultContent(record), details);
 }
 
 // ============================================================================
@@ -307,28 +323,36 @@ export async function toolCallListener(
   if (event.toolName !== "Agent") return;
 
   const input = event.input;
-  const subagentType = input.agent as string | undefined;
-  const agentConfig = subagentType ? getAgentConfig(subagentType) : undefined;
+  // Resolve the caller's spelling to the canonical type before any keyed
+  // lookup: session/config/providerAgents keys are canonical, so "Executor"
+  // or a display name would silently miss its per-type entries otherwise.
+  const requestedType = typeof input.agent === "string" && input.agent ? input.agent : "general-purpose";
+  const subagentType = resolveType(requestedType) ?? requestedType;
+  const agentConfig = getAgentConfig(subagentType);
 
   const parentModelId = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 
-  const effectiveModel = getStore().modelFor(
-    subagentType ?? "general-purpose",
-    parentModelId,
-    agentConfig,
-  );
+  // Don fork: feed the per-call model param into resolution instead of
+  // clobbering it — it now wins over the follow map and frontmatter (targeted
+  // overrides like a Luna trial) while still losing to session/config pins.
+  const explicitModel = typeof input.model === "string" && input.model ? input.model : undefined;
+  const spawn = getStore().spawnFor(subagentType, parentModelId, agentConfig, explicitModel);
 
-  if (effectiveModel) {
-    input.model = effectiveModel;
+  if (spawn.model) {
+    input.model = spawn.model;
     // Always inject _modelOverride for renderCall
-    const parsed = parseModelKey(effectiveModel);
+    const parsed = parseModelKey(spawn.model);
     if (parsed) {
       input._modelOverride = parsed.modelId;
     }
   }
 
-  // Inject thinking from agent config if not explicitly passed
-  if (input.thinking === undefined && agentConfig?.thinkingLevel !== undefined) {
-    input.thinking = agentConfig.thinkingLevel;
+  // Inject thinking if not explicitly passed: settings that traveled with the
+  // resolved model (follow-map entry), else agent config (frontmatter).
+  if (input.thinking === undefined) {
+    const thinking = spawn.thinking ?? agentConfig?.thinkingLevel;
+    if (thinking !== undefined) {
+      input.thinking = thinking;
+    }
   }
 }

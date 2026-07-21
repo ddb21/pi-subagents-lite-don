@@ -103,7 +103,10 @@ export function ensureManagerAndWidget(): void {
  */
 export async function scanAndRegisterAgents(ctx: ExtensionContext): Promise<void> {
   const homeDir = process.env.HOME || "";
-  const userAgentDir = path.join(homeDir, ".pi", "agent", "agents");
+  const configuredAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const userAgentDir = configuredAgentDir
+    ? path.join(configuredAgentDir, "agents")
+    : path.join(homeDir, ".pi", "agent", "agents");
   const projectAgentDir = path.join(ctx.cwd, ".pi", "agents");
 
   // Store scan dirs for on-demand discovery (agents added during the session)

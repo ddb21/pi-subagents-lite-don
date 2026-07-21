@@ -9,7 +9,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { SubagentsConfig } from "../models/model-precedence.js";
 
-const CONFIG_DIR = path.join(process.env.HOME || "", ".pi", "agent");
+// Pi-lite launches with PI_CODING_AGENT_DIR, so follow that runtime-specific
+// directory for config and prompt persistence instead of leaking into regular Pi.
+const CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || path.join(process.env.HOME || "", ".pi", "agent");
 const CONFIG_PATH = path.join(CONFIG_DIR, "subagents-lite.json");
 /** Path to custom prompt file for subagent system prompts. */
 export const CUSTOM_PROMPT_PATH = path.join(CONFIG_DIR, "subagents-lite-prompt.md");
@@ -59,17 +61,19 @@ export function loadConfig(): SubagentsConfig {
 
   // @ts-expect-error TS2783: spread may override 'default', which is intentional (loaded value wins)
   const concurrency = { default: 4, ...(raw.concurrency ?? {}) } as SubagentsConfig["concurrency"];
-  // Carry through (saveConfigAtomic writes this whole object back, so dropping
-  // the key here would erase providerAgents on the next menu save), but only
-  // if it is a plain object — per-entry junk is normalized at resolve time.
-  const providerAgents =
-    raw.providerAgents && typeof raw.providerAgents === "object" && !Array.isArray(raw.providerAgents)
-      ? raw.providerAgents
-      : undefined;
+  // Carry through routing maps (saveConfigAtomic writes this whole object
+  // back, so dropping either key here would erase it on the next menu save).
+  // Only accept plain objects at the top level; per-entry junk is normalized
+  // during resolution.
+  const routingMap = (value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+  const providerAgents = routingMap(raw.providerAgents);
+  const modelAgents = routingMap(raw.modelAgents);
   return {
     agent: { ...DEFAULT_AGENT, ...raw.agent },
     concurrency,
-    ...(providerAgents ? { providerAgents } : {}),
+    ...(providerAgents ? { providerAgents: providerAgents as SubagentsConfig["providerAgents"] } : {}),
+    ...(modelAgents ? { modelAgents: modelAgents as SubagentsConfig["modelAgents"] } : {}),
   };
 }
 

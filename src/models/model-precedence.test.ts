@@ -23,6 +23,22 @@ const PROVIDER_MAP: SubagentsConfig["providerAgents"] = {
   },
 };
 
+const MODEL_MAP: SubagentsConfig["modelAgents"] = {
+  "walmart-puppy/gpt-5.6-sol": {
+    executor: { model: "walmart-puppy/gpt-5.6-terra", thinking: "medium" },
+  },
+  "awb/claude-opus-4-8": {
+    default: "github-copilot/gpt-5.5",
+    executor: { model: "github-copilot/gpt-5.5", thinking: "high" },
+  },
+  "github-copilot/claude-opus-4.6": {
+    executor: { model: "github-copilot/gpt-5.5", thinking: "high" },
+  },
+  "github-copilot/gpt-5.5": {
+    executor: { model: "github-copilot/claude-opus-4.6", thinking: "xhigh" },
+  },
+};
+
 describe("resolveModel", () => {
   it("keeps the original precedence: session > config > frontmatter > parent", () => {
     const config = baseConfig();
@@ -126,6 +142,67 @@ describe("resolveModel", () => {
         sessionOverrides: { default: "openai-codex/from-session" },
       }),
     ).toBe("openai-codex/from-session");
+  });
+
+  it("resolves all approved exact-parent executor routes with their thinking", () => {
+    const config = baseConfig({ modelAgents: MODEL_MAP });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "walmart-puppy/gpt-5.6-sol" }))
+      .toEqual({ model: "walmart-puppy/gpt-5.6-terra", thinking: "medium" });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "awb/claude-opus-4-8" }))
+      .toEqual({ model: "github-copilot/gpt-5.5", thinking: "high" });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "github-copilot/claude-opus-4.6" }))
+      .toEqual({ model: "github-copilot/gpt-5.5", thinking: "high" });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "github-copilot/gpt-5.5" }))
+      .toEqual({ model: "github-copilot/claude-opus-4.6", thinking: "xhigh" });
+  });
+
+  it("checks the exact-parent map before the provider map", () => {
+    const config = baseConfig({
+      modelAgents: MODEL_MAP,
+      providerAgents: { "github-copilot": { executor: "github-copilot/provider-fallback" } },
+    });
+    expect(resolveSpawn({
+      subagentType: "executor",
+      config,
+      parentModelId: "github-copilot/gpt-5.5",
+    })).toEqual({ model: "github-copilot/claude-opus-4.6", thinking: "xhigh" });
+  });
+
+  it("uses exact-map default entries and ignores absent exact rules", () => {
+    const config = baseConfig({
+      modelAgents: MODEL_MAP,
+      providerAgents: { "walmart-puppy": { executor: "walmart-puppy/provider-fallback" } },
+    });
+    expect(resolveModel({
+      subagentType: "reviewer-adversarial",
+      config,
+      parentModelId: "awb/claude-opus-4-8",
+    })).toBe("github-copilot/gpt-5.5");
+    expect(resolveModel({
+      subagentType: "executor",
+      config,
+      parentModelId: "walmart-puppy/gpt-5.6-terra",
+      agentConfig: { model: "frontmatter/model" },
+    })).toBe("walmart-puppy/provider-fallback");
+  });
+
+  it("lets session, config, and explicit overrides retain higher precedence over exact maps", () => {
+    const config = baseConfig({ modelAgents: MODEL_MAP });
+    config.agent.executor = "config/model";
+    expect(resolveModel({ subagentType: "executor", config, parentModelId: "walmart-puppy/gpt-5.6-sol", explicitModel: "explicit/model" }))
+      .toBe("config/model");
+    expect(resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ modelAgents: MODEL_MAP }),
+      parentModelId: "walmart-puppy/gpt-5.6-sol",
+      explicitModel: "explicit/model",
+    })).toBe("explicit/model");
+    expect(resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ modelAgents: MODEL_MAP }),
+      parentModelId: "walmart-puppy/gpt-5.6-sol",
+      sessionOverrides: { default: null, executor: "session/model" },
+    })).toBe("session/model");
   });
 
   it("does not consult a literal empty-string provider key", () => {

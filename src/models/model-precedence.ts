@@ -8,20 +8,20 @@
  *   2. sessionOverrides["default"]     (session global default)
  *   3. config.agent[subagentType]      (config per-type override)
  *   4. config.agent["default"]         (config global default)
- *   5. explicitModel                   (per-call `model` param from the parent)
- *   6. providerAgents[parent provider] (provider-follow map, per-type then default)
- *   7. agentConfig?.model              (agent config / frontmatter)
- *   8. parentModelId                   (inherit from parent)
+ *   5. explicitModel                 (per-call `model` param from the parent)
+ *   6. modelAgents[parent model ID]  (exact-parent map, per-type then default)
+ *   7. providerAgents[parent provider] (provider-follow map, per-type then default)
+ *   8. agentConfig?.model            (agent config / frontmatter)
+ *   9. parentModelId                 (inherit from parent)
  *
- * Tiers 5–6 are the Don-fork additions: an explicit per-call model wins over
- * the follow map and frontmatter (so targeted overrides like a Luna trial
- * work) but still loses to user-set session/config pins; the providerAgents
- * map keys off the parent's provider so switching the orchestrator provider
- * moves the whole cast without touching frontmatter.
+ * Tiers 5–7 are the Don-fork additions: an explicit per-call model wins over
+ * both maps and frontmatter (so targeted overrides like a Luna trial work),
+ * while exact parent-model routes take precedence over provider routes. All
+ * maps still lose to user-set session/config pins.
  *
- * Thinking travels with the model: a follow-map entry's thinking applies only
- * when that entry is the one that supplied the resolved model. A model chosen
- * by a higher tier never picks up thinking from a map entry it didn't use.
+ * Thinking travels with the model: a map entry's thinking applies only when
+ * that entry is the one that supplied the resolved model. A model chosen by a
+ * higher tier never picks up thinking from a map entry it didn't use.
  */
 
 import type { ThinkingLevel } from "../types.js";
@@ -33,6 +33,8 @@ import { parseThinkingLevel } from "../utils.js";
  * ("provider/model") or an object carrying per-provider settings alongside it.
  */
 export type ProviderAgentEntry = string | { model?: string; thinking?: ThinkingLevel };
+/** Exact-parent model entries use the same shape as provider-follow entries. */
+export type ModelAgentEntry = ProviderAgentEntry;
 
 /** Shape of the subagents-lite.json config file. */
 export interface SubagentsConfig {
@@ -92,6 +94,13 @@ export interface SubagentsConfig {
    * the resolved model.
    */
   providerAgents?: Record<string, Record<string, ProviderAgentEntry>>;
+  /**
+   * Exact-parent model map: full parent `provider/model` key → per-agent-type
+   * entries, with "default" as the within-model fallback. Checked before
+   * providerAgents so a deliberate parent-model route can specialize a cast
+   * without changing the broader provider default.
+   */
+  modelAgents?: Record<string, Record<string, ModelAgentEntry>>;
 }
 
 /**
@@ -170,11 +179,14 @@ export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
   const { subagentType, agentConfig, config, parentModelId, sessionOverrides, explicitModel } = options;
 
   const parentProvider = providerOf(parentModelId);
+  const modelMap = parentModelId ? config.modelAgents?.[parentModelId] : undefined;
   const providerMap = parentProvider ? config.providerAgents?.[parentProvider] : undefined;
-  const typedEntry = normalizeEntry(providerMap?.[subagentType]);
-  const defaultEntry = normalizeEntry(providerMap?.["default"]);
+  const exactTypedEntry = normalizeEntry(modelMap?.[subagentType]);
+  const exactDefaultEntry = normalizeEntry(modelMap?.["default"]);
+  const providerTypedEntry = normalizeEntry(providerMap?.[subagentType]);
+  const providerDefaultEntry = normalizeEntry(providerMap?.["default"]);
 
-  // Precedence chain: session > config > per-call param > provider map > frontmatter > parent
+  // Precedence: session > config > per-call > exact model map > provider map > frontmatter > parent
   // Cast agent values: index signature includes number (graceTurns), but models are always strings
   const candidates: Array<{ model: string | boolean | null | undefined; thinking?: ThinkingLevel }> = [
     { model: sessionOverrides?.[subagentType] },
@@ -182,8 +194,10 @@ export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
     { model: config.agent[subagentType] as string | null | undefined },
     { model: config.agent["default"] },
     { model: explicitModel },
-    { model: typedEntry?.model, thinking: typedEntry?.thinking },
-    { model: defaultEntry?.model, thinking: defaultEntry?.thinking },
+    { model: exactTypedEntry?.model, thinking: exactTypedEntry?.thinking },
+    { model: exactDefaultEntry?.model, thinking: exactDefaultEntry?.thinking },
+    { model: providerTypedEntry?.model, thinking: providerTypedEntry?.thinking },
+    { model: providerDefaultEntry?.model, thinking: providerDefaultEntry?.thinking },
     { model: agentConfig?.model },
     { model: parentModelId }, // final fallback (always a valid string)
   ];

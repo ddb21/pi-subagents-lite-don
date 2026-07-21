@@ -179,7 +179,7 @@ export async function executeAgentTool(
 
   const modelStr = params.model as string | undefined;
   // Don fork: a requested model that isn't in the registry is an error, not a
-  // silent fallback to the parent model — a typo in a providerAgents entry or
+  // silent fallback to the parent model — a typo in a modelAgents/providerAgents entry or
   // per-call override would otherwise run the wrong model (and any thinking
   // that traveled with the configured entry would disagree with it).
   const model = findModelInRegistry(modelStr, ctx.modelRegistry, modelStr ? undefined : ctx.model);
@@ -324,7 +324,7 @@ export async function toolCallListener(
 
   const input = event.input;
   // Resolve the caller's spelling to the canonical type before any keyed
-  // lookup: session/config/providerAgents keys are canonical, so "Executor"
+  // lookup: session/config/modelAgents/providerAgents keys are canonical, so "Executor"
   // or a display name would silently miss its per-type entries otherwise.
   const requestedType = typeof input.agent === "string" && input.agent ? input.agent : "general-purpose";
   const subagentType = resolveType(requestedType) ?? requestedType;

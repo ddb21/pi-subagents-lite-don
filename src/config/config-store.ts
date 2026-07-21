@@ -168,8 +168,8 @@ export class ConfigStore {
   /**
    * Resolve the effective model for a spawn, hiding resolveModel's option
    * assembly. Precedence: session per-type → session default → config per-type
-   * → config default → explicit per-call param → providerAgents follow map
-   * → agentConfig (frontmatter) → parentModelId.
+   * → config default → explicit per-call param → modelAgents exact-parent map
+   * → providerAgents follow map → agentConfig (frontmatter) → parentModelId.
    */
   modelFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string): string {
     return this.spawnFor(type, parentModelId, agentConfig, explicitModel).model;
@@ -177,7 +177,7 @@ export class ConfigStore {
 
   /**
    * Resolve model + travelling settings for a spawn. `thinking` is set only
-   * when a providerAgents entry won the model resolution.
+   * when a modelAgents or providerAgents entry won the model resolution.
    */
   spawnFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string): ResolvedSpawn {
     return resolveSpawn({

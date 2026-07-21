@@ -10,7 +10,8 @@
  *   - Model parameter removed from schema — injected via tool_call listener
  *
  * Config:
- *   - Loaded from ~/.pi/agent/subagents-lite.json at session_start
+ *   - Loaded from $PI_CODING_AGENT_DIR/subagents-lite.json when set,
+ *     otherwise ~/.pi/agent/subagents-lite.json, at session_start
  *   - ConfigStore owns config + session overrides + persistence + side effects
  *   - Tool execution and menus read/write through store
  *

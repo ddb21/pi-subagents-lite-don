@@ -66,51 +66,57 @@ Added after the original fork (see git log for details):
   a background child could never deliver its result.
 - **`dispose()` aborts running children** so a SIGTERMed parent doesn't leave
   orphans burning provider quota.
-- **Provider-follow model map** (`providerAgents`) — below.
+- **Exact-parent model map** (`modelAgents`) and **provider-follow model map** (`providerAgents`) — below.
 
-### Provider-follow model map
+### Exact-parent and provider-follow model maps
 
 Problem: agent frontmatter pins concrete models (`model: openai-codex/gpt-5.6-terra`),
 so switching the orchestrator to another provider (quota exhausted, trying a
 new model) leaves every subagent behind on the old provider.
 
-`~/.pi/agent/subagents-lite.json` may now carry a `providerAgents` map, keyed
-by the **orchestrator's provider**, giving per-agent-type entries (plus
-`"default"`). An entry is a model key or `{ "model": ..., "thinking": ... }`:
+`subagents-lite.json` may carry two maps. `modelAgents` is keyed by the full
+**orchestrator `provider/model` ID**; it supports a per-agent-type entry and a
+`"default"` fallback. `providerAgents` remains keyed by provider and is checked
+only after an exact model route. An entry is a model key or
+`{ "model": ..., "thinking": ... }`:
 
 ```json
 {
+  "modelAgents": {
+    "walmart-puppy/gpt-5.6-sol": {
+      "executor": { "model": "walmart-puppy/gpt-5.6-terra", "thinking": "medium" }
+    }
+  },
   "providerAgents": {
     "github-copilot": {
-      "default": "github-copilot/gpt-5.2",
-      "reviewer-adversarial": { "model": "github-copilot/claude-opus-4.8", "thinking": "medium" }
-    },
-    "my-custom-vllm": {
-      "default": { "model": "my-custom-vllm/qwen3-max", "thinking": "low" }
+      "default": "github-copilot/gpt-5.2"
     }
   }
 }
 ```
 
-With this in place, `/model` is the single lever: switch the orchestrator's
-provider and the next spawn resolves executor/reviewers from that provider's
-entries. Unmapped providers fall back to frontmatter (the openai-codex pins).
+This permits exact parent-model routes while retaining provider-wide fallback
+behavior. Unmapped exact IDs proceed to `providerAgents`, then frontmatter.
 
 Model precedence (`src/models/model-precedence.ts`): session override →
-`subagents-lite.json` pin → explicit per-call `model` param → providerAgents
-map → frontmatter → parent model. The per-call param slot is also a fork
-change: upstream clobbered it; it now wins over the map and frontmatter
-(enabling targeted overrides, e.g. a Luna trial) but still loses to user-set
-pins. A model that isn't in the registry fails the Agent call instead of
-silently falling back to the parent model.
+`subagents-lite.json` pin → explicit per-call `model` param → `modelAgents`
+exact map → `providerAgents` map → frontmatter → parent model. The per-call
+param slot is also a fork change: upstream clobbered it; it now wins over both
+maps and frontmatter while still losing to user-set pins. A model that is not
+in the registry fails the Agent call instead of silently falling back to the
+parent model.
 
 `thinking` travels with the model: a map entry's thinking applies only when
 that entry supplied the resolved model (never leaking onto a model chosen by
 a session override or per-call param), and always loses to an explicit
 per-call `thinking` param.
 
-Config edits apply at the next session start (`/agents` session overrides
-cover mid-session changes).
+When `PI_CODING_AGENT_DIR` is set, configuration and the custom-prompt path
+are read and saved beneath that directory. For pi-lite this is
+`~/.pi-lite/agent/subagents-lite.json`, which prevents shared regular-Pi
+configuration. Without that environment variable, the legacy location remains
+`~/.pi/agent/subagents-lite.json`. Config edits apply at the next session
+start (`/agents` session overrides cover mid-session changes).
 
 ## How pi loads this fork (no build step)
 

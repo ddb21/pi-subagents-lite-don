@@ -65,6 +65,7 @@ export function registerAgentTool(pi: ExtensionAPI): void {
 
 /** Register all tools, commands, and message renderers. */
 export function registerTools(pi: ExtensionAPI): void {
+  if (lifecycleEnabled()) emitLifecycle("extension_loaded", { extension: "pi-subagents-lite" });
   // Agent tool — stealth schema with dynamic agent type enum
   registerAgentTool(pi);
 

@@ -5,10 +5,18 @@ import path from "node:path";
 export interface LifecycleEvent { event: string; timestamp_ct: string; [key: string]: unknown }
 
 function nowCT(): string {
-  return new Intl.DateTimeFormat("en-CA", {
+  // formatToParts preserves the real CT offset across CST/CDT transitions.
+  const date = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-  }).format(new Date()).replace(", ", "T") + "-05:00";
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  const utcMillis = Date.UTC(+value("year"), +value("month") - 1, +value("day"), +value("hour"), +value("minute"), +value("second"));
+  const offsetMinutes = Math.round((utcMillis - Math.floor(date.getTime() / 1000) * 1000) / 60_000);
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absolute = Math.abs(offsetMinutes);
+  return `${value("year")}-${value("month")}-${value("day")}T${value("hour")}:${value("minute")}:${value("second")}${sign}${String(Math.floor(absolute / 60)).padStart(2, "0")}:${String(absolute % 60).padStart(2, "0")}`;
 }
 
 export function emitLifecycle(event: string, fields: Record<string, unknown> = {}): void {
@@ -16,7 +24,8 @@ export function emitLifecycle(event: string, fields: Record<string, unknown> = {
   if (!file) return;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(file, JSON.stringify({ event, timestamp_ct: nowCT(), ...benchmarkContext(), ...fields }) + "\n", "utf8");
+    // A single append syscall keeps each JSONL record intact for concurrent children.
+    fs.appendFileSync(file, JSON.stringify({ event, timestamp_ct: nowCT(), timestamp_utc: new Date().toISOString(), ...benchmarkContext(), ...fields }) + "\n", "utf8");
   } catch { /* Benchmark telemetry must never alter agent execution. */ }
 }
 

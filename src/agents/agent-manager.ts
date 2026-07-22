@@ -23,6 +23,7 @@ import type { SubagentType } from "./types.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type AgentUsage } from "./usage.js";
 import { errorMessage } from "../utils.js";
 import { getSessionKeyIndexKey, resolveSessionKey } from "./persistent-executor.js";
+import { emitLifecycle } from "../benchmark-lifecycle.js";
 
 /** How often to check for expired agent records (milliseconds). */
 const CLEANUP_INTERVAL_MS = 60_000;
@@ -295,6 +296,7 @@ export class AgentManager {
     record.execution.outputLog = new AgentOutputLog(id, prompt, undefined, this.bufferSize);
     record.display.outputFile = record.execution.outputLog.path;
 
+    emitLifecycle("child_started", { child_id: record.id, agent: record.display.type, model: record.display.invocation?.modelName ?? null, background: Boolean(options.isBackground) });
     this.onStart?.(record);
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
@@ -380,6 +382,7 @@ export class AgentManager {
         // Decrement per-model concurrency count
         if (concurrencySlot) concurrencySlot.running--;
 
+        emitLifecycle("child_terminal", { child_id: record.id, agent: record.display.type, status: record.lifecycle.status, duration_ms: (record.lifecycle.completedAt ?? Date.now()) - record.lifecycle.startedAt, tool_uses: record.stats.toolUses, usage: record.stats.lifetimeUsage, active_children: 0 });
         this.safeNotifyComplete(record);
         this.drainQueue();
       });

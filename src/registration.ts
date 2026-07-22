@@ -6,6 +6,7 @@ import { executeAgentStatusTool } from "./agents/agent-status.js";
 import { renderAgentToolCall, renderAgentToolResult, renderSubagentResult } from "./ui/renderer.js";
 import { showAgentsMainMenu } from "./ui/menu/menus.js";
 import { getPiInstance, getStore } from "./shell.js";
+import { emitLifecycle, lifecycleEnabled } from "./benchmark-lifecycle.js";
 
 // ============================================================================
 // Agent tool registration helper — dynamic enum for agent types

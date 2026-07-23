@@ -382,7 +382,7 @@ export class AgentManager {
         // Decrement per-model concurrency count
         if (concurrencySlot) concurrencySlot.running--;
 
-        emitLifecycle("child_terminal", { child_id: record.id, agent: record.display.type, model: record.display.invocation?.modelName ?? null, status: record.lifecycle.status, duration_ms: (record.lifecycle.completedAt ?? Date.now()) - record.lifecycle.startedAt, tool_uses: record.stats.toolUses, usage: record.stats.lifetimeUsage, session_file: record.execution.sessionFile ?? null, active_children: this.list().filter((agent) => agent.id !== record.id && agent.lifecycle.status === "running").length });
+        emitLifecycle("child_terminal", { child_id: record.id, agent: record.display.type, model: record.display.invocation?.modelName ?? null, status: record.lifecycle.status, duration_ms: (record.lifecycle.completedAt ?? Date.now()) - record.lifecycle.startedAt, tool_uses: record.stats.toolUses, usage: record.stats.lifetimeUsage, session_file: record.execution.sessionFile ?? null, active_children: this.listAgents().filter((agent) => agent.id !== record.id && agent.lifecycle.status === "running").length });
         this.safeNotifyComplete(record);
         this.drainQueue();
       });

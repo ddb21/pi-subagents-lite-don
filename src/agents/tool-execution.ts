@@ -15,7 +15,7 @@ import { resolveType, getAgentConfig, discoverNewAgents } from "./agent-types.js
 import { getLifetimeTotal, getSessionContextPercent } from "./usage.js";
 import { validateWorktreePath } from "../spawn/worktree-validator.js";
 
-import { parseModelKey, findModelInRegistry, parseThinkingLevel } from "../utils.js";
+import { parseModelKey, findModelInRegistry, parseThinkingLevel, splitModelThinkingSuffix } from "../utils.js";
 import {
   getPiInstance,
   getSessionCtx,
@@ -338,19 +338,21 @@ export async function toolCallListener(
   const explicitModel = typeof input.model === "string" && input.model ? input.model : undefined;
   const spawn = getStore().spawnFor(subagentType, parentModelId, agentConfig, explicitModel);
 
-  if (spawn.model) {
-    input.model = spawn.model;
+  const modelWithSuffix = spawn.model ? splitModelThinkingSuffix(spawn.model) : undefined;
+  if (modelWithSuffix?.model) {
+    input.model = modelWithSuffix.model;
     // Always inject _modelOverride for renderCall
-    const parsed = parseModelKey(spawn.model);
+    const parsed = parseModelKey(modelWithSuffix.model);
     if (parsed) {
       input._modelOverride = parsed.modelId;
     }
   }
 
   // Inject thinking if not explicitly passed: settings that traveled with the
-  // resolved model (follow-map entry), else agent config (frontmatter).
+  // resolved model (follow-map entry), a pi CLI-style model suffix, else agent
+  // config (frontmatter).
   if (input.thinking === undefined) {
-    const thinking = spawn.thinking ?? agentConfig?.thinkingLevel;
+    const thinking = spawn.thinking ?? modelWithSuffix?.thinking ?? agentConfig?.thinkingLevel;
     if (thinking !== undefined) {
       input.thinking = thinking;
     }

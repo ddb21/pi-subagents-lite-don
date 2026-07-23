@@ -43,7 +43,7 @@ export function safeReadFile(filePath: string): string | undefined {
 
 /** All valid thinking levels. */
 export const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = [
-  "off", "minimal", "low", "medium", "high", "xhigh",
+  "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ] as const;
 
 /**
@@ -53,6 +53,19 @@ export const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = [
 export function parseThinkingLevel(raw: string | undefined): ThinkingLevel | undefined {
   if (raw === undefined) return undefined;
   return VALID_THINKING_LEVELS.includes(raw as ThinkingLevel) ? (raw as ThinkingLevel) : undefined;
+}
+
+/**
+ * Split a pi CLI-style model key suffix ("provider/model:thinking") when the
+ * trailing segment is a known thinking level. Model IDs can also contain
+ * colons (for example Ollama tags), so unknown suffixes stay part of model.
+ */
+export function splitModelThinkingSuffix(modelStr: string): { model: string; thinking?: ThinkingLevel } {
+  const colonIdx = modelStr.lastIndexOf(":");
+  if (colonIdx <= 0 || colonIdx === modelStr.length - 1) return { model: modelStr };
+  const maybeThinking = parseThinkingLevel(modelStr.slice(colonIdx + 1));
+  if (!maybeThinking) return { model: modelStr };
+  return { model: modelStr.slice(0, colonIdx), thinking: maybeThinking };
 }
 
 /**
@@ -67,9 +80,10 @@ export function errorMessage(err: unknown): string {
  * Returns null if the format is invalid (no slash or empty provider).
  */
 export function parseModelKey(modelStr: string): { provider: string; modelId: string } | null {
-  const slashIdx = modelStr.indexOf("/");
+  const normalized = splitModelThinkingSuffix(modelStr).model;
+  const slashIdx = normalized.indexOf("/");
   if (slashIdx <= 0) return null;
-  return { provider: modelStr.slice(0, slashIdx), modelId: modelStr.slice(slashIdx + 1) };
+  return { provider: normalized.slice(0, slashIdx), modelId: normalized.slice(slashIdx + 1) };
 }
 
 /**

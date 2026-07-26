@@ -114,12 +114,18 @@ export async function executeAgentTool(
   const parentSessionFile = ctx.sessionManager.getSessionFile();
 
   // Don fork: named executors cannot combine resumable state with fork-style state.
-  const rawSessionKey = params.session_key as string | undefined;
-  const sessionKey = rawSessionKey;
-  if (rawSessionKey !== undefined) {
-    if (!rawSessionKey.trim()) return errorResult("session_key must be a non-empty string");
-    if (params.worktree_path !== undefined) {
-      return errorResult("session_key cannot be used with worktree_path");
+  // Constrained providers may serialize unused optional strings as "". Normalize
+  // those placeholders before checking mutual exclusion so an empty
+  // worktree_path cannot prevent an otherwise valid persistent-session spawn.
+  const rawSessionKey = typeof params.session_key === "string" ? params.session_key.trim() : undefined;
+  const sessionKey = rawSessionKey || undefined;
+  const rawWorktreePath = typeof params.worktree_path === "string" ? params.worktree_path.trim() : undefined;
+  if (params.session_key !== undefined && !sessionKey) {
+    return errorResult("session_key must be a non-empty string");
+  }
+  if (sessionKey) {
+    if (rawWorktreePath) {
+      return errorResult("session_key cannot be used with a non-empty worktree_path; omit one of these fields");
     }
     const forkStyleParam = ["context", "fork", "fork_from", "parent_session", "parentSession"]
       .find((name) => params[name] !== undefined);
@@ -129,10 +135,9 @@ export async function executeAgentTool(
   }
 
   // Validate worktree_path early — needed for on-demand agent discovery
-  const rawWorktreePath = params.worktree_path as string | undefined;
   let validatedWorktreePath: string | undefined;
   let worktreeLabel: string | undefined;
-  if (rawWorktreePath && rawWorktreePath.trim() !== "") {
+  if (rawWorktreePath) {
     try {
       const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
       const warnings: string[] = [];

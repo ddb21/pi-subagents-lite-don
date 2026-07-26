@@ -33,9 +33,9 @@ export function registerAgentTool(pi: ExtensionAPI): void {
       description: Type.Optional(Type.String()),
       agent: agentParam,
       run_in_background: Type.Optional(Type.Boolean()),
-      worktree_path: Type.Optional(Type.String()),
+      worktree_path: Type.Optional(Type.String({ description: "Optional working directory. Do not supply with session_key; omit this field rather than passing an empty string." })),
       // Don fork: optional named, resumable child-session executor.
-      session_key: Type.Optional(Type.String()),
+      session_key: Type.Optional(Type.String({ description: "Optional persistent-session key. Mutually exclusive with a non-empty worktree_path." })),
       // Don fork: per-call overrides. These were always read by the executor
       // but absent from the schema, so constrained providers could never emit
       // them. model: "provider/model-id"; thinking: off..max.

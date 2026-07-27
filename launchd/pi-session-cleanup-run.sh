@@ -25,6 +25,10 @@ if [ -z "$BUN" ]; then
 fi
 
 tmp="$CANON.tmp.$$"
+# Clean ALL agent dirs (~/.pi/agent and ~/.pi-lite/agent), existence-filtered by
+# the CLI default. Unset PI_CODING_AGENT_DIR so a leaked interactive value can
+# never narrow the sweep to a single dir.
+unset PI_CODING_AGENT_DIR
 # Subagent-session cleanup only. Top-level sessions/ (--include-main) stays OFF
 # by default; enable deliberately after reviewing a dry-run.
 "$BUN" run "$REPO/bin/pi-session-cleanup.ts" \

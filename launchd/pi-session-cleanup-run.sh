@@ -13,16 +13,19 @@ HISTDIR="$LOGDIR/history"
 CANON="$LOGDIR/pi-session-cleanup.log"
 mkdir -p "$HISTDIR"
 
-BUN="$(command -v bun || true)"
-if [ -z "$BUN" ]; then
-  for c in /opt/homebrew/bin/bun /usr/local/bin/bun "$HOME/.bun/bin/bun"; do
-    [ -x "$c" ] && BUN="$c" && break
-  done
-fi
-if [ -z "$BUN" ]; then
-  echo "PI_SESSION_CLEANUP status=error reason=bun-not-found at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CANON"
-  exit 3
-fi
+# Runtime resolution: prefer bun (runs the .ts sources directly, Main Mac); fall
+# back to node running the prebuilt dependency-free bundle dist/pi-session-
+# cleanup.mjs (aighost has node v24 but no bun). Node cannot run the .ts sources
+# directly because they import ".js" specifiers that bun-only remaps to ".ts".
+resolve_bin() {
+  local name="$1"; shift
+  local found; found="$(command -v "$name" 2>/dev/null || true)"
+  [ -n "$found" ] && { echo "$found"; return; }
+  for c in "$@"; do [ -x "$c" ] && { echo "$c"; return; }; done
+}
+BUN="$(resolve_bin bun /opt/homebrew/bin/bun /usr/local/bin/bun "$HOME/.bun/bin/bun")"
+NODE="$(resolve_bin node /opt/homebrew/bin/node /usr/local/bin/node)"
+BUNDLE="$REPO/launchd/pi-session-cleanup.bundle.mjs"
 
 tmp="$CANON.tmp.$$"
 # Clean ALL agent dirs (~/.pi/agent and ~/.pi-lite/agent), existence-filtered by
@@ -31,9 +34,18 @@ tmp="$CANON.tmp.$$"
 unset PI_CODING_AGENT_DIR
 # Subagent-session cleanup only. Top-level sessions/ (--include-main) stays OFF
 # by default; enable deliberately after reviewing a dry-run.
-"$BUN" run "$REPO/bin/pi-session-cleanup.ts" \
-  --apply --retention-days 14 --trash-retention-days 7 > "$tmp" 2>&1
-rc=$?
+if [ -n "$BUN" ]; then
+  "$BUN" run "$REPO/bin/pi-session-cleanup.ts" \
+    --apply --retention-days 14 --trash-retention-days 7 > "$tmp" 2>&1
+  rc=$?
+elif [ -n "$NODE" ] && [ -f "$BUNDLE" ]; then
+  "$NODE" "$BUNDLE" \
+    --apply --retention-days 14 --trash-retention-days 7 > "$tmp" 2>&1
+  rc=$?
+else
+  echo "PI_SESSION_CLEANUP status=error reason=no-runtime (need bun, or node + $BUNDLE) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CANON"
+  exit 3
+fi
 
 mv -f "$tmp" "$CANON"
 cp -f "$CANON" "$HISTDIR/pi-session-cleanup-$(date +%Y-%m-%d_%H%M%S).log"

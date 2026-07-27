@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../status-note.js", () => ({ getStatusNote: () => "" }));
-const agentConfigs: Record<string, { persistentSession?: boolean }> = {
+const agentConfigs: Record<string, { sessionLifecycle?: "persistent" | "stateless"; persistentSession?: boolean }> = {
   qa: {},
   "reviewer-adversarial": {},
   "reviewer-conformance": {},
@@ -9,11 +9,12 @@ const agentConfigs: Record<string, { persistentSession?: boolean }> = {
   "qa-56": {},
   "qa-gemini": {},
   "qa-opus": {},
-  executor: { persistentSession: true },
+  executor: { sessionLifecycle: "persistent", persistentSession: true },
+  "data-deck": { sessionLifecycle: "persistent" },
 };
 
 vi.mock("./agent-types.js", () => ({
-  resolveType: (name: string) => name,
+  resolveType: (name: string) => name === "deck-alias" ? "data-deck" : name,
   getAgentConfig: (name: string) => agentConfigs[name],
   discoverNewAgents: vi.fn(),
 }));
@@ -77,6 +78,32 @@ describe("Agent session_key/worktree_path normalization", () => {
       sessionKey: "exec-repo",
       sessionKeyCwd: "/repo",
       worktreePath: undefined,
+    }));
+  });
+
+  it("allows an unkeyed persistent agent to run one-shot", async () => {
+    const result = await execute({}, "data-deck");
+
+    expect(result.isError).not.toBe(true);
+    expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.not.objectContaining({ sessionKey: expect.anything() }));
+  });
+
+  it("allows a keyed persistent artifact agent and forwards resolved type scope", async () => {
+    const result = await execute({ session_key: "deck-study" }, "data-deck");
+
+    expect(result.isError).not.toBe(true);
+    expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.objectContaining({
+      sessionKey: "deck-study",
+      sessionKeyAgentType: "data-deck",
+    }));
+  });
+
+  it("uses the canonical resolved type, not an alias, to scope a keyed session", async () => {
+    const result = await execute({ session_key: "deck-study" }, "deck-alias");
+
+    expect(result.isError).not.toBe(true);
+    expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.objectContaining({
+      sessionKeyAgentType: "data-deck",
     }));
   });
 

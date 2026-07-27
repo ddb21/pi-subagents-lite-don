@@ -79,8 +79,10 @@ export interface SpawnOptions extends SpawnConfig, RunCallbacks {
   parentSessionFile?: string;
   /** Don fork: optional named persistent executor session. */
   sessionKey?: string;
-  /** Don fork: parent cwd component used to scope sessionKey. */
+  /** Parent cwd component used to scope sessionKey. */
   sessionKeyCwd?: string;
+  /** Canonical resolved agent type required when sessionKey is set. */
+  sessionKeyAgentType?: string;
   /** Don fork: existing keyed session file to reopen, if its mapping resolves. */
   resumeSessionFile?: string;
 }
@@ -203,8 +205,12 @@ export class AgentManager {
     // live records can never write the same append-only JSONL file.
     if (options.sessionKey) {
       const sessionKeyCwd = options.sessionKeyCwd ?? ctx.cwd;
-      const sessionKeyId = getSessionKeyIndexKey(sessionKeyCwd, options.sessionKey);
-      const resumeSessionFile = resolveSessionKey(getAgentDir(), sessionKeyCwd, options.sessionKey);
+      const sessionKeyAgentType = options.sessionKeyAgentType;
+      if (!sessionKeyAgentType) {
+        throw new Error("session_key requires a canonical resolved agent type");
+      }
+      const sessionKeyId = getSessionKeyIndexKey(sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
+      const resumeSessionFile = resolveSessionKey(getAgentDir(), sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
       const busyRecord = [...this.agents.values()].find((record) => {
         if (record.lifecycle.status !== "queued" && record.lifecycle.status !== "running") return false;
         return record.execution.sessionKey === sessionKeyId
@@ -250,7 +256,7 @@ export class AgentManager {
         abortController,
         // Don fork: reserve an uncreated key too, preventing same-key queue races.
         ...(options.sessionKey ? {
-          sessionKey: getSessionKeyIndexKey(options.sessionKeyCwd ?? ctx.cwd, options.sessionKey),
+          sessionKey: getSessionKeyIndexKey(options.sessionKeyCwd ?? ctx.cwd, options.sessionKeyAgentType!, options.sessionKey),
           sessionFile: options.resumeSessionFile,
         } : {}),
       },
@@ -317,6 +323,7 @@ export class AgentManager {
       parentSessionFile: options.parentSessionFile,
       sessionKey: options.sessionKey,
       sessionKeyCwd: options.sessionKeyCwd,
+      sessionKeyAgentType: options.sessionKey ? options.sessionKeyAgentType! : undefined,
       resumeSessionFile: options.resumeSessionFile,
       ...this.createRecordCallbacks(record, options),
       onTurnEnd: (turnCount) => {

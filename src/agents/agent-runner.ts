@@ -55,8 +55,10 @@ interface RunOptions extends RunTunables, RunCallbacks {
   parentSessionFile?: string;
   /** Don fork: optional named persistent executor session. */
   sessionKey?: string;
-  /** Don fork: parent cwd component used to scope sessionKey. */
+  /** Parent cwd component used to scope sessionKey. */
   sessionKeyCwd?: string;
+  /** Canonical resolved agent type required when sessionKey is set. */
+  sessionKeyAgentType?: string;
   /** Don fork: existing keyed session file to reopen. */
   resumeSessionFile?: string;
 }
@@ -427,7 +429,7 @@ async function initSession(
     const sessionFile = sessionManager.getSessionFile();
     if (!sessionFile) throw new Error("persistent executor session has no session file");
     // Don fork: the SessionManager target is known before its first lazy file write.
-    recordSessionKey(agentDir, options.sessionKeyCwd ?? cwd, options.sessionKey, sessionFile);
+    recordSessionKey(agentDir, options.sessionKeyCwd ?? cwd, options.sessionKeyAgentType!, options.sessionKey, sessionFile);
   }
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd, agentDir,

@@ -6,6 +6,9 @@ export type SubagentType = string;
 /** How the subagent system prompt is constructed. */
 export type SystemPromptMode = "replace" | "inherit" | "custom";
 
+/** Agent session lifecycle policy. Keyed calls persist; unkeyed calls remain one-shot. */
+export type SessionLifecycle = "persistent" | "stateless";
+
 /** Unified agent configuration — used for both default and user-defined agents. */
 export interface AgentConfig {
   name: string;
@@ -30,7 +33,9 @@ export interface AgentConfig {
   skills?: true | string[] | false;
   /** Skills to preload with full content into system prompt. string[] = listed, false/undefined = none */
   preloadSkills?: string[] | false;
-  /** Whether this agent may use a named persistent session_key. Defaults to false. */
+  /** Whether keyed multi-round sessions are supported. Defaults to stateless. */
+  sessionLifecycle?: SessionLifecycle;
+  /** Compatibility alias for sessionLifecycle: persistent. */
   persistentSession?: boolean;
   model?: string;
   thinkingLevel?: ThinkingLevel;

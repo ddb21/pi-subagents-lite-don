@@ -170,7 +170,9 @@ export async function executeAgentTool(
     return errorResult(`Unknown agent type: ${type}`);
   }
   const agentConfig = getAgentConfig(resolvedType);
-  if (sessionKey && agentConfig?.persistentSession !== true) {
+  const sessionLifecycle = agentConfig?.sessionLifecycle
+    ?? (agentConfig?.persistentSession === true ? "persistent" : "stateless");
+  if (sessionKey && sessionLifecycle !== "persistent") {
     return errorResult(`session_key is not supported by stateless agent '${resolvedType}'; omit session_key`);
   }
 
@@ -222,8 +224,8 @@ export async function executeAgentTool(
       invocation: { modelName },
       ...(isBackground ? {} : { signal }),
       parentSessionFile,
-      // Don fork: scope named executors to the parent session's cwd.
-      ...(sessionKey ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd } : {}),
+      // Scope keyed sessions by normalized parent cwd, resolved type, and caller key.
+      ...(sessionKey ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd, sessionKeyAgentType: resolvedType } : {}),
       runInBackground: isBackground,
     });
   } catch (err: unknown) {

@@ -30,6 +30,7 @@ export interface AgentConfigFromMd {
   exclude_extensions?: string[];
   skills?: boolean | string[];
   preload_skills?: string[] | false;
+  session_lifecycle?: "persistent" | "stateless";
   persistent_session?: boolean;
   model?: string;
   thinking?: ThinkingLevel;
@@ -224,6 +225,11 @@ function parseBoolean(
   return undefined;
 }
 
+/** Parse and validate session lifecycle metadata. */
+function parseSessionLifecycle(raw: unknown): "persistent" | "stateless" | undefined {
+  return raw === "persistent" || raw === "stateless" ? raw : undefined;
+}
+
 /** Extract a number from frontmatter (number or numeric string). */
 function parseNumber(
   frontmatter: Record<string, unknown>,
@@ -272,6 +278,7 @@ export function parseAgentFile(
     exclude_extensions: parseStringArray(frontmatter, "exclude_extensions"),
     skills: parseExtensions(frontmatter.skills),
     preload_skills: parsePreloadSkills(frontmatter.preload_skills),
+    session_lifecycle: parseSessionLifecycle(frontmatter.session_lifecycle),
     persistent_session: parseBoolean(frontmatter, "persistent_session"),
     model: parseString(frontmatter, "model"),
     thinking: parseThinkingLevel(parseString(frontmatter, "thinking")),
@@ -393,6 +400,14 @@ function mergeAgentOverrides(
  * fields fall through to the existing values.
  */
 function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
+  const lifecycle = md.session_lifecycle;
+  const legacyLifecycle = md.persistent_session === undefined
+    ? undefined
+    : md.persistent_session ? "persistent" : "stateless";
+  const resolvedLifecycle = lifecycle ?? legacyLifecycle;
+  if (lifecycle && legacyLifecycle && lifecycle !== legacyLifecycle) {
+    throw new Error(`Agent '${md.name ?? "unknown"}' has conflicting session_lifecycle and persistent_session metadata`);
+  }
   const obj: Record<string, unknown> = {
     name: md.name,
     displayName: md.display_name,
@@ -404,7 +419,8 @@ function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
     excludeExtensions: md.exclude_extensions,
     skills: md.skills,
     preloadSkills: md.preload_skills,
-    persistentSession: md.persistent_session,
+    sessionLifecycle: resolvedLifecycle,
+    persistentSession: resolvedLifecycle === undefined ? undefined : resolvedLifecycle === "persistent",
     model: md.model,
     thinkingLevel: md.thinking,
     maxTurns: md.max_turns,

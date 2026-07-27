@@ -22,8 +22,33 @@ function getLegacySessionKeyIndexKey(cwd: string, sessionKey: string): string {
   return `${path.resolve(cwd)}|${sessionKey}`;
 }
 
-function getSessionKeyIndexFile(agentDir: string): string {
+export function getSessionKeyIndexFile(agentDir: string): string {
   return path.join(getSubagentSessionDir(agentDir), SESSION_KEY_INDEX_FILE);
+}
+
+/**
+ * Fail-closed read for maintenance tooling. A missing index is an empty index
+ * (ENOENT -> {}), but a present-but-corrupt index THROWS instead of silently
+ * degrading to {}. Cleanup must never interpret an unreadable index as "nothing
+ * is referenced" and then delete live persistent-session transcripts.
+ */
+export function readSessionKeyIndexStrict(agentDir: string): SessionKeyIndex {
+  const indexFile = getSessionKeyIndexFile(agentDir);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(indexFile, "utf8");
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw err;
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error(`invalid session key index (not an object): ${indexFile}`);
+  }
+  for (const value of Object.values(parsed)) {
+    if (typeof value !== "string") throw new Error(`invalid session key index (non-string value): ${indexFile}`);
+  }
+  return parsed as SessionKeyIndex;
 }
 
 function parseIndex(indexFile: string): SessionKeyIndex {
@@ -38,8 +63,9 @@ function parseIndex(indexFile: string): SessionKeyIndex {
   }
 }
 
-function mutateSessionKeyIndex(agentDir: string, mutate: (index: SessionKeyIndex) => void): SessionKeyIndex {
-  const indexFile = getSessionKeyIndexFile(agentDir);
+/** Run `fn` while holding the index file lock. Does not read or write the index
+ *  itself; callers decide. Shared by the mutate and read-only-under-lock paths. */
+function withIndexFileLock<T>(indexFile: string, fn: () => T): T {
   fs.mkdirSync(path.dirname(indexFile), { recursive: true });
   const lockFile = `${indexFile}.lock`;
   const deadline = Date.now() + 2_000;
@@ -47,12 +73,7 @@ function mutateSessionKeyIndex(agentDir: string, mutate: (index: SessionKeyIndex
     try {
       const fd = fs.openSync(lockFile, "wx");
       try {
-        const index = parseIndex(indexFile);
-        mutate(index);
-        const tempFile = `${indexFile}.${process.pid}.${randomUUID()}.tmp`;
-        fs.writeFileSync(tempFile, JSON.stringify(index) + "\n", "utf8");
-        fs.renameSync(tempFile, indexFile);
-        return index;
+        return fn();
       } finally {
         fs.closeSync(fd);
         try { fs.unlinkSync(lockFile); } catch { /* best effort */ }
@@ -64,7 +85,32 @@ function mutateSessionKeyIndex(agentDir: string, mutate: (index: SessionKeyIndex
   }
 }
 
-function readSessionKeyIndex(agentDir: string): SessionKeyIndex {
+export function mutateSessionKeyIndex(agentDir: string, mutate: (index: SessionKeyIndex) => void): SessionKeyIndex {
+  const indexFile = getSessionKeyIndexFile(agentDir);
+  return withIndexFileLock(indexFile, () => {
+    const index = parseIndex(indexFile);
+    mutate(index);
+    const tempFile = `${indexFile}.${process.pid}.${randomUUID()}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(index) + "\n", "utf8");
+    fs.renameSync(tempFile, indexFile);
+    return index;
+  });
+}
+
+/**
+ * Hold the index lock, strict-read the index (fail-closed on corruption), and
+ * run `fn` against it WITHOUT writing. Cleanup uses this to check-and-move a
+ * transcript atomically: because the lock is held across the caller's move, a
+ * concurrent recordSessionKey cannot register the same path mid-move. A corrupt
+ * index throws here so the caller can fail closed rather than treating an
+ * unreadable index as "nothing referenced".
+ */
+export function withSessionKeyIndexLock<T>(agentDir: string, fn: (index: SessionKeyIndex) => T): T {
+  const indexFile = getSessionKeyIndexFile(agentDir);
+  return withIndexFileLock(indexFile, () => fn(readSessionKeyIndexStrict(agentDir)));
+}
+
+export function readSessionKeyIndex(agentDir: string): SessionKeyIndex {
   return parseIndex(getSessionKeyIndexFile(agentDir));
 }
 

@@ -34,8 +34,10 @@ export function registerAgentTool(pi: ExtensionAPI): void {
       agent: agentParam,
       run_in_background: Type.Optional(Type.Boolean()),
       worktree_path: Type.Optional(Type.String({ description: "Optional working directory. Do not supply with session_key; omit this field rather than passing an empty string." })),
-      // Don fork: optional named, resumable child-session executor.
-      session_key: Type.Optional(Type.String({ description: "Optional persistent-session key. Mutually exclusive with a non-empty worktree_path." })),
+      // Don fork: optional named, resumable child-session executor. The schema
+      // rejects empty/whitespace placeholders before execution; one-shot
+      // reviewer calls should omit session_key entirely.
+      session_key: Type.Optional(Type.String({ minLength: 1, pattern: ".*\\S.*", description: "Optional persistent-session key. If unused, omit this field. Must contain a non-whitespace character and is mutually exclusive with a non-empty worktree_path." })),
       // Don fork: per-call overrides. These were always read by the executor
       // but absent from the schema, so constrained providers could never emit
       // them. model: "provider/model-id"; thinking: off..max.

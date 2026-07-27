@@ -30,6 +30,8 @@ export interface AgentConfig {
   skills?: true | string[] | false;
   /** Skills to preload with full content into system prompt. string[] = listed, false/undefined = none */
   preloadSkills?: string[] | false;
+  /** Whether this agent may use a named persistent session_key. Defaults to false. */
+  persistentSession?: boolean;
   model?: string;
   thinkingLevel?: ThinkingLevel;
   maxTurns?: number;

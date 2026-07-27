@@ -60,7 +60,9 @@ Added after the original fork (see git log for details):
 
 - **`session_key`** on the Agent tool: named, persistent, per-project executor
   sessions that survive across parent sessions (the two-tier architecture's
-  Terra executor).
+  Terra executor). It is optional but, when supplied, must contain a
+  non-whitespace character. Stateless one-shot calls such as QA/reviewer routes
+  must omit it rather than sending `session_key: ""`.
 - **Forced foreground in one-shot mode**: `run_in_background` is ignored when
   there is no UI (`pi -p` / `--mode json`) — the process exits at turn end, so
   a background child could never deliver its result.

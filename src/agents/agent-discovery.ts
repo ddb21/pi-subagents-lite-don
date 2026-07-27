@@ -30,6 +30,7 @@ export interface AgentConfigFromMd {
   exclude_extensions?: string[];
   skills?: boolean | string[];
   preload_skills?: string[] | false;
+  persistent_session?: boolean;
   model?: string;
   thinking?: ThinkingLevel;
   max_turns?: number;
@@ -271,6 +272,7 @@ export function parseAgentFile(
     exclude_extensions: parseStringArray(frontmatter, "exclude_extensions"),
     skills: parseExtensions(frontmatter.skills),
     preload_skills: parsePreloadSkills(frontmatter.preload_skills),
+    persistent_session: parseBoolean(frontmatter, "persistent_session"),
     model: parseString(frontmatter, "model"),
     thinking: parseThinkingLevel(parseString(frontmatter, "thinking")),
     max_turns: parseNumber(frontmatter, "max_turns"),
@@ -402,6 +404,7 @@ function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
     excludeExtensions: md.exclude_extensions,
     skills: md.skills,
     preloadSkills: md.preload_skills,
+    persistentSession: md.persistent_session,
     model: md.model,
     thinkingLevel: md.thinking,
     maxTurns: md.max_turns,

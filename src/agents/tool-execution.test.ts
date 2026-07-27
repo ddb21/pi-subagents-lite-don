@@ -1,9 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../status-note.js", () => ({ getStatusNote: () => "" }));
+const agentConfigs: Record<string, { persistentSession?: boolean }> = {
+  qa: {},
+  "reviewer-adversarial": {},
+  "reviewer-conformance": {},
+  "reviewer-tests": {},
+  "qa-56": {},
+  "qa-gemini": {},
+  "qa-opus": {},
+  executor: { persistentSession: true },
+};
+
 vi.mock("./agent-types.js", () => ({
-  resolveType: () => "qa",
-  getAgentConfig: () => undefined,
+  resolveType: (name: string) => name,
+  getAgentConfig: (name: string) => agentConfigs[name],
   discoverNewAgents: vi.fn(),
 }));
 vi.mock("./usage.js", () => ({
@@ -47,9 +58,9 @@ const ctx = {
   sessionManager: { getSessionFile: () => "/parent.jsonl" },
 } as any;
 
-function execute(params: Record<string, unknown>) {
+function execute(params: Record<string, unknown>, agent = "qa") {
   return executeAgentTool("call", {
-    agent: "qa",
+    agent,
     prompt: "review",
     description: "review",
     run_in_background: false,
@@ -58,15 +69,30 @@ function execute(params: Record<string, unknown>) {
 }
 
 describe("Agent session_key/worktree_path normalization", () => {
-  it("treats an empty worktree_path placeholder as absent", async () => {
-    const result = await execute({ session_key: " qa-review ", worktree_path: "  " });
+  it("allows a persistent-session-capable executor and trims placeholders", async () => {
+    const result = await execute({ session_key: " exec-repo ", worktree_path: "  " }, "executor");
 
     expect(result.isError).not.toBe(true);
     expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.objectContaining({
-      sessionKey: "qa-review",
+      sessionKey: "exec-repo",
       sessionKeyCwd: "/repo",
       worktreePath: undefined,
     }));
+  });
+
+  it.each([
+    "qa",
+    "qa-56",
+    "qa-gemini",
+    "qa-opus",
+    "reviewer-adversarial",
+    "reviewer-conformance",
+    "reviewer-tests",
+  ])("rejects session_key for stateless route %s", async (agent) => {
+    const result = await execute({ session_key: "not-allowed" }, agent);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe(`session_key is not supported by stateless agent '${agent}'; omit session_key`);
   });
 
   it("rejects a session_key with a non-empty worktree_path", async () => {

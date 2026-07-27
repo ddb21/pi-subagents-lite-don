@@ -169,6 +169,10 @@ export async function executeAgentTool(
   if (!resolvedType) {
     return errorResult(`Unknown agent type: ${type}`);
   }
+  const agentConfig = getAgentConfig(resolvedType);
+  if (sessionKey && agentConfig?.persistentSession !== true) {
+    return errorResult(`session_key is not supported by stateless agent '${resolvedType}'; omit session_key`);
+  }
 
   const prompt = params.prompt as string;
   const description = (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
@@ -180,7 +184,7 @@ export async function executeAgentTool(
   // succeed — force foreground instead of losing the work.
   const forcedForeground = isBackground && !ctx.hasUI;
   if (forcedForeground) isBackground = false;
-  const maxTurns = params.max_turns as number | undefined ?? getAgentConfig(resolvedType)?.maxTurns;
+  const maxTurns = params.max_turns as number | undefined ?? agentConfig?.maxTurns;
 
   const modelStr = params.model as string | undefined;
   // Don fork: a requested model that isn't in the registry is an error, not a
@@ -198,7 +202,7 @@ export async function executeAgentTool(
 
   // Resolve thinking: explicit param > agent config (frontmatter) > undefined (inherit)
   const thinkingLevel = parseThinkingLevel(params.thinking as string | undefined)
-    ?? getAgentConfig(resolvedType)?.thinkingLevel;
+    ?? agentConfig?.thinkingLevel;
 
   // Use SpawnCoordinator for unified spawn path
   const coordinator = getCoordinator()!;

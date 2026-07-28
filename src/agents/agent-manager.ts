@@ -22,7 +22,7 @@ import {
 import type { SubagentType } from "./types.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type AgentUsage } from "./usage.js";
 import { errorMessage } from "../utils.js";
-import { getSessionKeyIndexKey, resolveSessionKey } from "./persistent-executor.js";
+import { getSessionKeyIndexKey, resolveSessionKey, acquireSessionFileLease, acquireSessionKeyLease, type PersistentSessionLease } from "./persistent-executor.js";
 import { emitLifecycle } from "../benchmark-lifecycle.js";
 
 /** How often to check for expired agent records (milliseconds). */
@@ -85,6 +85,8 @@ export interface SpawnOptions extends SpawnConfig, RunCallbacks {
   sessionKeyAgentType?: string;
   /** Don fork: existing keyed session file to reopen, if its mapping resolves. */
   resumeSessionFile?: string;
+  /** Cross-process owner lease, held until the complete session turn is persisted. */
+  persistentSessionLease?: PersistentSessionLease;
 }
 
 export class AgentManager {
@@ -210,16 +212,20 @@ export class AgentManager {
         throw new Error("session_key requires a canonical resolved agent type");
       }
       const sessionKeyId = getSessionKeyIndexKey(sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
-      const resumeSessionFile = resolveSessionKey(getAgentDir(), sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
-      const busyRecord = [...this.agents.values()].find((record) => {
-        if (record.lifecycle.status !== "queued" && record.lifecycle.status !== "running") return false;
-        return record.execution.sessionKey === sessionKeyId
-          || (!!resumeSessionFile && record.execution.sessionFile === resumeSessionFile);
-      });
-      if (busyRecord) {
-        throw new Error(`Executor '${options.sessionKey}' is busy (agent ${busyRecord.id.slice(0, SHORT_ID_LENGTH)}). Wait for it to finish.`);
-      }
-      options.resumeSessionFile = resumeSessionFile;
+      const lease = acquireSessionKeyLease(getAgentDir(), sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
+      try {
+        const resumeSessionFile = resolveSessionKey(getAgentDir(), sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
+        const busyRecord = [...this.agents.values()].find((record) => {
+          if (record.lifecycle.status !== "queued" && record.lifecycle.status !== "running") return false;
+          return record.execution.sessionKey === sessionKeyId
+            || (!!resumeSessionFile && record.execution.sessionFile === resumeSessionFile);
+        });
+        if (busyRecord) throw new Error(`Executor '${options.sessionKey}' is busy (agent ${busyRecord.id.slice(0, SHORT_ID_LENGTH)}). Wait for it to finish.`);
+        options.resumeSessionFile = resumeSessionFile;
+        options.persistentSessionLease = lease;
+      } catch (error) { lease.release(); throw error; }
+    } else if (options.resumeSessionFile) {
+      options.persistentSessionLease = acquireSessionFileLease(getAgentDir(), options.resumeSessionFile);
     }
 
     const id = randomUUID().slice(0, AGENT_ID_PREFIX_LENGTH);
@@ -277,6 +283,8 @@ export class AgentManager {
       this.startAgent(id, record, args, concurrencySlot);
     } catch (err) {
       this.agents.delete(id);
+      options.persistentSessionLease?.release();
+      options.persistentSessionLease = undefined;
       throw err;
     }
     return id;
@@ -325,6 +333,7 @@ export class AgentManager {
       sessionKeyCwd: options.sessionKeyCwd,
       sessionKeyAgentType: options.sessionKey ? options.sessionKeyAgentType! : undefined,
       resumeSessionFile: options.resumeSessionFile,
+      persistentSessionLease: options.persistentSessionLease,
       ...this.createRecordCallbacks(record, options),
       onTurnEnd: (turnCount) => {
         record.stats.turnCount = turnCount;
@@ -373,6 +382,8 @@ export class AgentManager {
         return "";
       })
       .finally(() => {
+        options.persistentSessionLease?.release();
+        options.persistentSessionLease = undefined;
         // Finalize output log with final stats
         if (record.execution.outputLog) {
           try {

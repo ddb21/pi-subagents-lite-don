@@ -33,6 +33,7 @@ import {
   getSubagentSessionDir,
   recordSessionKey,
   sanitizeDanglingToolCalls,
+  type PersistentSessionLease,
 } from "./persistent-executor.js";
 
 /** Normalize max turns. undefined or 0 = unlimited, otherwise minimum 1. */
@@ -61,6 +62,8 @@ interface RunOptions extends RunTunables, RunCallbacks {
   sessionKeyAgentType?: string;
   /** Don fork: existing keyed session file to reopen. */
   resumeSessionFile?: string;
+  /** Cross-process lease already acquired before mapping resolution. */
+  persistentSessionLease?: PersistentSessionLease;
 }
 
 interface RunResult {

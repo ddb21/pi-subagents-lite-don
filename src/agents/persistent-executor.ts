@@ -1,6 +1,6 @@
 // Don fork: disk index and resume repair for named persistent subagent sessions.
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -8,6 +8,7 @@ import type { SessionManager } from "@earendil-works/pi-coding-agent";
 const SUBAGENT_SESSION_DIR = "sessions-subagents";
 const SESSION_KEY_INDEX_FILE = "session-keys.json";
 type SessionKeyIndex = Record<string, string>;
+export type PersistentSessionLease = { lockPath: string; sessionFile?: string; release(): void };
 
 export function getSubagentSessionDir(agentDir: string): string {
   return path.join(agentDir, SUBAGENT_SESSION_DIR);
@@ -24,6 +25,35 @@ function getLegacySessionKeyIndexKey(cwd: string, sessionKey: string): string {
 
 export function getSessionKeyIndexFile(agentDir: string): string {
   return path.join(getSubagentSessionDir(agentDir), SESSION_KEY_INDEX_FILE);
+}
+
+function processAlive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
+function leasePath(agentDir: string, identity: string): string { return path.join(getSubagentSessionDir(agentDir), "leases", `${createHash("sha256").update(identity).digest("hex")}.lock`); }
+function acquireLease(pathname: string): PersistentSessionLease {
+  fs.mkdirSync(path.dirname(pathname), { recursive: true }); const token = randomUUID();
+  for (;;) {
+    try { fs.mkdirSync(pathname); break; } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let owner: { pid?: unknown; token?: unknown } | undefined;
+      try { owner = JSON.parse(fs.readFileSync(path.join(pathname, "owner.json"), "utf8")); } catch {}
+      if (!owner || typeof owner.pid !== "number" || typeof owner.token !== "string" || processAlive(owner.pid)) throw new Error(`persistent_session_busy:${pathname}`);
+      const stale = `${pathname}.stale.${Date.now()}.${randomUUID()}`;
+      try { fs.renameSync(pathname, stale); fs.rmSync(stale, { recursive: true, force: true }); } catch (renameError: unknown) { if ((renameError as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`persistent_session_busy:${pathname}`); }
+    }
+  }
+  try { const ownerFile = path.join(pathname, "owner.json"); fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }), { encoding: "utf8", flag: "wx", mode: 0o600 }); } catch (error) { fs.rmSync(pathname, { recursive: true, force: true }); throw error; }
+  let released = false;
+  return { lockPath: pathname, release() { if (released) return; released = true; try { const owner = JSON.parse(fs.readFileSync(path.join(pathname, "owner.json"), "utf8")); if (owner.pid === process.pid && owner.token === token) fs.rmSync(pathname, { recursive: true, force: true }); } catch {} } };
+}
+
+/** Acquire before resolving or creating a keyed session; release only after the complete run has persisted. */
+export function acquireSessionKeyLease(agentDir: string, cwd: string, canonicalAgentType: string, sessionKey: string): PersistentSessionLease {
+  return acquireLease(leasePath(agentDir, `key:${getSessionKeyIndexKey(cwd, canonicalAgentType, sessionKey)}`));
+}
+
+/** Protect direct resume paths that bypass session_key mapping. */
+export function acquireSessionFileLease(agentDir: string, sessionFile: string): PersistentSessionLease {
+  const lease = acquireLease(leasePath(agentDir, `file:${path.resolve(sessionFile)}`)); lease.sessionFile = path.resolve(sessionFile); return lease;
 }
 
 /**

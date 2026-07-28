@@ -55,6 +55,23 @@ describe("keyed session scoping", () => {
     expect(resolveSessionKey(agentDir, cwd, "executor", "legacy")).toBeUndefined();
   });
 
+  it("leases reject another process, release for the next owner, and reclaim a dead owner", async () => {
+    const { agentDir, cwd } = await fixture();
+    const { acquireSessionKeyLease } = await import("./persistent-executor.js");
+    const first = acquireSessionKeyLease(agentDir, cwd, "executor", "shared");
+    expect(() => acquireSessionKeyLease(agentDir, cwd, "executor", "shared")).toThrow("persistent_session_busy");
+    first.release();
+    const second = acquireSessionKeyLease(agentDir, cwd, "executor", "shared"); second.release();
+  });
+
+  it("leases direct resume files independently", async () => {
+    const { agentDir } = await fixture(); const session = join(agentDir, "direct.jsonl"); await writeFile(session, "{}\n");
+    const { acquireSessionFileLease } = await import("./persistent-executor.js");
+    const first = acquireSessionFileLease(agentDir, session);
+    expect(() => acquireSessionFileLease(agentDir, session)).toThrow("persistent_session_busy");
+    first.release(); const next = acquireSessionFileLease(agentDir, session); next.release();
+  });
+
   it("merges concurrent executor legacy migrations without losing entries", async () => {
     const { agentDir, cwd, indexFile } = await fixture();
     const one = join(agentDir, "one.jsonl"); const two = join(agentDir, "two.jsonl");

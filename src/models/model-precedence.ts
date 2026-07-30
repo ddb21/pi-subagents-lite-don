@@ -4,20 +4,28 @@
  * Pure function — no side effects, no file I/O, no pi SDK imports.
  *
  * Precedence chain (highest to lowest):
- *   1. sessionOverrides[subagentType]  (session per-type override)
+ *   1. sessionOverrides[subagentType]  (session per-type override, /agents menu)
  *   2. sessionOverrides["default"]     (session global default)
  *   3. config.agent[subagentType]      (config per-type override)
  *   4. config.agent["default"]         (config global default)
  *   5. explicitModel                 (per-call `model` param from the parent)
- *   6. modelAgents[parent model ID]  (exact-parent map, per-type then default)
- *   7. providerAgents[parent provider] (provider-follow map, per-type then default)
- *   8. agentConfig?.model            (agent config / frontmatter)
- *   9. parentModelId                 (inherit from parent)
+ *   6. ambientOverrides[subagentType]  (session ambient route, /pool)
+ *   7. ambientOverrides["default"]     (session ambient default)
+ *   8. modelAgents[parent model ID]  (exact-parent map, per-type then default)
+ *   9. providerAgents[parent provider] (provider-follow map, per-type then default)
+ *  10. agentConfig?.model            (agent config / frontmatter)
+ *  11. parentModelId                 (inherit from parent)
  *
- * Tiers 5–7 are the Don-fork additions: an explicit per-call model wins over
+ * Tiers 5–9 are the Don-fork additions: an explicit per-call model wins over
  * both maps and frontmatter (so targeted overrides like a Luna trial work),
  * while exact parent-model routes take precedence over provider routes. All
  * maps still lose to user-set session/config pins.
+ *
+ * Why two session tiers: an /agents menu pick is a hard instruction and sits at
+ * the top. A /pool switch is only "this session prefers that pool", so it sits
+ * BELOW explicitModel. Otherwise a session-scoped pool switch would silently
+ * cancel a deliberate escalation, for example lmd-science asking for Opus on
+ * heavy quantitative work, which is the exact failure this fork set out to fix.
  *
  * Thinking travels with the model: a map entry's thinking applies only when
  * that entry is the one that supplied the resolved model. A model chosen by a
@@ -137,6 +145,8 @@ export interface ResolveModelOptions {
   parentModelId: string;
   /** Session-only overrides (checked first). */
   sessionOverrides?: SessionModelOverrides;
+  /** Ambient session routes from /pool. Below explicitModel on purpose. */
+  ambientOverrides?: SessionModelOverrides;
   /** Explicit per-call `model` param from the parent's Agent tool call. */
   explicitModel?: string;
 }
@@ -188,7 +198,7 @@ export function resolveModel(options: ResolveModelOptions): string {
  * resolveModel; thinking is populated only when a follow-map entry won.
  */
 export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
-  const { subagentType, agentConfig, config, parentModelId, sessionOverrides, explicitModel } = options;
+  const { subagentType, agentConfig, config, parentModelId, sessionOverrides, ambientOverrides, explicitModel } = options;
 
   const parentProvider = providerOf(parentModelId);
   const modelMap = parentModelId ? config.modelAgents?.[parentModelId] : undefined;
@@ -206,6 +216,8 @@ export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
     { model: config.agent[subagentType] as string | null | undefined },
     { model: config.agent["default"] },
     { model: explicitModel },
+    { model: ambientOverrides?.[subagentType] },
+    { model: ambientOverrides?.["default"] },
     { model: exactTypedEntry?.model, thinking: exactTypedEntry?.thinking },
     { model: exactDefaultEntry?.model, thinking: exactDefaultEntry?.thinking },
     { model: providerTypedEntry?.model, thinking: providerTypedEntry?.thinking },

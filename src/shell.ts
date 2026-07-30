@@ -71,6 +71,47 @@ export function getStore(): ConfigStore {
   return shell.store;
 }
 
+/**
+ * Publish a narrow session-override bridge on globalThis.
+ *
+ * The store is module-private, so a sibling extension (for example the /pool
+ * command) has no way to scope subagent routing to one session. Without this,
+ * every pool switch is global: it rewrites config for all runtimes and every
+ * future session, which is wrong when Don only wants this session on another
+ * pool. Only session overrides are exposed, never persisted config, so a
+ * caller cannot use the bridge to write to disk.
+ */
+export function publishSessionBridge(): void {
+  (globalThis as any).__piSubagentsLiteSession = {
+    /**
+     * Ambient route for this session, used by /pool. `spec` may include
+     * ":thinking". Sits below an explicit per-call model, so a deliberate
+     * escalation still wins.
+     */
+    setAmbient: (type: string, spec: string): void => {
+      shell.store.mutate.session.setAmbient(type, spec);
+    },
+    /** Hard per-session pin, as set by the /agents menu. Outranks everything. */
+    setOverride: (type: string, spec: string): void => {
+      shell.store.mutate.session.setOverride(type, spec);
+    },
+    clearOverride: (type: string): void => {
+      shell.store.mutate.session.clearOverride(type);
+    },
+    clearAll: (): void => {
+      shell.store.mutate.session.clearAll();
+    },
+    /** Read back what is active, so /pool status can show session scope. */
+    list: (): Record<string, string | null> => {
+      const out: Record<string, string | null> = {};
+      for (const snap of [shell.store.ambientOverrideSnapshot(), shell.store.sessionOverrideSnapshot()]) {
+        for (const [k, v] of Object.entries(snap)) if (v) out[k] = v;
+      }
+      return out;
+    },
+  };
+}
+
 /** The current SpawnCoordinator, or null if not yet created. */
 export function getCoordinator(): SpawnCoordinator | null {
   return shell.coordinator;

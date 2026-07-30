@@ -73,3 +73,59 @@ describe("ConfigStore.refreshIfChanged", () => {
     expect(store.refreshIfChanged()).toBe(false);
   });
 });
+
+describe("sessionOverrideSnapshot", () => {
+  it("returns a copy, so a caller cannot mutate live overrides", () => {
+    const store = new ConfigStore();
+    store.mutate.session.setOverride("executor", "github-copilot/gpt-5.6-terra:medium");
+    const snap = store.sessionOverrideSnapshot() as Record<string, string | null>;
+    expect(snap.executor).toBe("github-copilot/gpt-5.6-terra:medium");
+    snap.executor = "tampered";
+    expect(store.sessionModelOverride("executor")).toBe("github-copilot/gpt-5.6-terra:medium");
+  });
+
+  it("clearAll drops per-type overrides", () => {
+    const store = new ConfigStore();
+    store.mutate.session.setOverride("qa", "awb/claude-opus-5:high");
+    store.mutate.session.clearAll();
+    expect(store.sessionModelOverride("qa")).toBeNull();
+  });
+});
+
+describe("session override precedence (what /pool session scope relies on)", () => {
+  it("beats a providerAgents route but loses to an explicit per-call model", () => {
+    const store = new ConfigStore();
+    // Stand in for a global pool profile: providerAgents routes awb parents to Sol.
+    (store as any).config.providerAgents = {
+      awb: { executor: { model: "walmart-puppy/gpt-5.6-sol", thinking: "xhigh" } },
+    };
+    const globalRoute = store.spawnFor("executor", "awb/claude-opus-5");
+    expect(globalRoute.model).toBe("walmart-puppy/gpt-5.6-sol");
+
+    store.mutate.session.setAmbient("executor", "github-copilot/gpt-5.6-terra:medium");
+    const scoped = store.spawnFor("executor", "awb/claude-opus-5");
+    expect(scoped.model).toBe("github-copilot/gpt-5.6-terra:medium");
+
+    // An explicit escalation in the Agent call still wins over session scope.
+    const explicit = store.spawnFor("executor", "awb/claude-opus-5", undefined, "awb/claude-opus-5:high");
+    expect(explicit.model).toBe("awb/claude-opus-5:high");
+  });
+
+  it("a hard /agents pin still outranks an explicit per-call model", () => {
+    const store = new ConfigStore();
+    store.mutate.session.setOverride("executor", "awb/claude-opus-5:high");
+    const explicit = store.spawnFor("executor", "awb/claude-opus-5", undefined, "walmart-puppy/gpt-5.6-luna");
+    expect(explicit.model).toBe("awb/claude-opus-5:high");
+  });
+
+  it("clearing session scope restores the global route", () => {
+    const store = new ConfigStore();
+    (store as any).config.providerAgents = {
+      awb: { qa: { model: "github-copilot/gpt-5.6-sol", thinking: "xhigh" } },
+    };
+    store.mutate.session.setAmbient("qa", "awb/claude-opus-5:high");
+    expect(store.spawnFor("qa", "awb/claude-opus-5").model).toBe("awb/claude-opus-5:high");
+    store.mutate.session.clearAll();
+    expect(store.spawnFor("qa", "awb/claude-opus-5").model).toBe("github-copilot/gpt-5.6-sol");
+  });
+});

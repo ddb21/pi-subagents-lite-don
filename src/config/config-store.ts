@@ -92,6 +92,8 @@ export interface ConfigStoreDeps {
 export class ConfigStore {
   private config: SubagentsConfig;
   private sessionOverrides: SessionModelOverrides = { default: null };
+  /** Ambient per-session routes from /pool. Weaker than an explicit model. */
+  private ambientOverrides: SessionModelOverrides = { default: null };
   private sessionShowCost: boolean | undefined;
   private widget?: AgentWidget;
   private manager?: AgentManager;
@@ -208,6 +210,16 @@ export class ConfigStore {
     return this.sessionOverrides[type] ?? null;
   }
 
+  /** All active session overrides, for /pool status and the agents menu. */
+  sessionOverrideSnapshot(): Readonly<SessionModelOverrides> {
+    return { ...this.sessionOverrides };
+  }
+
+  /** Active ambient (/pool) routes. */
+  ambientOverrideSnapshot(): Readonly<SessionModelOverrides> {
+    return { ...this.ambientOverrides };
+  }
+
   /** Raw agent config incl. dynamic per-type model keys (for menu display). */
   agentConfigSnapshot(): Readonly<SubagentsConfig["agent"]> {
     return this.config.agent;
@@ -234,6 +246,7 @@ export class ConfigStore {
       config: this.config,
       parentModelId,
       sessionOverrides: this.sessionOverrides,
+      ambientOverrides: this.ambientOverrides,
       explicitModel,
     });
   }
@@ -415,6 +428,14 @@ export class ConfigStore {
       },
       clearAll: (): void => {
         this.sessionOverrides = { default: null };
+        this.ambientOverrides = { default: null };
+      },
+      /** Ambient route from /pool: loses to an explicit per-call model. */
+      setAmbient: (type: string, model: string): void => {
+        this.ambientOverrides[type] = model;
+      },
+      clearAmbient: (): void => {
+        this.ambientOverrides = { default: null };
       },
       /** Set a session showCost override. Not persisted. */
       setShowCost: (enabled: boolean): void => {

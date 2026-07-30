@@ -20,19 +20,22 @@ import type { AgentManager } from "../agents/agent-manager.js";
 import { CONFIG_AGENT_NON_MODEL_KEYS } from "./types.js";
 import type { SystemPromptMode } from "../agents/types.js";
 import type { ThinkingLevel } from "../types.js";
-import { VALID_SYSTEM_PROMPT_MODES, DEFAULT_CONCURRENCY, loadConfig, saveConfigAtomic } from "./config-io.js";
+import { VALID_SYSTEM_PROMPT_MODES, DEFAULT_CONCURRENCY, loadConfig, saveConfigAtomic , configMtimeMs} from "./config-io.js";
 
 
 /** Injected persistence adapter. Swap for an in-memory adapter in tests. */
 export interface ConfigIO {
   load(): SubagentsConfig;
   save(config: SubagentsConfig): void;
+  /** Config file mtime, for mid-session external-edit detection. 0 = absent. */
+  mtimeMs?(): number;
 }
 
 /** Production adapter wrapping the real config file. */
 export const fileConfigIO: ConfigIO = {
   load: () => loadConfig(),
   save: (c) => saveConfigAtomic(c),
+  mtimeMs: () => configMtimeMs(),
 };
 
 /** Agent settings with all scalar defaults resolved. Model fields stay nullable. */
@@ -95,8 +98,32 @@ export class ConfigStore {
   /** Previous tool-expansion state, for ctrl+o compact sync. */
   private lastToolsExpanded: boolean | undefined;
 
+  private lastMtimeMs: number;
+
   constructor(private readonly io: ConfigIO = fileConfigIO) {
     this.config = this.io.load();
+    this.lastMtimeMs = this.io.mtimeMs?.() ?? 0;
+  }
+
+  /**
+   * Re-read the config when the file changed on disk since the last read.
+   *
+   * Don fork: a pool-profile switch (scripts/pi-pool.py) rewrites
+   * subagents-lite.json while sessions are open. `reload()` only runs at
+   * session_start, so without this the running orchestrator keeps routing to
+   * the old pool - which is exactly wrong when the switch was made because a
+   * pool ran out of quota. Session overrides survive: a user pin must outrank
+   * an external file edit.
+   *
+   * Returns true when the config was re-read.
+   */
+  refreshIfChanged(): boolean {
+    const mtime = this.io.mtimeMs?.() ?? 0;
+    if (mtime === 0 || mtime === this.lastMtimeMs) return false;
+    this.lastMtimeMs = mtime;
+    this.config = this.io.load();
+    this.syncAllDeps();
+    return true;
   }
 
   // ── Reads ──────────────────────────────────────────────────────

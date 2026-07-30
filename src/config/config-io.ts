@@ -13,6 +13,19 @@ import type { SubagentsConfig } from "../models/model-precedence.js";
 // directory for config and prompt persistence instead of leaking into regular Pi.
 const CONFIG_DIR = process.env.PI_CODING_AGENT_DIR || path.join(process.env.HOME || "", ".pi", "agent");
 const CONFIG_PATH = path.join(CONFIG_DIR, "subagents-lite.json");
+
+/**
+ * Modification time of the config file, or 0 when it is absent.
+ * Used to pick up an external edit (a pool-profile switch) mid-session
+ * without restarting pi.
+ */
+export function configMtimeMs(): number {
+  try {
+    return fs.statSync(CONFIG_PATH).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
 /** Path to custom prompt file for subagent system prompts. */
 export const CUSTOM_PROMPT_PATH = path.join(CONFIG_DIR, "subagents-lite-prompt.md");
 /** Default number of grace turns before an agent is force-stopped. */

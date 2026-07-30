@@ -267,6 +267,9 @@ export async function executeAgentTool(
   if (forcedForeground) isBackground = false;
   const maxTurns = params.max_turns as number | undefined ?? agentConfig?.maxTurns;
 
+  // Pick up an external config edit (pool-profile switch) before resolving the
+  // model, so a switch made mid-session routes the very next delegation.
+  getStore().refreshIfChanged?.();
   const modelStr = params.model as string | undefined;
   // Don fork: a requested model that isn't in the registry is an error, not a
   // silent fallback to the parent model — a typo in a modelAgents/providerAgents entry or

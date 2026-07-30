@@ -60,9 +60,17 @@ Added after the original fork (see git log for details):
 
 - **`session_key`** on the Agent tool: named, persistent, per-project executor
   sessions that survive across parent sessions (the two-tier architecture's
-  Terra executor). It is optional but, when supplied, must contain a
-  non-whitespace character. Stateless one-shot calls such as QA/reviewer routes
-  must omit it rather than sending `session_key: ""`.
+  Terra executor). Migration/default behavior: agents without lifecycle
+  metadata default to stateless. If a stateless call supplies a non-empty
+  `session_key`, the tool strips the key, records a normalization warning, and
+  dispatches the agent once as a stateless one-shot. Empty/whitespace
+  `session_key` values are also stripped with a warning. Agents that need keyed
+  reuse must opt in with `session_lifecycle: persistent`; existing agent files
+  that already use the legacy `persistent_session: true` alias continue to opt
+  in, but new files should prefer `session_lifecycle`. Persistent keyed calls
+  cannot be combined with a non-empty `worktree_path`; that is a hard
+  non-retryable validation error because the tool will not silently alter
+  persistent worktree intent.
 - **Forced foreground in one-shot mode**: `run_in_background` is ignored when
   there is no UI (`pi -p` / `--mode json`) — the process exits at turn end, so
   a background child could never deliver its result.
@@ -107,6 +115,47 @@ param slot is also a fork change: upstream clobbered it; it now wins over both
 maps and frontmatter while still losing to user-set pins. A model that is not
 in the registry fails the Agent call instead of silently falling back to the
 parent model.
+
+### Tolerant model specs (`src/models/model-spec.ts`)
+
+Problem: the per-call `model` param accepted only a canonical
+`provider/model-id` key, and every other spelling produced a non-retryable
+"Model not found in registry" error with no format hint and no candidate list.
+An orchestrator then burned one turn per guess (`terra`, `gpt-5.4`,
+`claude-opus-5`, `default`) before a heavy agent finally ran, often on a weaker
+model than intended.
+
+`resolveModelSpec` now accepts, in order:
+
+1. `provider/model-id`, with an optional `:thinking` suffix
+2. inherit keywords: `default`, `parent`, `inherit`, `host`, `same`, `auto`, `any`
+3. `modelAliases` from `subagents-lite.json` (separator and case insensitive)
+4. aliased providers: `copilot/gpt-5.5`, `wm/gpt-5.6-terra`, `claude/claude-opus-5`
+5. `provider model-id` with a space: `awb claude-opus-5`
+6. a bare model id: `gpt-5.4`, `Opus 5`
+7. a unique fragment: `terra`, `luna`
+
+A trailing effort word sets thinking (`terra high`, `opus 5 medium`). An
+ambiguous fragment fails with every candidate listed, and an unknown spec fails
+with the format, the close matches, and the available keys, so the next call is
+exact instead of another guess. The Agent tool schema also publishes the format
+and the live registry keys in the `model` param description.
+
+User aliases live in `subagents-lite.json`:
+
+```json
+{
+  "modelAliases": {
+    "terra-high": "walmart-puppy/gpt-5.6-terra:high",
+    "opus-5-medium": "awb/claude-opus-5:medium"
+  }
+}
+```
+
+Agent frontmatter goes through the same resolver, and a frontmatter model that
+is no longer in the registry now logs a warning before the parent-model
+fallback, instead of silently downgrading a heavy agent to the orchestrator's
+cheap model.
 
 `thinking` travels with the model: a map entry's thinking applies only when
 that entry supplied the resolved model (never leaking onto a model chosen by

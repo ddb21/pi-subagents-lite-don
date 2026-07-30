@@ -17,8 +17,18 @@ import { emitLifecycle, lifecycleEnabled } from "./benchmark-lifecycle.js";
  * At init time only defaults exist; call again from session_start after
  * user/project agents are loaded to update the enum.
  */
-export function registerAgentTool(pi: ExtensionAPI): void {
+type RegistryForDescription = {
+  getAvailable(): Array<{ provider: string; id: string }>;
+  hasConfiguredAuth?(model: { provider: string; id: string }): boolean;
+};
+
+export function registerAgentTool(pi: ExtensionAPI, ctx?: { modelRegistry?: RegistryForDescription }): void {
   const types = getAvailableTypes();
+  // Don fork: the model param used to be an undocumented bare string, so a
+  // constrained orchestrator guessed keys ("terra", "gpt-5.4", "default") and
+  // burned a turn per guess on a non-retryable error. Publish the format and
+  // the live registry keys in the schema instead.
+  const modelParam = Type.Optional(Type.String({ description: buildModelParamDescription(ctx) }));
   // Use plain string to avoid verbose anyOf in prompt.
   // Available types are listed in description for discoverability.
   const agentParam = types.length > 0
@@ -41,8 +51,8 @@ export function registerAgentTool(pi: ExtensionAPI): void {
       // Don fork: per-call overrides. These were always read by the executor
       // but absent from the schema, so constrained providers could never emit
       // them. model: "provider/model-id"; thinking: off..max.
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(Type.String()),
+      model: modelParam,
+      thinking: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh|max" })),
       max_turns: Type.Optional(Type.Number()),
     }),
     execute: executeAgentTool,
@@ -60,6 +70,36 @@ export function registerAgentTool(pi: ExtensionAPI): void {
     },
   });
 }
+
+/** Format hint plus the live registry keys, capped to stay prompt-cheap. */
+function buildModelParamDescription(ctx?: { modelRegistry?: RegistryForDescription }): string {
+  const base = 'Model as "provider/model-id" or "provider/model-id:thinking". "default" inherits the parent model.';
+  let keys: string[] = [];
+  try {
+    const registry = ctx?.modelRegistry;
+    const entries = registry?.getAvailable() ?? [];
+    // The list is a menu, not an inventory: show the providers Don actually
+    // uses first (providerPreference), then any authenticated provider.
+    const preference = getStore().providerPreference;
+    const rank = (m: { provider: string; id: string }): number => {
+      const idx = preference.indexOf(m.provider);
+      if (idx >= 0) return idx;
+      return registry?.hasConfiguredAuth?.(m) ? preference.length : preference.length + 1;
+    };
+    keys = entries
+      .map((entry, index) => ({ entry, index }))
+      .sort((a, b) => rank(a.entry) - rank(b.entry) || a.index - b.index)
+      .map(({ entry }) => `${entry.provider}/${entry.id}`);
+  } catch {
+    keys = [];
+  }
+  if (keys.length === 0) return base;
+  const listed = keys.slice(0, MODEL_DESCRIPTION_LIMIT);
+  const suffix = keys.length > listed.length ? `, ... (${keys.length} total)` : "";
+  return `${base} Available: ${listed.join(", ")}${suffix}`;
+}
+
+const MODEL_DESCRIPTION_LIMIT = 24;
 
 // ============================================================================
 // Tool/Command/Message registration

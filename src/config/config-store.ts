@@ -140,6 +140,27 @@ export class ConfigStore {
     };
   }
 
+  /**
+   * Don fork: user-defined model aliases (normalized spelling -> canonical
+   * "provider/model[:thinking]"). Lets an orchestrator say "terra-high"
+   * instead of memorizing registry keys.
+   */
+  get modelAliases(): Record<string, string> {
+    const raw = this.config.modelAliases ?? {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      if (typeof key !== "string" || typeof value !== "string" || !value.trim()) continue;
+      out[key.toLowerCase().replace(/[\s._\-/:]+/g, "")] = value.trim();
+    }
+    return out;
+  }
+
+  /** Don fork: provider order that breaks model-id ties (see resolveModelSpec). */
+  get providerPreference(): string[] {
+    const raw = this.config.providerPreference;
+    return Array.isArray(raw) ? raw.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+  }
+
   get concurrency(): {
     default: number;
     providers: Record<string, number>;

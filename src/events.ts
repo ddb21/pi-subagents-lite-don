@@ -163,7 +163,8 @@ export function setupEventListeners(pi: ExtensionAPI): void {
     setSessionCtx(ctx);
     await loadConfigAndRegisterAgents(ctx);
     // Re-register with updated agent type list (now includes user/project agents)
-    registerAgentTool(pi);
+    // and the live model registry, so the model param advertises valid keys.
+    registerAgentTool(pi, ctx);
     // Register ctrl+o listener
     if (ctx.hasUI && !unregisterTerminalInput) {
       unregisterTerminalInput = ctx.ui.onTerminalInput((data: string) => {

@@ -47,6 +47,12 @@ describe("scanAgentFilesInDir", () => {
       sessionLifecycle: "persistent",
       persistentSession: true,
     });
+
+    const stateless = parseAgentFile("---\nname: scout\nsession_lifecycle: stateless\n---\n", "user");
+    expect(mergeAgents(new Map(), [stateless], []).get("scout")).toMatchObject({
+      sessionLifecycle: "stateless",
+      persistentSession: false,
+    });
   });
 
   it("continues to discover regular files", async () => {

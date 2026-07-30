@@ -101,6 +101,18 @@ export interface SubagentsConfig {
    * without changing the broader provider default.
    */
   modelAgents?: Record<string, Record<string, ModelAgentEntry>>;
+  /**
+   * Don fork: user model aliases. Key = any spelling (case and separators are
+   * ignored), value = canonical `provider/model[:thinking]`. Consumed by
+   * resolveModelSpec so a per-call `model` param may use short names.
+   */
+  modelAliases?: Record<string, string>;
+  /**
+   * Don fork: provider order used to break a model-id tie when several
+   * providers serve the same id (for example claude-opus-5 under `awb` and
+   * `github-copilot`). First listed provider wins.
+   */
+  providerPreference?: string[];
 }
 
 /**

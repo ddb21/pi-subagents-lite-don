@@ -69,11 +69,20 @@ export function loadConfig(): SubagentsConfig {
     value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
   const providerAgents = routingMap(raw.providerAgents);
   const modelAgents = routingMap(raw.modelAgents);
+  // Don fork: model-spec inputs. Same carry-through rule as the routing maps —
+  // saveConfigAtomic rewrites the whole object, so dropping these keys here
+  // would erase them on the next menu save.
+  const modelAliases = routingMap(raw.modelAliases);
+  const providerPreference = Array.isArray(raw.providerPreference)
+    ? raw.providerPreference.filter((p): p is string => typeof p === "string" && p.length > 0)
+    : undefined;
   return {
     agent: { ...DEFAULT_AGENT, ...raw.agent },
     concurrency,
     ...(providerAgents ? { providerAgents: providerAgents as SubagentsConfig["providerAgents"] } : {}),
     ...(modelAgents ? { modelAgents: modelAgents as SubagentsConfig["modelAgents"] } : {}),
+    ...(modelAliases ? { modelAliases: modelAliases as SubagentsConfig["modelAliases"] } : {}),
+    ...(providerPreference ? { providerPreference } : {}),
   };
 }
 

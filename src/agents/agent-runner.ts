@@ -22,10 +22,11 @@ import { getAgentConfig, getConfig, getToolNamesForType, resolveVisibleTools } f
 import { extractText } from "../prompt/context.js";
 import type { AgentUsage } from "./usage.js";
 import { findModelInRegistry, GIT_EXEC_TIMEOUT_MS } from "../utils.js";
+import { resolveModelSpec } from "../models/model-spec.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { buildAgentPrompt, type PromptExtras } from "../prompt/prompts.js";
 import { preloadSkills, loadSkillMeta, type SkillMeta } from "../prompt/skill-loader.js";
-import { type EnvInfo, type RunCallbacks, type RunTunables, SHORT_ID_LENGTH } from "../types.js";
+import { type EnvInfo, type RunCallbacks, type RunTunables, type ThinkingLevel, SHORT_ID_LENGTH } from "../types.js";
 import type { SubagentType, SystemPromptMode } from "./types.js";
 import { getStore, enterSubagentSpawn, exitSubagentSpawn } from "../shell.js";
 import { DEFAULT_GRACE_TURNS, CUSTOM_PROMPT_PATH } from "../config/config-io.js";
@@ -408,10 +409,31 @@ async function initSession(
   cwd: string,
   loader: DefaultResourceLoader,
 ) {
+  // Don fork: resolve the frontmatter spelling tolerantly, then fall back to
+  // the parent model. A frontmatter model that no longer exists in the
+  // registry used to fall back silently, so a heavy agent (for example
+  // lmd-science) quietly ran on the orchestrator's cheap model. Warn loudly.
+  let resolvedConfigModel: string | undefined;
+  let configThinking: ThinkingLevel | undefined;
+  if (!options.model && agentConfig?.model) {
+    const resolution = resolveModelSpec(agentConfig.model, ctx.modelRegistry, {
+      parentProvider: ctx.model?.provider,
+      providerPreference: getStore().providerPreference,
+    });
+    if (resolution.kind === "resolved") {
+      resolvedConfigModel = resolution.key;
+      configThinking = resolution.thinking;
+    } else if (resolution.kind === "error") {
+      console.warn(
+        `[pi-subagents-lite] agent '${type}' declares model '${agentConfig.model}', which is not in the registry. `
+        + `Falling back to the parent model. ${resolution.message}`,
+      );
+    }
+  }
   const model = options.model ?? findModelInRegistry(
-    agentConfig?.model, ctx.modelRegistry, ctx.model,
+    resolvedConfigModel ?? agentConfig?.model, ctx.modelRegistry, ctx.model,
   );
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel;
+  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel ?? configThinking;
   const agentDir = getAgentDir();
   // Don fork: persist each subagent's session (with parent lineage) into a
   // dedicated subdir so usage/session scrapers can classify subagent runs.

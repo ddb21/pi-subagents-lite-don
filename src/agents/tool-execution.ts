@@ -276,19 +276,43 @@ export async function executeAgentTool(
   // "default" = inherit) so a near-miss spelling costs zero extra turns, and
   // any failure message carries the format plus the candidate list.
   let specThinking: ThinkingLevel | undefined;
-  let resolvedModelStr = modelStr;
-  if (modelStr) {
-    const resolution = resolveModelSpec(modelStr, ctx.modelRegistry, {
+  // Don fork: resolve the full precedence chain here rather than trusting the
+  // tool_call listener. The listener does not fire in one-shot (`pi -p`) runs,
+  // which is exactly how two-context delegations spawn children, so a pinned
+  // heavy agent (lmd-science, analyst) silently inherited the orchestrator's
+  // cheap model. execute() is now the authoritative resolver; the listener
+  // only canonicalizes what the caller typed for display.
+  let modelSpec = modelStr;
+  if (!modelSpec) {
+    const parentModelId = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+    const configured = getStore().spawnFor(resolvedType, parentModelId, agentConfig, undefined);
+    if (configured.model && configured.model !== parentModelId) {
+      modelSpec = configured.model;
+      specThinking = configured.thinking;
+    }
+  }
+  let resolvedModelStr = modelSpec;
+  if (modelSpec) {
+    const resolution = resolveModelSpec(modelSpec, ctx.modelRegistry, {
       aliases: getStore().modelAliases,
       providerPreference: getStore().providerPreference,
       parentProvider: ctx.model?.provider,
     });
     if (resolution.kind === "error") {
-      return withNormalizationWarnings(nonRetryableValidationErrorResult(resolution.message), normalizationWarnings);
+      // A caller-typed spec is a hard error; a stale config/frontmatter pin
+      // must not block the spawn, but it must not be silent either.
+      if (modelStr) {
+        return withNormalizationWarnings(nonRetryableValidationErrorResult(resolution.message), normalizationWarnings);
+      }
+      normalizationWarnings.push(
+        `agent '${resolvedType}' pins model '${modelSpec}', which did not resolve; using the parent model. ${resolution.message}`,
+      );
     }
-    specThinking = resolution.thinking;
+    specThinking = (resolution.kind === "error" ? undefined : resolution.thinking) ?? specThinking;
     resolvedModelStr = resolution.kind === "resolved" ? resolution.key : undefined;
-    if (resolution.note) normalizationWarnings.push(resolution.note);
+    // Only surface a note for a spelling the caller actually typed; a
+    // frontmatter or config pin resolving is not news for the caller.
+    if (resolution.kind !== "error" && resolution.note && modelStr) normalizationWarnings.push(resolution.note);
   }
   const model = findModelInRegistry(resolvedModelStr, ctx.modelRegistry, resolvedModelStr ? undefined : ctx.model);
   if (resolvedModelStr && !model) {

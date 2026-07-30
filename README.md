@@ -153,9 +153,25 @@ User aliases live in `subagents-lite.json`:
 ```
 
 Agent frontmatter goes through the same resolver, and a frontmatter model that
-is no longer in the registry now logs a warning before the parent-model
-fallback, instead of silently downgrading a heavy agent to the orchestrator's
-cheap model.
+is no longer in the registry now warns before the parent-model fallback,
+instead of silently downgrading a heavy agent to the orchestrator's cheap
+model.
+
+### Model resolution moved into `execute()`
+
+Model precedence used to be applied only by the `tool_call` listener, which
+rewrote `input.model` before the tool ran. That listener does not fire in
+one-shot (`pi -p`) runs, and one-shot runs are how two-context delegations
+spawn children. Result: every frontmatter pin was ignored headless, so
+`lmd-science` (pinned to `awb/claude-opus-5:high`) ran on the orchestrator's
+`walmart-puppy/gpt-5.6-sol`. Verified in `~/.pi-lite/agent/sessions-subagents`:
+the child's `model_change` record showed the parent model before the fix and
+`awb/claude-opus-5` after it.
+
+`executeAgentTool` now resolves the whole chain itself (`spawnFor` when the
+caller passes no `model`), and the listener only canonicalizes what the caller
+typed, for display. A stale config or frontmatter pin warns and falls back to
+the parent model; a caller-typed spec that fails still errors.
 
 `thinking` travels with the model: a map entry's thinking applies only when
 that entry supplied the resolved model (never leaking onto a model chosen by

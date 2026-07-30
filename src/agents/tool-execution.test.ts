@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../status-note.js", () => ({ getStatusNote: () => "" }));
-const agentConfigs: Record<string, { sessionLifecycle?: "persistent" | "stateless"; persistentSession?: boolean }> = {
+const agentConfigs: Record<string, { sessionLifecycle?: "persistent" | "stateless"; persistentSession?: boolean; model?: string }> = {
   qa: {},
+  "pinned-science": { sessionLifecycle: "persistent", model: "awb/claude-opus-5:high" },
+  "stale-pin": { model: "awb/claude-opus-9" },
   scout: { sessionLifecycle: "stateless" },
   "reviewer-adversarial": {},
   "reviewer-conformance": {},
@@ -74,7 +76,15 @@ const spawn = vi.fn(async (_pi, _ctx, options) => ({
 vi.mock("../shell.js", () => ({
   getPiInstance: () => ({}),
   getSessionCtx: () => ({ cwd: "/repo" }),
-  getStore: () => ({ agent: { forceBackground: false, graceTurns: 0 } }),
+  getStore: () => ({
+    agent: { forceBackground: false, graceTurns: 0 },
+    modelAliases: {},
+    providerPreference: [],
+    // Mirrors config-store.spawnFor: frontmatter pin, else parent model.
+    spawnFor: (_type: string, parentModelId: string, agentConfig?: { model?: string }) => ({
+      model: agentConfig?.model ?? parentModelId,
+    }),
+  }),
   getCoordinator: () => ({ spawn }),
   getManager: () => ({ listAgents: () => [] }),
 }));
@@ -392,6 +402,29 @@ describe("Agent session_key/worktree_path normalization", () => {
     expect(result.content[0].text).toContain('"provider/model-id:thinking"');
     expect(result.content[0].text).toContain("Available: awb/claude-opus-5");
     expect(result.content[0].text).toContain("non-retryable");
+  });
+
+  it("applies a frontmatter model pin when the caller passes no model", async () => {
+    const result = await execute({}, "pinned-science");
+
+    expect(result.isError).toBeFalsy();
+    expect(spawn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ modelKey: "awb/claude-opus-5", thinkingLevel: "high" }),
+    );
+  });
+
+  it("warns and inherits the parent model when a frontmatter pin is stale", async () => {
+    const result = await execute({}, "stale-pin");
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain("pins model 'awb/claude-opus-9', which did not resolve");
+    expect(spawn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ modelKey: undefined }),
+    );
   });
 
   it("keeps normalization warnings visible when the child spawn ends in error", async () => {

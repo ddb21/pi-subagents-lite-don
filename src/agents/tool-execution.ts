@@ -151,7 +151,22 @@ export function buildAgentDetails(
  * have diverged before. getStatusNote owns the leading separator.
  */
 export function formatResultContent(record: AgentRecord): string {
-  return (record.result ?? "") + getStatusNote(record.lifecycle);
+  const result = record.result ?? "";
+  // Don fork: never hand the parent a silent empty string. A model that fails
+  // before its first token, for example on a provider quota cap, resolves with
+  // no text and a "completed" status, so the caller saw "no output or errors"
+  // and had no idea the reviewer never ran.
+  if (result.trim().length === 0) {
+    const reason = record.error ? `: ${record.error}` : "";
+    const model = record.display.invocation?.modelName;
+    return (
+      `[no output] The agent produced no text. status=${record.lifecycle.status}` +
+      `${model ? `, model=${model}` : ""}${reason}. ` +
+      `Check the model is reachable, then retry with a different model if it is capped.` +
+      getStatusNote(record.lifecycle)
+    );
+  }
+  return result + getStatusNote(record.lifecycle);
 }
 
 // ============================================================================

@@ -36,6 +36,8 @@ export interface AgentRecord {
   id: string;
   result?: string;
   error?: string;
+  /** Don fork: non-fatal setup warnings included in the parent tool result. */
+  warnings?: string[];
   lifecycle: AgentLifecycle;
   display: AgentDisplayInfo;
   execution: AgentExecutionState;

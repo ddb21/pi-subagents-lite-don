@@ -134,6 +134,12 @@ interface RunOptions extends RunTunables, RunCallbacks {
 export interface RunResult {
   responseText: string;
   session: AgentSession;
+  /**
+   * Don fork: non-fatal setup warnings raised during this run. Upstream flushed
+   * these to the UI only, so a background or headless caller never saw them.
+   * A continuation carries none of its own, hence the optional field.
+   */
+  warnings?: string[];
   /** True if the agent was hard-aborted (max_turns + grace exceeded). */
   aborted: boolean;
   /** True if the agent hit the soft turn limit and wrapped up within grace turns. */
@@ -889,5 +895,7 @@ async function runAgentImpl(
     else console.warn(`[pi-subagents-lite] ${msg}`);
   }
 
-  return result;
+  // Don fork: also hand them back, so the parent's tool result carries them.
+  // The UI flush above is not enough for a background or headless caller.
+  return warnings.length > 0 ? { ...result, warnings } : result;
 }

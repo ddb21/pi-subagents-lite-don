@@ -1214,3 +1214,182 @@ describe("executeAgentTool — session lifecycle gate", () => {
     expect(result.content[0].text).not.toContain("ignored");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Don fork — headless foreground, no-output report, run warnings    */
+/* ------------------------------------------------------------------ */
+
+describe("executeAgentTool — one-shot mode forces foreground", () => {
+  let record: Record<string, unknown>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveSubagentTrust.mockReturnValue(true);
+    record = {
+      id: "agent-id-123",
+      display: { type: "general-purpose", description: "Test agent", invocation: {} },
+      lifecycle: { status: "completed", startedAt: Date.now() },
+      execution: { promise: Promise.resolve("done") },
+      result: "the real answer",
+      stats: {
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        toolUses: 0,
+        compactionCount: 0,
+      },
+    };
+    mockGetRecord.mockReturnValue(record);
+  });
+
+  const lastOptions = () => mockSpawn.mock.calls.at(-1)![4] as Record<string, unknown>;
+
+  it("runs a background request in the foreground when there is no UI", async () => {
+    // pi -p / --mode json: the parent process exits when the turn ends, so a
+    // background child would be killed mid-work with no turn left to collect it.
+    const result = await executeAgentTool(
+      "tc-oneshot",
+      makeParams({ run_in_background: true }),
+      undefined,
+      undefined,
+      fakeCtx({ hasUI: false }),
+    );
+
+    expect(lastOptions().isBackground).toBe(false);
+    expect(result.content[0].text).toContain("run_in_background was ignored");
+    expect(result.content[0].text).toContain("one-shot mode has no later turn");
+    // The work still ran and its result is returned, not a queue receipt.
+    expect(result.content[0].text).toContain("the real answer");
+  });
+
+  it("leaves a background request alone when a UI is present", async () => {
+    record.lifecycle = { status: "running", startedAt: Date.now() };
+    const result = await executeAgentTool(
+      "tc-bg-ui",
+      makeParams({ run_in_background: true }),
+      undefined,
+      undefined,
+      fakeCtx({ hasUI: true }),
+    );
+
+    expect(lastOptions().isBackground).toBe(true);
+    expect(result.content[0].text).not.toContain("run_in_background was ignored");
+  });
+
+  it("adds no note for a foreground request without a UI", async () => {
+    const result = await executeAgentTool(
+      "tc-fg-nouI",
+      makeParams({ run_in_background: false }),
+      undefined,
+      undefined,
+      fakeCtx({ hasUI: false }),
+    );
+
+    expect(lastOptions().isBackground).toBe(false);
+    expect(result.content[0].text).not.toContain("run_in_background was ignored");
+  });
+});
+
+describe("formatResultContent — no-output report", () => {
+  const baseRecord = (over: Record<string, unknown> = {}) =>
+    ({
+      id: "agent-id-123",
+      display: { type: "general-purpose", description: "d", invocation: {} },
+      lifecycle: { status: "completed", startedAt: 0, completedAt: 1 },
+      stats: { lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 }, toolUses: 0, compactionCount: 0 },
+      ...over,
+    }) as never;
+
+  it("reports a completed run that produced no text at all", async () => {
+    // The silent-empty case: a provider quota cap can fail a model before its
+    // first token, leaving status "completed" with no text. The caller used to
+    // read that as "no output and no errors".
+    const { formatResultContent } = await import("../../src/agents/tool-execution.js");
+    const text = formatResultContent(baseRecord({ result: "" }));
+
+    expect(text).toContain("[no output]");
+    expect(text).toContain("status=completed");
+    expect(text).toContain("retry with a different model if it is capped");
+  });
+
+  it("treats a whitespace-only result as no output", async () => {
+    const { formatResultContent } = await import("../../src/agents/tool-execution.js");
+    expect(formatResultContent(baseRecord({ result: "   \n  " }))).toContain("[no output]");
+  });
+
+  it("treats a missing result as no output", async () => {
+    const { formatResultContent } = await import("../../src/agents/tool-execution.js");
+    expect(formatResultContent(baseRecord())).toContain("[no output]");
+  });
+
+  it("names the model and the error when both are known", async () => {
+    const { formatResultContent } = await import("../../src/agents/tool-execution.js");
+    const text = formatResultContent(
+      baseRecord({
+        result: "",
+        error: "quota exceeded",
+        lifecycle: { status: "error", startedAt: 0, completedAt: 1 },
+        display: { type: "qa", description: "d", invocation: { modelName: "walmart-puppy/sol" } },
+      }),
+    );
+
+    expect(text).toContain("status=error");
+    expect(text).toContain("model=walmart-puppy/sol");
+    expect(text).toContain(": quota exceeded");
+  });
+
+  it("leaves a normal result untouched", async () => {
+    const { formatResultContent } = await import("../../src/agents/tool-execution.js");
+    const text = formatResultContent(baseRecord({ result: "real output" }));
+
+    expect(text).toContain("real output");
+    expect(text).not.toContain("[no output]");
+  });
+});
+
+describe("executeAgentTool — run warnings reach the parent result", () => {
+  let record: Record<string, unknown>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockResolveSubagentTrust.mockReturnValue(true);
+    record = {
+      id: "agent-id-123",
+      display: { type: "general-purpose", description: "Test agent", invocation: {} },
+      lifecycle: { status: "completed", startedAt: Date.now() },
+      execution: { promise: Promise.resolve("done") },
+      result: "answer",
+      // Raised inside the run and flushed to the UI. A headless caller has no
+      // UI to read, so the text has to carry them too.
+      warnings: ['extension "office-docx" not found in loaded extensions'],
+      stats: {
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        toolUses: 0,
+        compactionCount: 0,
+      },
+    };
+    mockGetRecord.mockReturnValue(record);
+  });
+
+  it("includes a run warning in a foreground result", async () => {
+    const result = await executeAgentTool("tc-warn-fg", makeParams(), undefined, undefined, fakeCtx());
+    expect(result.content[0].text).toContain('extension "office-docx" not found');
+    expect(result.content[0].text).toContain("answer");
+  });
+
+  it("includes a run warning in a background receipt", async () => {
+    record.lifecycle = { status: "running", startedAt: Date.now() };
+    const result = await executeAgentTool(
+      "tc-warn-bg",
+      makeParams({ run_in_background: true }),
+      undefined,
+      undefined,
+      fakeCtx(),
+    );
+    expect(result.content[0].text).toContain('extension "office-docx" not found');
+  });
+
+  it("adds nothing when the run raised no warnings", async () => {
+    record.warnings = undefined;
+    const result = await executeAgentTool("tc-warn-none", makeParams(), undefined, undefined, fakeCtx());
+    expect(result.content[0].text).toBe("answer");
+  });
+});

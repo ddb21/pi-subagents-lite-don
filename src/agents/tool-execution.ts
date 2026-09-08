@@ -85,7 +85,22 @@ export function formatResultContent(record: AgentRecord): string {
   // Only the nudge path formats error-status records as text: the foreground
   // handler intercepts error status earlier and throws instead.
   const errorNote = record.lifecycle.status === "error" && record.error ? `\n\nError: ${record.error}` : "";
-  return (record.result ?? "") + errorNote + getStatusNote(record.lifecycle);
+  const result = record.result ?? "";
+  // Don fork: never hand the parent a silent empty string. A model that fails
+  // before its first token, for example on a provider quota cap, can resolve
+  // with no text and a "completed" status, so the caller read "no output and no
+  // errors" and had no idea the agent never ran.
+  if (result.trim().length === 0) {
+    const reason = record.error ? `: ${record.error}` : "";
+    const model = record.display.invocation?.modelName;
+    return (
+      `[no output] The agent produced no text. status=${record.lifecycle.status}` +
+      `${model ? `, model=${model}` : ""}${reason}. ` +
+      `Check the model is reachable, then retry with a different model if it is capped.` +
+      getStatusNote(record.lifecycle)
+    );
+  }
+  return result + errorNote + getStatusNote(record.lifecycle);
 }
 
 // --- Tool execute handlers ---
@@ -387,7 +402,19 @@ export async function executeAgentTool(
   const coordinator = getCoordinator()!;
   // Background spawns (explicit or forceBackground) never bind to the parent
   // run's interrupt signal — only foreground spawns can be interrupted.
-  const isBackground = runInBackground || getStore().agent.forceBackground;
+  let isBackground = runInBackground || getStore().agent.forceBackground;
+  // Don fork: in one-shot mode (no UI: pi -p / --mode json) the parent process
+  // exits when the turn ends, killing any background child mid-work. There is
+  // no later turn to collect the result, so background delegation can never
+  // succeed. Force foreground instead of losing the work.
+  const forcedForeground = isBackground && !ctx.hasUI;
+  if (forcedForeground) {
+    isBackground = false;
+    normalizationWarnings.push(
+      "run_in_background was ignored: one-shot mode has no later turn to collect a background result, " +
+        "so the agent ran in the foreground",
+    );
+  }
 
   const result = await coordinator.spawn(getPiInstance(), ctx, {
     type: resolvedType,
@@ -429,7 +456,10 @@ export async function executeAgentTool(
     const details = buildAgentDetails(record);
     details.agentId = agentId;
     details.status = record.lifecycle.status;
-    return successResult(withNotes(`[${label}] ${suffix}`, normalizationWarnings), details);
+    return successResult(
+      withNotes(`[${label}] ${suffix}`, [...normalizationWarnings, ...(record.warnings ?? [])]),
+      details,
+    );
   }
 
   // Foreground: record.execution.promise is already awaited by coordinator.spawn()
@@ -439,7 +469,13 @@ export async function executeAgentTool(
     throw new Error(`Agent failed: ${record.error || "unknown error"}`);
   }
 
-  return successResult(withNotes(formatResultContent(record), normalizationWarnings), details);
+  // Don fork: setup warnings raised inside the run (for example a declared
+  // extension that matched nothing) reach the parent's result, not only the UI.
+  // A background or headless orchestrator has no UI to read.
+  return successResult(
+    withNotes(formatResultContent(record), [...normalizationWarnings, ...(record.warnings ?? [])]),
+    details,
+  );
 }
 
 // --- Running agents list helper (used by executeStopAgentTool) ---

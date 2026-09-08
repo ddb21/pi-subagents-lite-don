@@ -452,7 +452,7 @@ export class AgentManager {
     leaseHolder?: SpawnOptions,
   ) {
     runPromise
-      .then(({ responseText, session, aborted, turnLimited, modelError }) => {
+      .then(({ responseText, session, warnings, aborted, turnLimited, modelError }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.lifecycle.status !== "stopped") {
           // Precedence: an abort during a model error wins; a model error outranks a turn limit.
@@ -465,6 +465,9 @@ export class AgentManager {
                 : "completed";
         }
         record.result = responseText;
+        // Don fork: a continuation reports no warnings of its own, so keep the
+        // first run's rather than clearing them on the second settlement.
+        if (warnings?.length) record.warnings = warnings;
         if (modelError) {
           record.error = formatModelError(record.display.type, session?.model, modelError);
         }

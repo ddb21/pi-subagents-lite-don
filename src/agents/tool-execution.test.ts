@@ -30,7 +30,17 @@ vi.mock("./usage.js", () => ({
   getLifetimeTotal: () =>0,
   getSessionContextPercent: () => 0,
 }));
-vi.mock("../spawn/worktree-validator.js", () => ({ validateWorktreePath: vi.fn() }));
+vi.mock("../spawn/worktree-validator.js", () => ({
+  validateWorktreePath: vi.fn(),
+  isParentCwdPath: (worktreePath: string, parentCwd: string) => {
+    if (!worktreePath.trim() || !parentCwd.trim()) return false;
+    const normalize = (value: string) => value.replace(/\/+$/, "") || "/";
+    const resolved = worktreePath.startsWith("/")
+      ? worktreePath
+      : `${normalize(parentCwd)}/${worktreePath}`;
+    return normalize(resolved) === normalize(parentCwd);
+  },
+}));
 vi.mock("../utils.js", () => ({
   // Inlined (not a top-level const): vi.mock factories are hoisted.
   parseModelKey: vi.fn(),
@@ -229,15 +239,47 @@ describe("Agent session_key/worktree_path normalization", () => {
     expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.not.objectContaining({ sessionKey: expect.anything() }));
   });
 
-  it("rejects persistent session_key with a non-empty worktree_path before spawn", async () => {
+  it("drops a parent-cwd worktree_path, warns, and keeps the persistent session", async () => {
+    const result = await execute({ session_key: "exec-review", worktree_path: "/repo/" }, "executor");
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0].text).toContain("worktree_path '/repo/' is the parent working directory");
+    expect(result.details).toMatchObject({
+      normalizationWarnings: [expect.stringContaining("ignored so session_key 'exec-review' applies")],
+    });
+    expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.objectContaining({
+      sessionKey: "exec-review",
+      sessionKeyCwd: "/repo",
+      worktreePath: undefined,
+    }));
+    expect(validateWorktreePath).not.toHaveBeenCalled();
+  });
+
+  it("rejects persistent session_key with a different worktree_path before spawn", async () => {
     const result = await execute({ session_key: "exec-review", worktree_path: "/other" }, "executor");
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("session_key cannot be used with a non-empty worktree_path for persistent agents");
+    expect(result.content[0].text).toContain("worktree_path was '/other'");
+    expect(result.content[0].text).toContain("parent working directory '/repo'");
+    expect(result.content[0].text).toContain("resend the same call with worktree_path omitted");
     expect(result.content[0].text).toContain("non-retryable; do not repeat the same Agent call unchanged");
     expect(result.details).toMatchObject({ errorType: "validation", retryable: false });
     expect(spawn).not.toHaveBeenCalled();
     expect(validateWorktreePath).not.toHaveBeenCalled();
+  });
+
+  it("validates worktree_path without session_key and forwards it normally", async () => {
+    validateWorktreePathMock.mockResolvedValue({ ok: true, resolvedPath: "/repo-wt", label: "repo-wt" });
+
+    const result = await execute({ worktree_path: "/repo-wt" }, "executor");
+
+    expect(result.isError).not.toBe(true);
+    expect(validateWorktreePath).toHaveBeenCalledWith(expect.anything(), "/repo-wt", "/repo", expect.any(Function));
+    expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.objectContaining({
+      worktreePath: "/repo-wt",
+      worktreeLabel: "repo-wt",
+    }));
+    expect(spawn).toHaveBeenCalledWith(expect.anything(), ctx, expect.not.objectContaining({ sessionKey: expect.anything() }));
   });
 
   it("rejects a non-string session_key before spawn", async () => {

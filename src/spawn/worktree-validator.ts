@@ -197,19 +197,29 @@ export function isParentCwdPath(worktreePath: string, parentCwd: string): boolea
   const trimmed = worktreePath.trim();
   const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(parentCwd, trimmed);
 
-  const canonical = (target: string): string => {
+  const normalize = (target: string): string => {
+    const normalized = path.resolve(target).replace(/\\/g, "/");
+    return normalized.length > 1 && normalized.endsWith("/")
+      ? normalized.slice(0, -1)
+      : normalized;
+  };
+  const canonical = (target: string): string | undefined => {
     try {
-      return realpathSync(target).replace(/\\/g, "/");
+      return normalize(realpathSync(target));
     } catch {
-      // Path missing or unreadable — fall back to a normalized comparison.
-      return path.resolve(target).replace(/\\/g, "/");
+      return undefined;
     }
   };
 
-  const stripTrailingSlash = (target: string): string =>
-    target.length > 1 && target.endsWith("/") ? target.slice(0, -1) : target;
+  const resolvedPlain = normalize(resolved);
+  const parentPlain = normalize(parentCwd);
+  if (resolvedPlain === parentPlain) return true;
 
-  return stripTrailingSlash(canonical(resolved)) === stripTrailingSlash(canonical(parentCwd));
+  const resolvedCanonical = canonical(resolved);
+  const parentCanonical = canonical(parentCwd);
+  return resolvedCanonical !== undefined
+    && parentCanonical !== undefined
+    && resolvedCanonical === parentCanonical;
 }
 
 /**

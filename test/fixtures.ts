@@ -88,6 +88,8 @@ interface ShellMockState {
   coordinator: Partial<SpawnCoordinator> | null;
   widget: AgentWidget | null | undefined;
   spawnGuard: { depth: number };
+  /** Don fork: how many times publishSessionBridge() was called. */
+  sessionBridgePublishCount: number;
 }
 
 /**
@@ -128,6 +130,7 @@ export function shellMock(fns: ShellMockFns = {}) {
     coordinator: fns.coordinator ?? { spawn: vi.fn() },
     widget: fns.widget ?? undefined,
     spawnGuard: fns.spawnGuard ?? { depth: 0 },
+    sessionBridgePublishCount: 0,
   };
 
   return {
@@ -139,6 +142,12 @@ export function shellMock(fns: ShellMockFns = {}) {
     getWidget: () => state.widget,
     setPiInstance: (pi: Partial<ExtensionAPI>) => {
       state.pi = pi;
+    },
+    // Don fork: the /pool session bridge. Records the publish and exposes the
+    // published object, so a test can assert on it without a real globalThis.
+    SESSION_BRIDGE_KEY: "__piSubagentsLiteSession",
+    publishSessionBridge: () => {
+      state.sessionBridgePublishCount++;
     },
     setSessionCtx: (ctx: Partial<ExtensionContext>) => {
       state.sessionCtx = ctx;

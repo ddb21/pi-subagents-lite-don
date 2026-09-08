@@ -9,7 +9,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { setPiInstance, isInsideSubagentSpawn } from "./shell.js";
+import { setPiInstance, isInsideSubagentSpawn, publishSessionBridge } from "./shell.js";
 import { registerTools } from "./registration.js";
 import { setupEventListeners } from "./events.js";
 
@@ -18,6 +18,8 @@ export default function (pi: ExtensionAPI) {
   // so we never clobber the parent-owned shell (the completion nudge relies on it).
   if (isInsideSubagentSpawn()) return;
   setPiInstance(pi);
+  // Don fork: expose session-scoped routing to sibling extensions (/pool).
+  publishSessionBridge();
   registerTools(pi);
   setupEventListeners(pi);
 }

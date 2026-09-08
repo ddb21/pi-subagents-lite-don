@@ -151,6 +151,14 @@ export class ConfigStore {
   private config: SubagentsConfig;
   private io: ConfigIO;
   private sessionOverrides: SessionModelOverrides = { default: null };
+  /**
+   * Don fork: ambient per-session routes from /pool. Weaker than an explicit
+   * per-call model, so a session-scoped pool switch cannot silently cancel a
+   * deliberate escalation.
+   */
+  private ambientOverrides: SessionModelOverrides = { default: null };
+  /** Don fork: last seen config change stamp, for external-edit detection. */
+  private lastChangeStamp = 0;
   private sessionConcurrencyLayer: RawConcurrency = {};
   private sessionShowCost: boolean | undefined;
   private widget?: AgentWidget;
@@ -165,6 +173,35 @@ export class ConfigStore {
     this.projectRaw = loaded.project;
     this.projectStatus = loaded.projectStatus;
     this.config = mergeDefaults(mergeLayers(this.globalRaw, this.projectRaw));
+    this.lastChangeStamp = this.io.changeStamp?.() ?? 0;
+  }
+
+  /**
+   * Don fork: re-read config when either layer changed on disk since the last
+   * read.
+   *
+   * A pool-profile switch (projects/pi-utils/pi-pool.py) rewrites
+   * subagents-lite.json while sessions are open. `reload()` only runs at
+   * session_start, so without this a running orchestrator keeps routing to the
+   * old pool, which is exactly wrong when the switch was made because that pool
+   * ran out of quota.
+   *
+   * Session and ambient overrides deliberately SURVIVE: a user pin must outrank
+   * an external file edit. That is the one behavioral difference from reload().
+   *
+   * @returns true when the config was re-read.
+   */
+  refreshIfChanged(): boolean {
+    const stamp = this.io.changeStamp?.() ?? 0;
+    if (stamp === 0 || stamp === this.lastChangeStamp) return false;
+    this.lastChangeStamp = stamp;
+    const loaded = this.io.load();
+    this.globalRaw = loaded.global;
+    this.projectRaw = loaded.project;
+    this.projectStatus = loaded.projectStatus;
+    this.rebuildEffective();
+    this.syncAllDeps();
+    return true;
   }
 
   /**
@@ -310,6 +347,16 @@ export class ConfigStore {
     return concurrencyLayerHasSettings(this.projectRaw?.concurrency ?? {});
   }
 
+  /** Don fork: all active session pins, for /pool status and the agents menu. */
+  sessionOverrideSnapshot(): Readonly<SessionModelOverrides> {
+    return { ...this.sessionOverrides };
+  }
+
+  /** Don fork: active ambient (/pool) routes. */
+  ambientOverrideSnapshot(): Readonly<SessionModelOverrides> {
+    return { ...this.ambientOverrides };
+  }
+
   /** Raw agent config incl. dynamic per-type model keys (for menu display). */
   agentConfigSnapshot(): Readonly<SubagentsConfig["agent"]> {
     return this.config.agent;
@@ -327,6 +374,7 @@ export class ConfigStore {
       config: this.config,
       parentModelId,
       sessionOverrides: this.sessionOverrides,
+      ambientOverrides: this.ambientOverrides,
     });
   }
 
@@ -347,6 +395,7 @@ export class ConfigStore {
       config: this.config,
       parentModelId,
       sessionOverrides: this.sessionOverrides,
+      ambientOverrides: this.ambientOverrides,
       explicitModel,
     });
   }
@@ -550,6 +599,17 @@ export class ConfigStore {
       },
       clearAll: (): void => {
         this.sessionOverrides = { default: null };
+        this.ambientOverrides = { default: null };
+      },
+      /**
+       * Don fork: ambient route from /pool. Loses to an explicit per-call
+       * model, unlike setOverride.
+       */
+      setAmbient: (type: string, model: string): void => {
+        this.ambientOverrides[type] = model;
+      },
+      clearAmbient: (): void => {
+        this.ambientOverrides = { default: null };
       },
       /** Not persisted. */
       setShowCost: (enabled: boolean): void => {
@@ -598,6 +658,7 @@ export class ConfigStore {
     this.projectStatus = loaded.projectStatus;
     this.rebuildEffective();
     this.sessionOverrides = { default: null };
+    this.ambientOverrides = { default: null };
     this.sessionConcurrencyLayer = {};
     this.sessionShowCost = undefined;
     this.lastToolsExpanded = undefined;

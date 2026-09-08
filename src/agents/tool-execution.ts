@@ -373,6 +373,10 @@ export async function executeAgentTool(
     getAgentConfig(resolvedType)?.maxTurns ??
     getStore().agent.defaultMaxTurns;
 
+  // Don fork: pick up an external config edit (a pool-profile switch) before
+  // resolving the model, so a switch made mid-session routes the very next
+  // delegation instead of waiting for the next session_start.
+  getStore().refreshIfChanged?.();
   const modelStr = params.model as string | undefined;
   // Don fork: resolve the full precedence chain here rather than trusting the
   // tool_call listener. The listener does not fire in one-shot (`pi -p`) runs,

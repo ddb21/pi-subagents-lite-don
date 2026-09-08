@@ -121,6 +121,12 @@ export interface ConfigIO {
   load(): LoadedConfig;
   saveGlobal(config: RawConfig): void;
   saveProject(config: RawConfig): void;
+  /**
+   * Don fork: a change stamp over both config layers, for mid-session
+   * external-edit detection. 0 means neither file exists. Optional so an
+   * in-memory test adapter can omit it.
+   */
+  changeStamp?(): number;
 }
 
 /** Agent keys a project file may set: the model family plus per-type overrides. */
@@ -140,6 +146,18 @@ type ProjectRead = { raw: RawConfig; unknownKeys: string[] } | "malformed" | nul
  * save touches only its own layer. A malformed project file is never written;
  * without a project dir the project layer is untrusted and unavailable.
  */
+/**
+ * Don fork: modification time of a config file, or 0 when it is absent or
+ * unreadable. Used to notice an external edit without restarting pi.
+ */
+export function configMtimeMs(filePath: string): number {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 export function createConfigIO(projectDir?: string): ConfigIO {
   const projectPath = projectDir ? path.join(projectDir, CONFIG_FILE_NAME) : null;
   let projectStatus: ProjectLayerStatus = projectDir ? "absent" : "untrusted";
@@ -183,6 +201,9 @@ export function createConfigIO(projectDir?: string): ConfigIO {
       }
       writeJsonAtomic(projectPath, config);
     },
+    // Don fork: sum both layers so an edit to either is noticed. Summing is
+    // enough because any write moves at least one mtime forward.
+    changeStamp: () => configMtimeMs(CONFIG_PATH) + (projectPath ? configMtimeMs(projectPath) : 0),
   };
 }
 

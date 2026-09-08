@@ -61,6 +61,51 @@ export function getStore(): ConfigStore {
   return shell.store;
 }
 
+/** Don fork: the narrow session-routing surface published on globalThis. */
+export interface SessionBridge {
+  setAmbient(type: string, spec: string): void;
+  setOverride(type: string, spec: string): void;
+  clearOverride(type: string): void;
+  clearAll(): void;
+  list(): Record<string, string>;
+}
+
+/** The globalThis key the bridge is published under. */
+export const SESSION_BRIDGE_KEY = "__piSubagentsLiteSession";
+
+/**
+ * Don fork: publish a narrow session-override bridge on globalThis.
+ *
+ * The store is module-private, so a sibling extension (the /pool command, for
+ * example) has no way to scope subagent routing to one session. Without this
+ * every pool switch is global: it rewrites config for all runtimes and every
+ * future session, which is wrong when only this session should move pools.
+ *
+ * Only session-scoped setters are exposed, never persisted config, so a caller
+ * cannot use the bridge to write to disk.
+ */
+export function publishSessionBridge(): void {
+  const bridge: SessionBridge = {
+    // `spec` may carry ":thinking". Sits below an explicit per-call model, so a
+    // deliberate escalation still wins.
+    setAmbient: (type, spec) => shell.store.mutate.session.setAmbient(type, spec),
+    // Hard per-session pin, as set by the /agents menu. Outranks everything.
+    setOverride: (type, spec) => shell.store.mutate.session.setOverride(type, spec),
+    clearOverride: (type) => shell.store.mutate.session.clearOverride(type),
+    clearAll: () => shell.store.mutate.session.clearAll(),
+    // Read back what is active, so /pool status can show session scope. A hard
+    // pin is listed after the ambient route, so it wins on the same key.
+    list: () => {
+      const out: Record<string, string> = {};
+      for (const snapshot of [shell.store.ambientOverrideSnapshot(), shell.store.sessionOverrideSnapshot()]) {
+        for (const [type, model] of Object.entries(snapshot)) if (model) out[type] = model;
+      }
+      return out;
+    },
+  };
+  (globalThis as Record<string, unknown>)[SESSION_BRIDGE_KEY] = bridge;
+}
+
 /** Null until created at session_start. */
 export function getCoordinator(): SpawnCoordinator | null {
   return shell.coordinator;

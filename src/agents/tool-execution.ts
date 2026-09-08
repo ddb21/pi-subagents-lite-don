@@ -14,7 +14,7 @@ import { SHORT_ID_LENGTH } from "../types.js";
 import type { AgentConfig, SessionLifecycle } from "./types.js";
 import { resolveType, getAgentConfig, discoverNewAgents } from "./agent-types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "./usage.js";
-import { validateWorktreePath } from "../spawn/worktree-validator.js";
+import { validateWorktreePath, isParentCwdPath } from "../spawn/worktree-validator.js";
 
 import { parseModelKey, findModelInRegistry, parseThinkingLevel, splitModelThinkingSuffix } from "../utils.js";
 import { resolveModelSpec } from "../models/model-spec.js";
@@ -191,6 +191,7 @@ export async function executeAgentTool(
   const rawSessionKey = typeof params.session_key === "string" ? params.session_key.trim() : undefined;
   let sessionKey = rawSessionKey || undefined;
   const rawWorktreePath = typeof params.worktree_path === "string" ? params.worktree_path.trim() : undefined;
+  let effectiveWorktreePath = rawWorktreePath;
   const normalizationWarnings: string[] = [];
   if (params.session_key !== undefined && !sessionKey) {
     normalizationWarnings.push("empty session_key ignored; spawned without a session key");
@@ -215,13 +216,13 @@ export async function executeAgentTool(
   let worktreeLabel: string | undefined;
   let worktreeValidated = false;
   const validateWorktreeForDispatch = async (): Promise<ReturnType<typeof errorResult> | undefined> => {
-    if (!rawWorktreePath || worktreeValidated) return undefined;
+    if (!effectiveWorktreePath || worktreeValidated) return undefined;
     worktreeValidated = true;
     try {
       const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
       const warnings: string[] = [];
       const onWarning = (msg: string) => { warnings.push(msg); };
-      const validation = await validateWorktreePath(getPiInstance(), rawWorktreePath, parentCwd, onWarning);
+      const validation = await validateWorktreePath(getPiInstance(), effectiveWorktreePath, parentCwd, onWarning);
       if (!validation.ok) {
         for (const msg of warnings) {
           if (ctx.ui?.notify) ctx.ui.notify(`[pi-subagents-lite] ${msg}`, "warning");
@@ -263,8 +264,27 @@ export async function executeAgentTool(
     normalizationWarnings.push(`session_key ignored for stateless agent '${resolvedType}'; spawned as one-shot`);
     sessionKey = undefined;
   }
-  if (sessionKey && rawWorktreePath) {
-    return nonRetryableValidationErrorResult("session_key cannot be used with a non-empty worktree_path for persistent agents; omit one of these fields.");
+  if (sessionKey && effectiveWorktreePath) {
+    // Don fork: a worktree_path equal to the parent working directory selects no
+    // other worktree. Models that fill every optional field send exactly that,
+    // then repeat the identical call after a hard error. Ignore the no-op value
+    // and keep the persistent session instead of failing the delegation.
+    const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
+    if (isParentCwdPath(effectiveWorktreePath, parentCwd)) {
+      normalizationWarnings.push(
+        `worktree_path '${effectiveWorktreePath}' is the parent working directory, not a separate git worktree; ignored so session_key '${sessionKey}' applies. Omit worktree_path unless you target a different worktree.`,
+      );
+      effectiveWorktreePath = undefined;
+      validatedWorktreePath = undefined;
+      worktreeLabel = undefined;
+      worktreeValidated = true;
+    } else {
+      return nonRetryableValidationErrorResult(
+        `session_key cannot be used with a non-empty worktree_path for persistent agents; omit one of these fields. `
+        + `worktree_path was '${effectiveWorktreePath}', which is not the parent working directory '${parentCwd}'. `
+        + `To reuse session_key '${sessionKey}', resend the same call with worktree_path omitted.`,
+      );
+    }
   }
 
   const worktreeError = await validateWorktreeForDispatch();

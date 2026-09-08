@@ -177,6 +177,42 @@ export async function validateWorktreePath(
 }
 
 /**
+ * Don fork: report whether a raw `worktree_path` points at the parent session's
+ * own working directory.
+ *
+ * A model that fills every optional field sends the parent cwd here. That value
+ * selects no other worktree, so the fork treats it as a no-op instead of a
+ * conflict with `session_key`. Comparison is pure and synchronous: resolve a
+ * relative path against the parent cwd, then canonicalize both sides when the
+ * filesystem allows it.
+ *
+ * @param worktreePath - The raw worktree_path value from the LLM
+ * @param parentCwd - The parent session's working directory
+ * @returns true when both paths name the same directory
+ */
+export function isParentCwdPath(worktreePath: string, parentCwd: string): boolean {
+  if (!worktreePath || worktreePath.trim() === "") return false;
+  if (!parentCwd || parentCwd.trim() === "") return false;
+
+  const trimmed = worktreePath.trim();
+  const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(parentCwd, trimmed);
+
+  const canonical = (target: string): string => {
+    try {
+      return realpathSync(target).replace(/\\/g, "/");
+    } catch {
+      // Path missing or unreadable — fall back to a normalized comparison.
+      return path.resolve(target).replace(/\\/g, "/");
+    }
+  };
+
+  const stripTrailingSlash = (target: string): string =>
+    target.length > 1 && target.endsWith("/") ? target.slice(0, -1) : target;
+
+  return stripTrailingSlash(canonical(resolved)) === stripTrailingSlash(canonical(parentCwd));
+}
+
+/**
  * Compute a short display label for the worktree path.
  *
  * Rules:

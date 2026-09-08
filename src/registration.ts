@@ -43,7 +43,7 @@ export function registerAgentTool(pi: ExtensionAPI, ctx?: { modelRegistry?: Regi
       description: Type.Optional(Type.String()),
       agent: agentParam,
       run_in_background: Type.Optional(Type.Boolean()),
-      worktree_path: Type.Optional(Type.String({ description: "Optional working directory. Do not supply with session_key; omit this field rather than passing an empty string." })),
+      worktree_path: Type.Optional(Type.String({ description: "Path to a separate git worktree of this repo. Omit it for normal work, including work in the current directory. Never send the parent working directory, and never send it with session_key." })),
       // Don fork: optional named, resumable child-session executor. The schema
       // rejects empty/whitespace placeholders before execution; one-shot
       // reviewer calls should omit session_key entirely.

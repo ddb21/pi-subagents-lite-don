@@ -87,6 +87,10 @@ function collectResponseText(
   onTextDelta?: (delta: string, fullText: string) => void,
 ) {
   let text = "";
+  // Last finalized assistant text seen during THIS run. Event-scoped, so it
+  // survives a compaction that replaces session.messages with a shorter array,
+  // and it can never carry text from an earlier run of a resumed session.
+  let finalText = "";
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "message_start") {
       text = "";
@@ -95,8 +99,12 @@ function collectResponseText(
       text += event.assistantMessageEvent.delta;
       onTextDelta?.(event.assistantMessageEvent.delta, text);
     }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const finalized = extractText((event.message.content ?? []) as unknown[]).trim();
+      if (finalized) finalText = finalized;
+    }
   });
-  return { getText: () => text, unsubscribe };
+  return { getText: () => text, getFinalText: () => finalText, unsubscribe };
 }
 
 /**
@@ -117,13 +125,27 @@ function lastAssistantTextFrom(messages: AgentSession["messages"], fromIndex: nu
   return "";
 }
 
-/** Get the last assistant text this run produced. */
-function getLastAssistantText(session: AgentSession, fromIndex: number): string {
-  return lastAssistantTextFrom(session.messages, fromIndex);
+/**
+ * Resolve a run's result text from the three sources, in priority order.
+ *
+ * 1. `streamedText` — deltas from the in-flight assistant message.
+ * 2. `finalText` — the last finalized assistant text from THIS run's
+ *    `message_end` events. Needed when the provider returns no deltas, and
+ *    when a compaction shortened `messages` below `fromIndex`.
+ * 3. The message array, scanned no lower than `fromIndex`, so an earlier run's
+ *    text can never surface as this run's result.
+ */
+function resolveRunResult(
+  streamedText: string,
+  finalText: string,
+  messages: AgentSession["messages"],
+  fromIndex: number,
+): string {
+  return streamedText.trim() || finalText.trim() || lastAssistantTextFrom(messages, fromIndex);
 }
 
 /** Test-only surface for the stale-result boundary. */
-export const __test__ = { lastAssistantTextFrom };
+export const __test__ = { lastAssistantTextFrom, collectResponseText, resolveRunResult };
 
 /**
  * Wire an AbortSignal to abort a session.
@@ -598,7 +620,12 @@ async function runTurnLoop(
     collector.unsubscribe();
     cleanupAbort();
   }
-  return collector.getText().trim() || getLastAssistantText(session, messageStart);
+  return resolveRunResult(
+    collector.getText(),
+    collector.getFinalText(),
+    session.messages,
+    messageStart,
+  );
 }
 
 // ── main entry ─────────────────────────────────────────────────────

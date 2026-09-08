@@ -1,7 +1,36 @@
 import { describe, expect, it } from "vitest";
 import { __test__ } from "./agent-runner.js";
 
-const { lastAssistantTextFrom } = __test__;
+const { lastAssistantTextFrom, collectResponseText, resolveRunResult } = __test__;
+
+/** Minimal session double: only `subscribe` is used by the collector. */
+function fakeSession() {
+  const listeners: ((event: unknown) => void)[] = [];
+  return {
+    session: {
+      subscribe(fn: (event: unknown) => void) {
+        listeners.push(fn);
+        return () => {
+          const i = listeners.indexOf(fn);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      },
+    },
+    emit(event: unknown) {
+      for (const fn of [...listeners]) fn(event);
+    },
+    listenerCount: () => listeners.length,
+  };
+}
+
+const delta = (text: string) => ({
+  type: "message_update",
+  assistantMessageEvent: { type: "text_delta", delta: text },
+});
+const end = (text: string) => ({
+  type: "message_end",
+  message: { role: "assistant", content: [{ type: "text", text }] },
+});
 
 /**
  * Regression cover for the persistent-session stale-result defect.
@@ -61,5 +90,99 @@ describe("stale-result boundary", () => {
 
   it("returns nothing for an empty history", () => {
     expect(lastAssistantTextFrom([] as never[], 0)).toBe("");
+  });
+});
+
+/**
+ * The collector must record finalized assistant text from this run, because a
+ * compaction can replace `session.messages` with a shorter array while the run
+ * is still in flight. The boundary index then points past the end.
+ */
+describe("collectResponseText final text", () => {
+  it("records finalized assistant text when the provider sends no deltas", () => {
+    const fake = fakeSession();
+    const collector = collectResponseText(fake.session as never);
+    fake.emit(end("finalized answer"));
+    expect(collector.getText()).toBe("");
+    expect(collector.getFinalText()).toBe("finalized answer");
+  });
+
+  it("keeps the latest finalized text across several assistant messages", () => {
+    const fake = fakeSession();
+    const collector = collectResponseText(fake.session as never);
+    fake.emit(end("first"));
+    fake.emit(end("second"));
+    expect(collector.getFinalText()).toBe("second");
+  });
+
+  it("ignores a finalized message that carries no text", () => {
+    const fake = fakeSession();
+    const collector = collectResponseText(fake.session as never);
+    fake.emit(end("kept"));
+    fake.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+    fake.emit(end("   "));
+    expect(collector.getFinalText()).toBe("kept");
+  });
+
+  it("ignores a finalized user message", () => {
+    const fake = fakeSession();
+    const collector = collectResponseText(fake.session as never);
+    fake.emit({
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "prompt" }] },
+    });
+    expect(collector.getFinalText()).toBe("");
+  });
+
+  it("resets streamed text at message_start but keeps finalized text", () => {
+    const fake = fakeSession();
+    const collector = collectResponseText(fake.session as never);
+    fake.emit(delta("partial"));
+    fake.emit(end("partial"));
+    fake.emit({ type: "message_start" });
+    expect(collector.getText()).toBe("");
+    expect(collector.getFinalText()).toBe("partial");
+  });
+
+  it("stops recording after unsubscribe", () => {
+    const fake = fakeSession();
+    const collector = collectResponseText(fake.session as never);
+    collector.unsubscribe();
+    expect(fake.listenerCount()).toBe(0);
+    fake.emit(end("after unsubscribe"));
+    expect(collector.getFinalText()).toBe("");
+  });
+});
+
+/** Pins the priority order the turn loop uses, so a call-site change fails. */
+describe("resolveRunResult priority", () => {
+  const history = [
+    { role: "assistant", content: [{ type: "text", text: "previous run result" }] },
+  ] as never[];
+
+  it("prefers streamed text", () => {
+    expect(resolveRunResult(" streamed ", "finalized", history, 1)).toBe("streamed");
+  });
+
+  it("uses finalized text when no deltas arrived", () => {
+    expect(resolveRunResult("", " finalized ", history, 1)).toBe("finalized");
+  });
+
+  it("returns this run's text after a compaction shortened the history", () => {
+    // Boundary was recorded at 40 messages; compaction cut history to 1.
+    expect(resolveRunResult("", "current run result", history, 40)).toBe("current run result");
+  });
+
+  it("never returns an earlier run's text when this run produced nothing", () => {
+    expect(resolveRunResult("", "", history, 1)).toBe("");
+    expect(resolveRunResult("", "", history, 40)).toBe("");
+  });
+
+  it("falls back to the message array when no events fired", () => {
+    const messages = [
+      ...history,
+      { role: "assistant", content: [{ type: "text", text: "array only" }] },
+    ] as never[];
+    expect(resolveRunResult("", "", messages, 1)).toBe("array only");
   });
 });

@@ -160,6 +160,11 @@ export interface SessionPromptOptions extends RunCallbacks {
 
 function collectResponseText(session: AgentSession, onTextDelta?: (delta: string, fullText: string) => void) {
   let text = "";
+  // Don fork: the last finalized assistant text seen during THIS run. It is
+  // event-scoped, so it survives a compaction that replaces session.messages
+  // with a shorter array, and it can never carry text from an earlier run of a
+  // resumed session.
+  let finalText = "";
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "message_start") {
       text = "";
@@ -168,19 +173,48 @@ function collectResponseText(session: AgentSession, onTextDelta?: (delta: string
       text += event.assistantMessageEvent.delta;
       onTextDelta?.(event.assistantMessageEvent.delta, text);
     }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const finalized = extractText(event.message.content).trim();
+      if (finalized) finalText = finalized;
+    }
   });
-  return { getText: () => text, unsubscribe };
+  return { getText: () => text, getFinalText: () => finalText, unsubscribe };
 }
 
-function getLastAssistantText(session: AgentSession, fromIndex: number): string {
-  for (let i = session.messages.length - 1; i >= fromIndex; i--) {
-    const msg = session.messages[i];
+function lastAssistantTextFrom(messages: AgentSession["messages"], fromIndex: number): string {
+  for (let i = messages.length - 1; i >= fromIndex; i--) {
+    const msg = messages[i];
     if (msg.role !== "assistant") continue;
     const text = extractText(msg.content).trim();
     if (text) return text;
   }
   return "";
 }
+
+/**
+ * Don fork: resolve a run's result text from the three sources, in priority
+ * order.
+ *
+ * 1. `streamedText` - deltas from the in-flight assistant message.
+ * 2. `finalText` - the last finalized assistant text from THIS run's
+ *    `message_end` events. Needed when the provider returns no deltas, and
+ *    when a threshold auto-compaction inside `session.prompt()` shortened
+ *    `messages` below `fromIndex`, which makes the scan below run zero times
+ *    and drop a legitimate current-run result.
+ * 3. The message array, scanned no lower than `fromIndex`, so an earlier run's
+ *    text can never surface as this run's result.
+ */
+function resolveRunResult(
+  streamedText: string,
+  finalText: string,
+  messages: AgentSession["messages"],
+  fromIndex: number,
+): string {
+  return streamedText.trim() || finalText.trim() || lastAssistantTextFrom(messages, fromIndex);
+}
+
+/** Test-only surface for the stale-result boundary. */
+export const __test__ = { lastAssistantTextFrom, collectResponseText, resolveRunResult };
 
 /**
  * The provider error message when the run ended in a model error: the final
@@ -718,7 +752,7 @@ async function runTurnLoop(
     collector.unsubscribe();
     cleanupAbort();
   }
-  return collector.getText().trim() || getLastAssistantText(session, messageStart);
+  return resolveRunResult(collector.getText(), collector.getFinalText(), session.messages, messageStart);
 }
 
 /**

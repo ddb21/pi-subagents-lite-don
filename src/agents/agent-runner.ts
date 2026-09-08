@@ -99,16 +99,31 @@ function collectResponseText(
   return { getText: () => text, unsubscribe };
 }
 
-/** Get the last assistant text from the completed session history. */
-function getLastAssistantText(session: AgentSession): string {
-  for (let i = session.messages.length - 1; i >= 0; i--) {
-    const msg = session.messages[i];
+/**
+ * Get the last assistant text produced at or after `fromIndex`.
+ *
+ * `fromIndex` is the message count captured before this run's prompt. Messages
+ * below it belong to earlier runs on a resumed persistent session, so the
+ * fallback must never surface their text: doing so resurrects a prior run's
+ * result when this run produces nothing (abort or model error).
+ */
+function lastAssistantTextFrom(messages: AgentSession["messages"], fromIndex: number): string {
+  for (let i = messages.length - 1; i >= fromIndex; i--) {
+    const msg = messages[i];
     if (msg.role !== "assistant") continue;
     const text = extractText(msg.content).trim();
     if (text) return text;
   }
   return "";
 }
+
+/** Get the last assistant text this run produced. */
+function getLastAssistantText(session: AgentSession, fromIndex: number): string {
+  return lastAssistantTextFrom(session.messages, fromIndex);
+}
+
+/** Test-only surface for the stale-result boundary. */
+export const __test__ = { lastAssistantTextFrom };
 
 /**
  * Wire an AbortSignal to abort a session.
@@ -572,6 +587,9 @@ async function runTurnLoop(
   const unsubEvents = subscribeToSessionEvents(session, options);
   const collector = collectResponseText(session, options.onTextDelta);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
+  // Messages already present belong to earlier runs of a resumed persistent
+  // session. Record the boundary so the fallback cannot return their text.
+  const messageStart = session.messages.length;
   try {
     await session.prompt(prompt);
   } finally {
@@ -580,7 +598,7 @@ async function runTurnLoop(
     collector.unsubscribe();
     cleanupAbort();
   }
-  return collector.getText().trim() || getLastAssistantText(session);
+  return collector.getText().trim() || getLastAssistantText(session, messageStart);
 }
 
 // ── main entry ─────────────────────────────────────────────────────

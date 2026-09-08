@@ -46,6 +46,28 @@ const {
 
 vi.mock("../../src/spawn/worktree-validator.js", () => ({
   validateWorktreePath: mockValidateWorktreePath,
+  // Don fork: the parent-cwd no-op check is pure, so mirror the real logic
+  // rather than stubbing it. Inlined because vi.mock factories are hoisted.
+  isParentCwdPath: (worktreePath: string, parentCwd: string) => {
+    if (!worktreePath.trim() || !parentCwd.trim()) return false;
+    const normalize = (value: string) => value.replace(/\/+$/, "") || "/";
+    const trimmed = worktreePath.trim();
+    const resolved = trimmed.startsWith("/") ? trimmed : `${normalize(parentCwd)}/${trimmed}`;
+    const collapse = (value: string) =>
+      normalize(value)
+        .split("/")
+        .reduce<string[]>((parts, part) => {
+          if (part === "." || part === "") return parts;
+          if (part === "..") {
+            parts.pop();
+            return parts;
+          }
+          parts.push(part);
+          return parts;
+        }, [])
+        .join("/");
+    return collapse(resolved) === collapse(parentCwd);
+  },
   computeLabel: vi.fn((resolved: string, root: string) => {
     if (resolved === root) return root.split("/").pop() || root;
     const rel = resolved.slice(root.length + 1);
@@ -987,7 +1009,7 @@ describe("executeAgentTool — session_key", () => {
     expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
   });
 
-  it("rejects session_key combined with a non-empty worktree_path", async () => {
+  it("rejects session_key combined with a genuinely different worktree_path", async () => {
     await expect(
       executeAgentTool(
         "tc-sk-wt",
@@ -996,8 +1018,105 @@ describe("executeAgentTool — session_key", () => {
         undefined,
         ctx,
       ),
-    ).rejects.toThrow(/session_key cannot be used with a non-empty worktree_path/);
+    ).rejects.toThrow(/session_key cannot be used with a non-empty worktree_path for persistent agents/);
     expect(mockValidateWorktreePath).not.toHaveBeenCalled();
+  });
+
+  it("names the failed value, the parent cwd, and the exact retry in that error", async () => {
+    // The live incident was a caller looping on an error it could not act on.
+    // The message has to say which of the two arguments to drop.
+    const failure = await executeAgentTool(
+      "tc-sk-wt-msg",
+      makeParams({ session_key: "exec-proj", worktree_path: "/wt/feature" }),
+      undefined,
+      undefined,
+      ctx,
+    ).catch((error: Error) => error.message);
+
+    expect(failure).toContain("worktree_path was '/wt/feature'");
+    expect(failure).toContain("parent working directory '/home/test/project'");
+    expect(failure).toContain("resend the same call with worktree_path omitted");
+    expect(failure).toContain("non-retryable; do not repeat the same Agent call unchanged");
+  });
+
+  it("drops a parent-cwd worktree_path, notes it, and keeps the session", async () => {
+    // A model that fills every optional field sends the parent cwd here. That
+    // value selects no OTHER worktree, so it must not fail the delegation.
+    const result = await executeAgentTool(
+      "tc-sk-wt-noop",
+      makeParams({ session_key: "exec-proj", worktree_path: "/home/test/project" }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
+    expect(lastSpawnOptions().worktreePath).toBeUndefined();
+    expect(mockValidateWorktreePath).not.toHaveBeenCalled();
+    expect(result.content[0].text).toContain("is the parent working directory");
+    expect(result.content[0].text).toContain("ignored so session_key 'exec-proj' applies");
+  });
+
+  it("drops a parent-cwd worktree_path written with a trailing slash", async () => {
+    await executeAgentTool(
+      "tc-sk-wt-slash",
+      makeParams({ session_key: "exec-proj", worktree_path: "/home/test/project/" }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
+    expect(lastSpawnOptions().worktreePath).toBeUndefined();
+  });
+
+  it("drops a parent-cwd worktree_path written as '.'", async () => {
+    await executeAgentTool(
+      "tc-sk-wt-dot",
+      makeParams({ session_key: "exec-proj", worktree_path: "." }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
+    expect(lastSpawnOptions().worktreePath).toBeUndefined();
+  });
+
+  it("still validates a worktree_path sent without a session_key", async () => {
+    // The guard must not change the ordinary worktree path.
+    mockValidateWorktreePath.mockResolvedValue({
+      ok: true,
+      resolvedPath: "/wt/feature",
+      worktreeRoot: "/wt/feature",
+      label: "feature",
+    });
+
+    await executeAgentTool("tc-wt-only", makeParams({ worktree_path: "/wt/feature" }), undefined, undefined, ctx);
+
+    expect(mockValidateWorktreePath).toHaveBeenCalledTimes(1);
+    expect(lastSpawnOptions().worktreePath).toBe("/wt/feature");
+    expect(lastSpawnOptions().sessionKey).toBeUndefined();
+  });
+
+  it("still validates the parent cwd as a worktree_path when no key is sent", async () => {
+    // Without a key there is no conflict to resolve, so the no-op shortcut must
+    // not fire and swallow the normal validation.
+    mockValidateWorktreePath.mockResolvedValue({
+      ok: true,
+      resolvedPath: "/home/test/project",
+      worktreeRoot: "/home/test/project",
+      label: "project",
+    });
+
+    await executeAgentTool(
+      "tc-wt-parent-nokey",
+      makeParams({ worktree_path: "/home/test/project" }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(mockValidateWorktreePath).toHaveBeenCalledTimes(1);
   });
 
   it("allows session_key alongside an empty worktree_path placeholder", async () => {

@@ -14,7 +14,7 @@ import { SHORT_ID_LENGTH } from "../types.js";
 import { resolveType, getAgentConfig, resolveTypeOrDiscover, type TypeResolution } from "./agent-types.js";
 import type { SessionLifecycle } from "./types.js";
 import { getSessionContextPercent } from "./usage.js";
-import { validateWorktreePath } from "../spawn/worktree-validator.js";
+import { validateWorktreePath, isParentCwdPath } from "../spawn/worktree-validator.js";
 import { resolveSubagentTrust, createSubagentTrustDeps, untrustedProjectWarning } from "../spawn/project-trust.js";
 
 import { parseModelKey, findModelInRegistry, parseThinkingLevel, splitModelThinkingSuffix } from "../utils.js";
@@ -285,14 +285,35 @@ export async function executeAgentTool(
 
   // Validate worktree_path early — needed for on-demand agent discovery
   const rawWorktreePath = params.worktree_path as string | undefined;
-  if (sessionKey && rawWorktreePath && rawWorktreePath.trim() !== "") {
-    throw new Error(
-      `session_key cannot be used with a non-empty worktree_path; omit one of these fields. ` +
-        `worktree_path was '${rawWorktreePath}'. To reuse session_key '${sessionKey}', resend the same call ` +
-        `with worktree_path omitted. ${NON_RETRYABLE_VALIDATION_NOTE}`,
-    );
+  // Don fork: an empty or whitespace-only placeholder selects no worktree.
+  let effectiveWorktreePath = rawWorktreePath?.trim() || undefined;
+
+  if (sessionKey && effectiveWorktreePath) {
+    // Don fork: a worktree_path equal to the parent working directory selects no
+    // OTHER worktree. Models that fill every optional field send exactly that,
+    // and a hard error here made one live session repeat the identical call 11
+    // times. Ignore the no-op value and keep the session instead.
+    const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
+    if (isParentCwdPath(effectiveWorktreePath, parentCwd)) {
+      normalizationWarnings.push(
+        `worktree_path '${effectiveWorktreePath}' is the parent working directory, not a separate git worktree; ` +
+          `ignored so session_key '${sessionKey}' applies. Omit worktree_path unless you target a different worktree.`,
+      );
+      effectiveWorktreePath = undefined;
+    } else {
+      // A genuinely different worktree cannot host a session keyed to this one.
+      // Name the failed value, the parent cwd, and the exact retry, so the
+      // caller can tell which of the two arguments to drop.
+      throw new Error(
+        `session_key cannot be used with a non-empty worktree_path for persistent agents; ` +
+          `omit one of these fields. worktree_path was '${effectiveWorktreePath}', which is not the parent ` +
+          `working directory '${parentCwd}'. To reuse session_key '${sessionKey}', resend the same call with ` +
+          `worktree_path omitted. ${NON_RETRYABLE_VALIDATION_NOTE}`,
+      );
+    }
   }
-  const resolved = await resolveWorktree(ctx, rawWorktreePath);
+
+  const resolved = await resolveWorktree(ctx, effectiveWorktreePath);
   if (!resolved.ok) throw new Error(resolved.error);
   const validatedWorktreePath = resolved.resolvedPath;
   const worktreeLabel = resolved.worktreeLabel;

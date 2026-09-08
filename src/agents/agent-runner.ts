@@ -70,6 +70,8 @@ interface RunOptions extends RunTunables, RunCallbacks {
 interface RunResult {
   responseText: string;
   session: AgentSession;
+  /** Non-fatal setup warnings that must be included in the parent result. */
+  warnings: string[];
   /** True if the agent was hard-aborted (max_turns + grace exceeded). */
   aborted: boolean;
   /** True if the agent hit the soft turn limit and wrapped up within grace turns. */
@@ -180,7 +182,7 @@ export function subscribeToSessionEvents(
  * Does NOT depend on internal directory structure (dist/, lib/, src/, etc).
  * Only cares about the package root, which is determined by distribution method.
  */
-function extractExtensionName(extPath: string): string {
+export function extractExtensionName(extPath: string): string {
   const parts = extPath.split(path.sep);
 
   // 1. Git package: .../git/github.com/<user>/<pkg>/...
@@ -364,6 +366,16 @@ function buildExtOverride(
     });
   }
   return undefined;
+}
+
+/** Warn for every declared extension that exact package-path matching cannot find. */
+export function findMissingDeclaredExtensions(
+  declared: true | string[] | false | undefined,
+  loaded: Array<{ path: string }>,
+): string[] {
+  if (!Array.isArray(declared)) return [];
+  const loadedNames = new Set(loaded.map((ext) => extractExtensionName(ext.path)));
+  return declared.filter((name) => !loadedNames.has(name));
 }
 
 /**
@@ -623,6 +635,11 @@ async function runAgentImpl(
   );
   const { loader, reloadAndMap } = createResourceLoader(config, agentConfig, effectiveCwd, systemPrompt);
   const { extResult } = await reloadAndMap();
+  for (const extension of findMissingDeclaredExtensions(agentConfig?.extensions, extResult.extensions)) {
+    bufferNotify(
+      `agent "${type}" declares extension "${extension}", but no loaded extension has that exact package name`,
+    );
+  }
   const session = await createAndConfigureSession(
     ctx, options, agentConfig, type, effectiveCwd, loader, extResult, bufferNotify,
   );
@@ -639,5 +656,5 @@ async function runAgentImpl(
     else console.warn(`[pi-subagents-lite] ${msg}`);
   }
 
-  return { responseText, session, aborted: getAborted(), turnLimited: getTurnLimited() };
+  return { responseText, session, warnings, aborted: getAborted(), turnLimited: getTurnLimited() };
 }

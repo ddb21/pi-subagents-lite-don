@@ -361,12 +361,13 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(({ responseText, session, aborted, turnLimited }) => {
+      .then(({ responseText, session, warnings, aborted, turnLimited }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.lifecycle.status !== "stopped") {
           record.lifecycle.status = aborted ? "aborted" : turnLimited ? "turn_limited" : "completed";
         }
         record.result = responseText;
+        record.warnings = warnings;
         record.execution.session = session;
         record.stats.contextPercent = getSessionContextPercent(session);
         record.lifecycle.completedAt ??= Date.now();

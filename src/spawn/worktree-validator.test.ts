@@ -1,10 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { describe, expect, it } from "vitest";
 import { isParentCwdPath } from "./worktree-validator.js";
-
-beforeEach(() => vi.restoreAllMocks());
 
 describe("isParentCwdPath", () => {
   const makeParent = () => {
@@ -14,20 +12,42 @@ describe("isParentCwdPath", () => {
     return { root, parent };
   };
 
-  it("covers absolute, relative, trailing slash, empty, different, missing, and symlink paths", () => {
+  it("matches an absolute parent path", () => {
+    const { parent } = makeParent();
+    expect(isParentCwdPath(parent, parent)).toBe(true);
+  });
+
+  it("resolves a relative path against the parent cwd", () => {
+    const { parent } = makeParent();
+    expect(isParentCwdPath(".", parent)).toBe(true);
+  });
+
+  it("ignores a trailing slash", () => {
+    const { parent } = makeParent();
+    expect(isParentCwdPath(`${parent}${path.sep}`, parent)).toBe(true);
+  });
+
+  it.each(["", "   "])("rejects empty input %j", (input) => {
+    const { parent } = makeParent();
+    expect(isParentCwdPath(input, parent)).toBe(false);
+  });
+
+  it("rejects a different directory", () => {
     const { root, parent } = makeParent();
     const other = path.join(root, "other");
-    const alias = path.join(root, "repo-alias");
     mkdirSync(other);
-    symlinkSync(parent, alias, "dir");
-
-    expect(isParentCwdPath(parent, parent)).toBe(true);
-    expect(isParentCwdPath(".", parent)).toBe(true);
-    expect(isParentCwdPath(`${parent}${path.sep}`, parent)).toBe(true);
-    expect(isParentCwdPath("", parent)).toBe(false);
-    expect(isParentCwdPath("   ", parent)).toBe(false);
     expect(isParentCwdPath(other, parent)).toBe(false);
+  });
+
+  it("rejects a non-existent path", () => {
+    const { root, parent } = makeParent();
     expect(isParentCwdPath(path.join(root, "missing"), parent)).toBe(false);
+  });
+
+  it("matches a symlink alias of the parent cwd", () => {
+    const { root, parent } = makeParent();
+    const alias = path.join(root, "repo-alias");
+    symlinkSync(parent, alias, "dir");
     expect(isParentCwdPath(alias, parent)).toBe(true);
   });
 });

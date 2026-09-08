@@ -405,20 +405,29 @@ export async function executeAgentTool(
     // Background: return immediately
     const suffix = `A notification will arrive when done - User asks you not to poll, check status or duplicate the delegated work.\n\nAgent ID: ${agentId}`;
     const label = record.lifecycle.status === "queued" ? "Agent queued" : "Agent running";
-    return withNormalizationWarnings(successResult(`[${label}] ${suffix}`, buildAgentDetails(record)), normalizationWarnings);
+    return withNormalizationWarnings(successResult(`[${label}] ${suffix}`, buildAgentDetails(record)), [
+      ...normalizationWarnings,
+      ...(record.warnings ?? []),
+    ]);
   }
 
   // Foreground: record.execution.promise is already awaited by coordinator.spawn()
   const details = buildAgentDetails(record, { includeStats: true });
 
   if (record.lifecycle.status === "error") {
-    return withNormalizationWarnings(errorResult(`Agent failed: ${record.error || "unknown error"}`, details), normalizationWarnings);
+    return withNormalizationWarnings(errorResult(`Agent failed: ${record.error || "unknown error"}`, details), [
+      ...normalizationWarnings,
+      ...(record.warnings ?? []),
+    ]);
   }
 
   const resultText = forcedForeground
     ? `[note: run_in_background was ignored — one-shot mode has no later turn to collect background results, so the agent ran in the foreground]\n\n${formatResultContent(record)}`
     : formatResultContent(record);
-  return withNormalizationWarnings(successResult(resultText, details), normalizationWarnings);
+  return withNormalizationWarnings(successResult(resultText, details), [
+    ...normalizationWarnings,
+    ...(record.warnings ?? []),
+  ]);
 }
 
 // ============================================================================

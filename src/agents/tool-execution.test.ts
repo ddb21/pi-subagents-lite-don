@@ -16,6 +16,7 @@ const agentConfigs: Record<string, { sessionLifecycle?: "persistent" | "stateles
   "data-deck": { sessionLifecycle: "persistent" },
   "legacy-executor": { persistentSession: true },
   "conflicting-executor": { sessionLifecycle: "persistent", persistentSession: false },
+  "warning-agent": {},
 };
 
 vi.mock("./agent-types.js", () => ({
@@ -32,14 +33,8 @@ vi.mock("./usage.js", () => ({
 }));
 vi.mock("../spawn/worktree-validator.js", () => ({
   validateWorktreePath: vi.fn(),
-  isParentCwdPath: (worktreePath: string, parentCwd: string) => {
-    if (!worktreePath.trim() || !parentCwd.trim()) return false;
-    const normalize = (value: string) => value.replace(/\/+$/, "") || "/";
-    const resolved = worktreePath.startsWith("/")
-      ? worktreePath
-      : `${normalize(parentCwd)}/${worktreePath}`;
-    return normalize(resolved) === normalize(parentCwd);
-  },
+  isParentCwdPath: vi.fn((worktreePath: string, parentCwd: string) =>
+    worktreePath.replace(/\/+$/, "") === parentCwd.replace(/\/+$/, "")),
 }));
 vi.mock("../utils.js", () => ({
   // Inlined (not a top-level const): vi.mock factories are hoisted.
@@ -80,6 +75,9 @@ const spawn = vi.fn(async (_pi, _ctx, options) => ({
     stats: { turnCount: 1, maxTurns: 1, toolUses: 0, lifetimeUsage: { input: 0, output: 0, cost: 0 }, compactionCount: 0 },
     execution: { session: {} },
     result: "ok",
+    warnings: options.type === "warning-agent"
+      ? ["agent \"warning-agent\" declares extension \"pi-lens\", but no loaded extension has that exact package name"]
+      : [] as string[],
   },
 }));
 
@@ -150,6 +148,16 @@ describe("Agent session_key/worktree_path normalization", () => {
       sessionKeyCwd: "/repo",
       worktreePath: undefined,
     }));
+  });
+
+  it("includes spawn-time dependency warnings in the agent result", async () => {
+    const result = await execute({}, "warning-agent");
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0].text).toContain("declares extension \"pi-lens\"");
+    expect(result.details).toMatchObject({
+      normalizationWarnings: [expect.stringContaining("no loaded extension has that exact package name")],
+    });
   });
 
   it("allows an unkeyed persistent agent to run one-shot", async () => {
@@ -480,6 +488,7 @@ describe("Agent session_key/worktree_path normalization", () => {
         execution: { session: {} },
         result: "",
         error: "child boom",
+        warnings: [] as string[],
       },
     }));
 

@@ -34,6 +34,8 @@ export interface AgentRecord {
   id: string;
   result?: string;
   error?: string;
+  /** Non-fatal spawn/setup warnings included in the parent tool result. */
+  warnings?: string[];
   /** Lifecycle state: status, timestamps. */
   lifecycle: AgentLifecycle;
   /** Display-oriented info: type, description, output file, invocation. */

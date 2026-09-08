@@ -12,7 +12,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentConfig } from "./types.js";
+import type { AgentConfig, SessionLifecycle } from "./types.js";
 import type { ThinkingLevel } from "../types.js";
 import { parseThinkingLevel } from "../utils.js";
 
@@ -28,6 +28,10 @@ export interface AgentConfigFromMd {
   exclude_extensions?: string[];
   skills?: boolean | string[];
   preload_skills?: string[] | false;
+  /** Don fork: "persistent" opts the agent into keyed multi-round sessions. */
+  session_lifecycle?: SessionLifecycle;
+  /** Don fork: legacy boolean spelling of session_lifecycle. */
+  persistent_session?: boolean;
   color?: string;
   model?: string;
   thinking?: ThinkingLevel;
@@ -213,6 +217,15 @@ function parseBoolean(frontmatter: Record<string, unknown>, key: string): boolea
   return undefined;
 }
 
+/**
+ * Don fork: parse session lifecycle metadata. An unrecognized value is dropped
+ * rather than thrown, so a future spelling degrades to the stateless default
+ * instead of making the whole agent file unloadable.
+ */
+function parseSessionLifecycle(raw: unknown): SessionLifecycle | undefined {
+  return raw === "persistent" || raw === "stateless" ? raw : undefined;
+}
+
 function parseNumber(frontmatter: Record<string, unknown>, key: string): number | undefined {
   const v = frontmatter[key];
   if (typeof v === "number") return v;
@@ -242,6 +255,8 @@ export function parseAgentFile(content: string, source: "user" | "project"): Age
     exclude_extensions: parseStringArray(frontmatter, "exclude_extensions"),
     skills: parseExtensions(frontmatter.skills),
     preload_skills: parsePreloadSkills(frontmatter.preload_skills),
+    session_lifecycle: parseSessionLifecycle(frontmatter.session_lifecycle),
+    persistent_session: parseBoolean(frontmatter, "persistent_session"),
     color: parseString(frontmatter, "color"),
     model: parseString(frontmatter, "model"),
     thinking: parseThinkingLevel(parseString(frontmatter, "thinking")),
@@ -270,7 +285,9 @@ export async function scanAgentFilesInDir(
   }
 
   const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
-  const mdFiles = entries.filter((e) => e.isFile() && e.name.endsWith(".md"));
+  // Don fork: follow symlinks so an agent file can be deployed with `ln -s`.
+  // A broken or directory symlink still fails its read below and is skipped.
+  const mdFiles = entries.filter((e) => (e.isFile() || e.isSymbolicLink()) && e.name.endsWith(".md"));
 
   const agents: AgentConfigFromMd[] = [];
   for (const entry of mdFiles) {
@@ -349,6 +366,18 @@ function mergeAgentOverrides(result: Map<string, AgentConfig>, agents: AgentConf
  * fields fall through to the existing values.
  */
 function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
+  // Don fork: session_lifecycle is authoritative; persistent_session is the
+  // legacy boolean spelling. A file that sets both to opposite meanings is a
+  // config bug that must not resolve silently to one of the two.
+  const legacyLifecycle: SessionLifecycle | undefined =
+    md.persistent_session === undefined ? undefined : md.persistent_session ? "persistent" : "stateless";
+  if (md.session_lifecycle && legacyLifecycle && md.session_lifecycle !== legacyLifecycle) {
+    throw new Error(
+      `Agent '${md.name ?? "unknown"}' has conflicting session_lifecycle and persistent_session metadata`,
+    );
+  }
+  const sessionLifecycle = md.session_lifecycle ?? legacyLifecycle;
+
   const obj: Record<string, unknown> = {
     name: md.name,
     displayName: md.display_name,
@@ -360,6 +389,8 @@ function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
     excludeExtensions: md.exclude_extensions,
     skills: md.skills,
     preloadSkills: md.preload_skills,
+    sessionLifecycle,
+    persistentSession: sessionLifecycle === undefined ? undefined : sessionLifecycle === "persistent",
     color: md.color,
     model: md.model,
     thinkingLevel: md.thinking,

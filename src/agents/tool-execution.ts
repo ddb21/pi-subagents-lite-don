@@ -12,6 +12,7 @@ import { getAgentDir, type ExtensionContext, type ToolCallEvent } from "@earendi
 import type { AgentRecord } from "../types.js";
 import { SHORT_ID_LENGTH } from "../types.js";
 import { resolveType, getAgentConfig, resolveTypeOrDiscover, type TypeResolution } from "./agent-types.js";
+import type { SessionLifecycle } from "./types.js";
 import { getSessionContextPercent } from "./usage.js";
 import { validateWorktreePath } from "../spawn/worktree-validator.js";
 import { resolveSubagentTrust, createSubagentTrustDeps, untrustedProjectWarning } from "../spawn/project-trust.js";
@@ -227,6 +228,16 @@ function resolveSpawnModel(
 const NON_RETRYABLE_VALIDATION_NOTE =
   "This validation error is non-retryable; do not repeat the same Agent call unchanged.";
 
+/**
+ * Don fork: resolve an agent's session lifecycle. `sessionLifecycle` is
+ * authoritative; `persistentSession` is the legacy boolean. Anything unset
+ * defaults to stateless, so persistence is always opt-in.
+ */
+function resolveSessionLifecycle(resolvedType: string): SessionLifecycle {
+  const config = getAgentConfig(resolvedType);
+  return config?.sessionLifecycle ?? (config?.persistentSession === true ? "persistent" : "stateless");
+}
+
 /** True when a param carries a value a caller actually meant to set. */
 function hasMeaningfulValue(value: unknown): boolean {
   if (value === undefined || value === null || value === false) return false;
@@ -303,6 +314,20 @@ export async function executeAgentTool(
   }
   const resolvedType = resolution.key;
 
+  // Don fork: only a "persistent" agent may be addressed by a named key. A key
+  // sent to a stateless agent is dropped with a note rather than thrown,
+  // because the caller cannot see agent frontmatter and an error here just
+  // loses the work: an orchestrator whose routing config names a key would
+  // resend the identical call. The note tells it the key had no effect.
+  const lifecycle = resolveSessionLifecycle(resolvedType);
+  const effectiveSessionKey = sessionKey && lifecycle === "persistent" ? sessionKey : undefined;
+  if (sessionKey && !effectiveSessionKey) {
+    normalizationWarnings.push(
+      `session_key '${sessionKey}' ignored: agent '${resolvedType}' is stateless, so this call is one-shot. ` +
+        `Omit session_key, or set session_lifecycle: persistent in that agent's frontmatter.`,
+    );
+  }
+
   const prompt = params.prompt as string;
   const description =
     (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
@@ -358,8 +383,12 @@ export async function executeAgentTool(
     parentSessionFile,
     // Don fork: scope a keyed session by normalized parent cwd, canonical type,
     // and caller key, so the same key under two projects stays two sessions.
-    ...(sessionKey
-      ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd, sessionKeyAgentType: resolvedType }
+    ...(effectiveSessionKey
+      ? {
+          sessionKey: effectiveSessionKey,
+          sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd,
+          sessionKeyAgentType: resolvedType,
+        }
       : {}),
     invocation: { modelName, thinkingLevel, maxTurns },
     runInBackground: isBackground,

@@ -7,7 +7,7 @@
  * (tool result content) not internal call order.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fakeCtx, makeResolvablePromise } from "../fixtures.js";
 import { asExtensionContext } from "../pi-boundaries.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -28,6 +28,7 @@ const {
   mockResolveSubagentTrust,
   mockResolveType,
   mockStoreState,
+  mockAgentConfigState,
 } = vi.hoisted(() => ({
   mockValidateWorktreePath: vi.fn(),
   mockSpawn: vi.fn().mockReturnValue("agent-id-123"),
@@ -36,6 +37,11 @@ const {
   mockResolveSubagentTrust: vi.fn(),
   mockResolveType: vi.fn<(type: string) => TypeResolution>((type) => ({ kind: "resolved", key: type })),
   mockStoreState: { forceBackground: false },
+  // Don fork: the session-key gate reads agent frontmatter, so the config the
+  // resolver returns has to be settable per test.
+  mockAgentConfigState: {
+    config: { maxTurns: 25, thinkingLevel: undefined } as Record<string, unknown>,
+  },
 }));
 
 vi.mock("../../src/spawn/worktree-validator.js", () => ({
@@ -63,7 +69,7 @@ vi.mock("../../src/agents/agent-types.js", () => ({
     }
     return resolution;
   }),
-  getAgentConfig: vi.fn(() => ({ maxTurns: 25, thinkingLevel: undefined })),
+  getAgentConfig: vi.fn(() => mockAgentConfigState.config),
   discoverNewAgents: mockDiscoverNewAgents,
 }));
 
@@ -872,12 +878,20 @@ describe("executeAgentTool — queued foreground spawn", () => {
 /*  Don fork — session_key                                            */
 /* ------------------------------------------------------------------ */
 
+/** Restore the default stateless agent config after a lifecycle test. */
+afterEach(() => {
+  mockAgentConfigState.config = { maxTurns: 25, thinkingLevel: undefined };
+});
+
 describe("executeAgentTool — session_key", () => {
   let ctx: ExtensionContext;
 
   beforeEach(() => {
     vi.clearAllMocks();
     ctx = fakeCtx();
+    // A key only survives on a persistent agent; the gate itself is covered in
+    // the session lifecycle block below.
+    mockAgentConfigState.config = { maxTurns: 25, sessionLifecycle: "persistent" };
     mockResolveSubagentTrust.mockReturnValue(true);
     mockGetRecord.mockReturnValue({
       id: "agent-id-123",
@@ -995,5 +1009,89 @@ describe("executeAgentTool — session_key", () => {
       ctx,
     );
     expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Don fork — session lifecycle gate                                 */
+/* ------------------------------------------------------------------ */
+
+describe("executeAgentTool — session lifecycle gate", () => {
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    ctx = fakeCtx();
+    mockResolveSubagentTrust.mockReturnValue(true);
+    mockGetRecord.mockReturnValue({
+      id: "agent-id-123",
+      display: { type: "general-purpose", description: "Test agent" },
+      lifecycle: { status: "completed", startedAt: Date.now() },
+      execution: { promise: Promise.resolve("done") },
+      result: "done",
+      stats: {
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        toolUses: 0,
+        compactionCount: 0,
+      },
+    });
+  });
+
+  const spawnOptions = () => mockSpawn.mock.calls.at(-1)![4] as Record<string, unknown>;
+
+  const call = (id: string, params: Record<string, unknown> = {}) =>
+    executeAgentTool(id, makeParams({ session_key: "exec-1", ...params }), undefined, undefined, ctx);
+
+  it("honours a key on a persistent agent", async () => {
+    mockAgentConfigState.config = { sessionLifecycle: "persistent" };
+    await call("tc-lc-persistent");
+    expect(spawnOptions().sessionKey).toBe("exec-1");
+  });
+
+  it("honours a key on an agent using the legacy persistent_session boolean", async () => {
+    mockAgentConfigState.config = { persistentSession: true };
+    await call("tc-lc-legacy");
+    expect(spawnOptions().sessionKey).toBe("exec-1");
+  });
+
+  it("drops a key on a stateless agent with an actionable note, not an error", async () => {
+    // The caller cannot see agent frontmatter. Throwing here loses the work and
+    // an orchestrator whose routing config names a key resends the same call.
+    mockAgentConfigState.config = { sessionLifecycle: "stateless" };
+    const result = await call("tc-lc-stateless");
+
+    expect(result.isError).toBeUndefined();
+    expect(spawnOptions().sessionKey).toBeUndefined();
+    expect(spawnOptions().sessionKeyCwd).toBeUndefined();
+    expect(spawnOptions().sessionKeyAgentType).toBeUndefined();
+    expect(result.content[0].text).toContain("session_key 'exec-1' ignored");
+    expect(result.content[0].text).toContain("session_lifecycle: persistent");
+    // The work still ran.
+    expect(result.content[0].text).toContain("done");
+  });
+
+  it("treats an agent with no lifecycle metadata as stateless", async () => {
+    mockAgentConfigState.config = { maxTurns: 25 };
+    const result = await call("tc-lc-default");
+    expect(spawnOptions().sessionKey).toBeUndefined();
+    expect(result.content[0].text).toContain("is stateless");
+  });
+
+  it("treats a missing agent config as stateless", async () => {
+    mockAgentConfigState.config = undefined as unknown as Record<string, unknown>;
+    await call("tc-lc-noconfig");
+    expect(spawnOptions().sessionKey).toBeUndefined();
+  });
+
+  it("lets sessionLifecycle override the legacy boolean", async () => {
+    mockAgentConfigState.config = { sessionLifecycle: "stateless", persistentSession: true };
+    await call("tc-lc-override");
+    expect(spawnOptions().sessionKey).toBeUndefined();
+  });
+
+  it("adds no note at all when the caller sent no key", async () => {
+    mockAgentConfigState.config = { sessionLifecycle: "stateless" };
+    const result = await executeAgentTool("tc-lc-nokey", makeParams(), undefined, undefined, ctx);
+    expect(result.content[0].text).not.toContain("ignored");
   });
 });

@@ -58,14 +58,29 @@ export function errorMessage(err: unknown): string {
   return toSingleLine(err instanceof Error ? err.message : String(err));
 }
 
+/**
+ * Split a pi CLI-style ":thinking" suffix off a model string.
+ * "provider/model:high" -> { model: "provider/model", thinking: "high" }.
+ * A trailing colon, a leading colon, or an unknown level leaves the string intact.
+ */
+export function splitModelThinkingSuffix(modelStr: string): { model: string; thinking?: ThinkingLevel } {
+  const colonIdx = modelStr.lastIndexOf(":");
+  if (colonIdx <= 0 || colonIdx === modelStr.length - 1) return { model: modelStr };
+  const maybeThinking = parseThinkingLevel(modelStr.slice(colonIdx + 1));
+  if (!maybeThinking) return { model: modelStr };
+  return { model: modelStr.slice(0, colonIdx), thinking: maybeThinking };
+}
+
 /** Parse "provider/model-id" into { provider, modelId }; null if invalid (no slash or empty provider). */
 export function parseModelKey(value: unknown): { provider: string; modelId: string } | null {
   // Backstop: config values flow from JSON, so a mistyped value can reach
   // here at runtime. Never throw on non-strings; report unparseable instead.
   if (typeof value !== "string") return null;
-  const slashIdx = value.indexOf("/");
+  // A pi CLI-style thinking suffix is not part of the model id.
+  const normalized = splitModelThinkingSuffix(value).model;
+  const slashIdx = normalized.indexOf("/");
   if (slashIdx <= 0) return null;
-  return { provider: value.slice(0, slashIdx), modelId: value.slice(slashIdx + 1) };
+  return { provider: normalized.slice(0, slashIdx), modelId: normalized.slice(slashIdx + 1) };
 }
 
 /** Find a model by "provider/model-id"; fallback if unparseable or not in registry. */

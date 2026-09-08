@@ -160,6 +160,27 @@ export function validateRawLayer(raw: unknown, filePath: string): RawConfig {
     if (Object.keys(concurrency).length > 0) cleaned.concurrency = concurrency;
   }
 
+  // Don fork routing sections. Entry-level shapes are normalized later in
+  // model-precedence (normalizeEntry tolerates any hand-edited value), so the
+  // check here only rejects a section that is not a JSON object.
+  for (const section of ["providerAgents", "modelAgents", "modelAliases"] as const) {
+    const value = raw[section];
+    if (value === undefined) continue;
+    if (!isPlainObject(value)) {
+      warnIncompatible(filePath, section, value, EXPECTED_OBJECT);
+      continue;
+    }
+    cleaned[section] = value as never;
+  }
+
+  if (raw.providerPreference !== undefined) {
+    if (Array.isArray(raw.providerPreference) && raw.providerPreference.every((p) => typeof p === "string")) {
+      cleaned.providerPreference = raw.providerPreference as string[];
+    } else {
+      warnIncompatible(filePath, "providerPreference", raw.providerPreference, "array of strings");
+    }
+  }
+
   return cleaned;
 }
 

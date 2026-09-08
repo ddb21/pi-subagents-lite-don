@@ -16,8 +16,8 @@
  * at session_start. `dispose()` drops deps at session_shutdown.
  */
 
-import type { SubagentsConfig, SessionModelOverrides } from "../models/model-precedence.js";
-import { resolveModel } from "../models/model-precedence.js";
+import type { SubagentsConfig, SessionModelOverrides, ResolvedSpawn } from "../models/model-precedence.js";
+import { resolveModel, resolveSpawn } from "../models/model-precedence.js";
 import type { AgentWidget } from "../ui/agent-widget.js";
 import type { AgentManager } from "../agents/agent-manager.js";
 import { CONFIG_AGENT_NON_MODEL_KEYS, type ModelThinkingPlacement } from "./types.js";
@@ -328,6 +328,37 @@ export class ConfigStore {
       parentModelId,
       sessionOverrides: this.sessionOverrides,
     });
+  }
+
+  /**
+   * Don fork: resolve the model AND the settings that travel with it, including
+   * the per-call `model` param. Thinking is set only when a routing-map entry
+   * supplied the model.
+   */
+  spawnFor(
+    type: string,
+    parentModelId: string,
+    agentConfig?: { model?: string },
+    explicitModel?: string,
+  ): ResolvedSpawn {
+    return resolveSpawn({
+      subagentType: type,
+      agentConfig,
+      config: this.config,
+      parentModelId,
+      sessionOverrides: this.sessionOverrides,
+      explicitModel,
+    });
+  }
+
+  /** Don fork: user model aliases (normalized keys) consumed by resolveModelSpec. */
+  get modelAliases(): Record<string, string> | undefined {
+    return this.config.modelAliases;
+  }
+
+  /** Don fork: provider order used to break a bare model-id tie. */
+  get providerPreference(): string[] | undefined {
+    return this.config.providerPreference;
   }
 
   // ── Mutations ──────────────────────────────────────────────────

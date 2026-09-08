@@ -99,6 +99,14 @@ export interface RawConcurrency {
 export interface RawConfig {
   agent?: Record<string, unknown>;
   concurrency?: RawConcurrency;
+  /** Don fork: provider-follow routing map (parent provider -> per-type entries). */
+  providerAgents?: SubagentsConfig["providerAgents"];
+  /** Don fork: exact-parent model routing map (parent model key -> per-type entries). */
+  modelAgents?: SubagentsConfig["modelAgents"];
+  /** Don fork: user model aliases consumed by resolveModelSpec. */
+  modelAliases?: SubagentsConfig["modelAliases"];
+  /** Don fork: provider order used to break a bare model-id tie. */
+  providerPreference?: SubagentsConfig["providerPreference"];
 }
 
 /** Result of a load: the two raw layers plus the project layer's status. */
@@ -200,7 +208,21 @@ export function mergeLayers(global: RawConfig, project: RawConfig | null): RawCo
       if (isProjectAllowedAgentKey(key)) agent[key] = value;
     }
   }
-  return { agent, concurrency: mergeRawConcurrency(global.concurrency, project?.concurrency) };
+  const merged: RawConfig = {
+    agent,
+    concurrency: mergeRawConcurrency(global.concurrency, project?.concurrency),
+  };
+  // Don fork routing sections: a project layer replaces the global section it
+  // names, and inherits every section it does not name.
+  const providerAgents = project?.providerAgents ?? global.providerAgents;
+  const modelAgents = project?.modelAgents ?? global.modelAgents;
+  const modelAliases = project?.modelAliases ?? global.modelAliases;
+  const providerPreference = project?.providerPreference ?? global.providerPreference;
+  if (providerAgents) merged.providerAgents = providerAgents;
+  if (modelAgents) merged.modelAgents = modelAgents;
+  if (modelAliases) merged.modelAliases = modelAliases;
+  if (providerPreference) merged.providerPreference = providerPreference;
+  return merged;
 }
 
 /**
@@ -238,7 +260,25 @@ export function mergeDefaults(raw: RawConfig): SubagentsConfig {
   return {
     agent,
     concurrency,
+    // Don fork routing sections have no baked defaults: absent means "no map".
+    ...(raw.providerAgents ? { providerAgents: raw.providerAgents } : {}),
+    ...(raw.modelAgents ? { modelAgents: raw.modelAgents } : {}),
+    ...(raw.modelAliases ? { modelAliases: normalizeAliasKeys(raw.modelAliases) } : {}),
+    ...(raw.providerPreference ? { providerPreference: raw.providerPreference } : {}),
   };
+}
+
+/**
+ * Don fork: alias lookup is case- and separator-insensitive, so keys are
+ * normalized once at load instead of on every resolution.
+ */
+function normalizeAliasKeys(aliases: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(aliases)) {
+    if (typeof value !== "string" || !value) continue;
+    out[key.toLowerCase().replace(/[\s._\-/:]+/g, "")] = value;
+  }
+  return out;
 }
 
 // ── Load ─────────────────────────────────────────────────────────────

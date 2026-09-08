@@ -82,6 +82,9 @@ vi.mock("../../src/shell.js", () => ({
       };
     },
     modelFor: vi.fn(() => undefined),
+    spawnFor: vi.fn(() => ({ model: undefined })),
+    modelAliases: undefined,
+    providerPreference: undefined,
   }),
   getPiInstance: () => ({ sendMessage: vi.fn(), exec: vi.fn() }),
   getSessionCtx: () => ({ cwd: "/home/test/project" }),

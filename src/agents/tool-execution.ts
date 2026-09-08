@@ -16,7 +16,9 @@ import { getSessionContextPercent } from "./usage.js";
 import { validateWorktreePath } from "../spawn/worktree-validator.js";
 import { resolveSubagentTrust, createSubagentTrustDeps, untrustedProjectWarning } from "../spawn/project-trust.js";
 
-import { parseModelKey, findModelInRegistry, parseThinkingLevel } from "../utils.js";
+import { parseModelKey, findModelInRegistry, parseThinkingLevel, splitModelThinkingSuffix } from "../utils.js";
+import { resolveModelSpec } from "../models/model-spec.js";
+import type { ThinkingLevel } from "../types.js";
 import { getPiInstance, getSessionCtx, getStore, getCoordinator, getManager } from "../shell.js";
 
 // --- Tool result helpers ---
@@ -140,6 +142,89 @@ async function resolveWorktree(
   }
 }
 
+/**
+ * Don fork: resolve the model for a spawn through the full precedence chain,
+ * then through tolerant spec resolution (aliases, bare ids, "terra high",
+ * "default" = inherit).
+ *
+ * A caller-typed spec that does not resolve is a hard error, not a silent
+ * fallback to the parent model: a typo in a modelAgents/providerAgents entry or
+ * a per-call override would otherwise run the wrong model. A stale config or
+ * frontmatter pin must not block the spawn, but it must not be silent either,
+ * so it degrades to the parent model with a note.
+ */
+function resolveSpawnModel(
+  ctx: ExtensionContext,
+  resolvedType: string,
+  callerModelStr: string | undefined,
+): {
+  model: ReturnType<typeof findModelInRegistry>;
+  modelKey: string | undefined;
+  specThinking: ThinkingLevel | undefined;
+  modelWarnings: string[];
+  modelError?: string;
+} {
+  const warnings: string[] = [];
+  const agentConfig = getAgentConfig(resolvedType);
+  let specThinking: ThinkingLevel | undefined;
+
+  let modelSpec = callerModelStr;
+  if (!modelSpec) {
+    const parentModelId = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+    const configured = getStore().spawnFor(resolvedType, parentModelId, agentConfig, undefined);
+    if (configured.model && configured.model !== parentModelId) {
+      modelSpec = configured.model;
+      specThinking = configured.thinking;
+    }
+  }
+
+  let resolvedModelStr = modelSpec;
+  if (modelSpec) {
+    const resolution = resolveModelSpec(modelSpec, ctx.modelRegistry, {
+      aliases: getStore().modelAliases,
+      providerPreference: getStore().providerPreference,
+      parentProvider: ctx.model?.provider,
+    });
+    if (resolution.kind === "error") {
+      if (callerModelStr) return { model: undefined, modelKey: undefined, specThinking, modelWarnings: warnings, modelError: resolution.message };
+      warnings.push(
+        `agent '${resolvedType}' pins model '${modelSpec}', which did not resolve; using the parent model. ${resolution.message}`,
+      );
+      specThinking = undefined;
+      resolvedModelStr = undefined;
+    } else {
+      specThinking = resolution.thinking ?? specThinking;
+      resolvedModelStr = resolution.kind === "resolved" ? resolution.key : undefined;
+      // Only surface a note for a spelling the caller actually typed; a
+      // frontmatter or config pin resolving is not news for the caller.
+      if (resolution.note && callerModelStr) warnings.push(resolution.note);
+    }
+  }
+
+  const model = findModelInRegistry(resolvedModelStr, ctx.modelRegistry, resolvedModelStr ? undefined : ctx.model);
+  if (resolvedModelStr && !model) {
+    return {
+      model: undefined,
+      modelKey: undefined,
+      specThinking,
+      modelWarnings: warnings,
+      modelError: `Model not found in registry: ${resolvedModelStr}.`,
+    };
+  }
+  return {
+    model,
+    modelKey: model ? `${model.provider}/${model.id}` : undefined,
+    specThinking,
+    modelWarnings: warnings,
+  };
+}
+
+/** Prefix a tool result text with any spawn-time normalization notes. */
+function withNotes(text: string, warnings: string[]): string {
+  if (warnings.length === 0) return text;
+  return `${warnings.map((warning) => `[note: ${warning}]`).join("\n")}\n\n${text}`;
+}
+
 export async function executeAgentTool(
   _toolCallId: string,
   params: Record<string, unknown>,
@@ -147,6 +232,8 @@ export async function executeAgentTool(
   _onUpdate: ((update: any) => void) | undefined,
   ctx: ExtensionContext,
 ): Promise<any> {
+  /** Don fork: spawn-time notes surfaced to the caller alongside the result. */
+  const normalizationWarnings: string[] = [];
   // Validate worktree_path early — needed for on-demand agent discovery
   const rawWorktreePath = params.worktree_path as string | undefined;
   const resolved = await resolveWorktree(ctx, rawWorktreePath);
@@ -181,15 +268,28 @@ export async function executeAgentTool(
     getStore().agent.defaultMaxTurns;
 
   const modelStr = params.model as string | undefined;
-  const model = findModelInRegistry(modelStr, ctx.modelRegistry, ctx.model);
-  const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+  // Don fork: resolve the full precedence chain here rather than trusting the
+  // tool_call listener. The listener does not fire in one-shot (`pi -p`) runs,
+  // which is exactly how two-context delegations spawn children, so a pinned
+  // heavy agent (lmd-science, analyst) silently inherited the orchestrator's
+  // cheap model. execute() is the authoritative resolver; the listener only
+  // canonicalizes what the caller typed for display.
+  const { model, modelKey, specThinking, modelWarnings, modelError } = resolveSpawnModel(
+    ctx,
+    resolvedType,
+    modelStr,
+  );
+  if (modelError) throw new Error(modelError);
+  normalizationWarnings.push(...modelWarnings);
 
   // Determine modelName for invocation (always capture for display)
   const modelName = model?.id;
 
-  // Resolve thinking: explicit param > agent config (frontmatter) > spawn options default > undefined (inherit)
+  // Resolve thinking: explicit param > settings that traveled with the resolved
+  // model > agent config (frontmatter) > spawn options default > inherit
   const thinkingLevel =
     parseThinkingLevel(params.thinking as string | undefined) ??
+    specThinking ??
     getAgentConfig(resolvedType)?.thinkingLevel ??
     getStore().agent.defaultThinking;
 
@@ -228,7 +328,7 @@ export async function executeAgentTool(
     const details = buildAgentDetails(record);
     details.agentId = agentId;
     details.status = record.lifecycle.status;
-    return successResult(`[${label}] ${suffix}`, details);
+    return successResult(withNotes(`[${label}] ${suffix}`, normalizationWarnings), details);
   }
 
   // Foreground: record.execution.promise is already awaited by coordinator.spawn()
@@ -238,7 +338,7 @@ export async function executeAgentTool(
     throw new Error(`Agent failed: ${record.error || "unknown error"}`);
   }
 
-  return successResult(formatResultContent(record), details);
+  return successResult(withNotes(formatResultContent(record), normalizationWarnings), details);
 }
 
 // --- Running agents list helper (used by executeStopAgentTool) ---
@@ -297,24 +397,60 @@ export async function toolCallListener(event: ToolCallEvent, ctx: ExtensionConte
   if (event.toolName !== "Agent") return;
 
   const input = event.input;
-  const subagentType = input.agent as string | undefined;
-  const agentConfig = subagentType ? getAgentConfig(subagentType) : undefined;
+  // Don fork: resolve the caller's spelling to the canonical type before any
+  // keyed lookup. Session, config, modelAgents, and providerAgents keys are
+  // canonical, so "Executor" or a display name would silently miss its
+  // per-type entries otherwise.
+  const requestedType = typeof input.agent === "string" && input.agent ? input.agent : "general-purpose";
+  const typeResolution = resolveType(requestedType);
+  const subagentType = typeResolution.kind === "resolved" ? typeResolution.key : requestedType;
+  const agentConfig = getAgentConfig(subagentType);
 
   const parentModelId = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 
-  const effectiveModel = getStore().modelFor(subagentType ?? "general-purpose", parentModelId, agentConfig);
+  // Don fork: feed the per-call model param into resolution instead of
+  // clobbering it — it wins over the routing maps and frontmatter (targeted
+  // overrides like a Luna trial) while still losing to session/config pins.
+  const explicitModel = typeof input.model === "string" && input.model ? input.model : undefined;
+  const spawn = getStore().spawnFor(subagentType, parentModelId, agentConfig, explicitModel);
 
-  if (effectiveModel) {
-    input.model = effectiveModel;
+  const modelWithSuffix = spawn.model ? splitModelThinkingSuffix(spawn.model) : undefined;
+  // Don fork: canonicalize the resolved spelling before execute() validates it.
+  // A tolerated spelling (alias, bare id, "terra high") becomes the registry
+  // key here; "default" clears the override so the parent model is inherited;
+  // an unresolvable spelling is left untouched so execute() reports the
+  // actionable error exactly once.
+  const specResolution = modelWithSuffix?.model
+    ? resolveModelSpec(modelWithSuffix.model, ctx.modelRegistry, {
+        aliases: getStore().modelAliases,
+        providerPreference: getStore().providerPreference,
+        parentProvider: ctx.model?.provider,
+      })
+    : undefined;
+  if (specResolution?.kind === "resolved") {
+    input.model = specResolution.key;
+    input._modelOverride = specResolution.id;
+  } else if (specResolution?.kind === "inherit") {
+    delete input.model;
+    delete input._modelOverride;
+  } else if (modelWithSuffix?.model) {
+    input.model = modelWithSuffix.model;
     // Always inject _modelOverride for renderCall
-    const parsed = parseModelKey(effectiveModel);
+    const parsed = parseModelKey(modelWithSuffix.model);
     if (parsed) {
       input._modelOverride = parsed.modelId;
     }
   }
 
-  // Inject thinking if not explicitly passed: agent frontmatter > spawn options default
+  // Inject thinking if not explicitly passed: settings that traveled with the
+  // resolved model (routing-map entry), a pi CLI-style model suffix, the
+  // resolved spec's own suffix, then agent frontmatter, then the spawn default.
   if (input.thinking === undefined) {
-    input.thinking = agentConfig?.thinkingLevel ?? getStore().agent.defaultThinking;
+    input.thinking =
+      spawn.thinking ??
+      modelWithSuffix?.thinking ??
+      (specResolution?.kind !== "error" ? specResolution?.thinking : undefined) ??
+      agentConfig?.thinkingLevel ??
+      getStore().agent.defaultThinking;
   }
 }

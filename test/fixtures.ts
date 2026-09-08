@@ -37,6 +37,35 @@ import type { AgentWidget } from "../src/ui/agent-widget.js";
 export interface MockShellStore {
   agent: Partial<SubagentsConfig["agent"]>;
   modelFor?: (type: string, parentModelId: string, agentConfig?: { model?: string }) => string;
+  /**
+   * Don fork: model plus the settings that travel with it. Doubles may omit it;
+   * createShellMock derives it from modelFor so every double stays in sync.
+   */
+  spawnFor?: (
+    type: string,
+    parentModelId: string,
+    agentConfig?: { model?: string },
+    explicitModel?: string,
+  ) => { model: string; thinking?: string };
+  modelAliases?: Record<string, string>;
+  providerPreference?: string[];
+}
+
+/**
+ * Don fork: give a store double a spawnFor when it only declares modelFor.
+ * The store gained the method; the doubles must not have to restate it.
+ */
+export function withSpawnFor(store: MockShellStore): MockShellStore {
+  if (store.spawnFor) return store;
+  return Object.create(store, {
+    spawnFor: {
+      enumerable: true,
+      value: (type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string) => {
+        if (explicitModel) return { model: explicitModel };
+        return { model: store.modelFor?.(type, parentModelId, agentConfig) ?? parentModelId };
+      },
+    },
+  }) as MockShellStore;
 }
 
 export interface ShellMockFns {
@@ -105,7 +134,7 @@ export function shellMock(fns: ShellMockFns = {}) {
     getManager: () => state.manager,
     getPiInstance: () => state.pi,
     getSessionCtx: () => state.sessionCtx,
-    getStore: () => state.store,
+    getStore: () => withSpawnFor(state.store),
     getCoordinator: () => state.coordinator,
     getWidget: () => state.widget,
     setPiInstance: (pi: Partial<ExtensionAPI>) => {

@@ -238,7 +238,7 @@ vi.mock("../src/shell.js", async () => {
   // Derive the getter defaults from src's real config constants (via the mocked
   // config-io module above) so menu tests pin src's defaults, not a hand copy.
   const { DEFAULT_AGENT, DEFAULT_CONCURRENCY } = await import("../src/config/config-io.js");
-  const { resolveModel } = await import("../src/models/model-precedence.js");
+  const { resolveModel, resolveSpawn } = await import("../src/models/model-precedence.js");
   const {
     agentLayerHasModelSettings,
     sessionOverridesHasModelSettings,
@@ -366,6 +366,21 @@ vi.mock("../src/shell.js", async () => {
         sessionOverrides: mockModules.mockSessionOverrides,
       });
     },
+    spawnFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string) {
+      // Delegate to the real chain so the mock cannot drift from resolveSpawn.
+      return resolveSpawn({
+        subagentType: type,
+        agentConfig,
+        config: {
+          agent: { ...DEFAULT_AGENT, ...mockModules.mockConfig.agent, ...mockModules.mockProjectConfig.agent },
+        },
+        parentModelId,
+        sessionOverrides: mockModules.mockSessionOverrides,
+        explicitModel,
+      });
+    },
+    modelAliases: undefined,
+    providerPreference: undefined,
     mutate: {
       agent: {
         setDefaultModel(value: string | null, target: string = "global") {

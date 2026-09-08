@@ -83,6 +83,12 @@ vi.mock("../../src/shell.js", () => ({
       if (agentConfig?.model) return agentConfig.model;
       return parentModelId;
     },
+    spawnFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string) {
+      if (explicitModel) return { model: explicitModel };
+      return { model: agentConfig?.model ?? parentModelId };
+    },
+    modelAliases: undefined,
+    providerPreference: undefined,
   }),
   getPiInstance: () => ({ sendMessage: vi.fn(), exec: vi.fn() }),
   getSessionCtx: () => ({ cwd: "/home/test/project" }),

@@ -7,6 +7,7 @@
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { Theme } from "./types.js";
 import { buildStatsParts, formatMs, getDisplayName } from "./format.js";
+import { agentLogHint } from "./log-link.js";
 
 // ============================================================================
 // Stats rendering helpers
@@ -115,8 +116,9 @@ export function renderSubagentResult(
     const namePart = agentNameLabel(d, theme);
     const statsLine = buildStatsLine(d, theme, showCost);
     let headerLine = `${icon} ${namePart}·${statsLine}\n  ${theme.fg("text", (d.description as string) || "")}`;
-    if (d.outputFile as string) {
-      headerLine += `\n  ${theme.fg("dim", `tail -f ${d.outputFile}`)}`;
+    const logHint = agentLogHint(d.outputFile as string | undefined);
+    if (logHint) {
+      headerLine += `\n  ${theme.fg("dim", logHint)}`;
     }
     if (d.worktreePath as string) {
       headerLine += `\n  ${theme.fg("dim", `worktree: ${d.worktreePath}`)}`;
@@ -154,8 +156,9 @@ function buildFallbackResultLine(
   }
   const desc = (d?.description as string) || "";
   if (desc) line += `\n  ${theme.fg("text", desc)}`;
-  if (d?.outputFile) {
-    line += `\n  ${theme.fg("dim", `tail -f ${d.outputFile}`)}`;
+  const logHint = agentLogHint(d?.outputFile as string | undefined);
+  if (logHint) {
+    line += `\n  ${theme.fg("dim", logHint)}`;
   }
   if (d?.worktreePath) {
     line += `\n  ${theme.fg("dim", `worktree: ${d.worktreePath}`)}`;

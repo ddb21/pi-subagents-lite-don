@@ -13,6 +13,7 @@ import {
 } from "../agents/usage.js";
 import { formatMs, buildStatsParts, getDisplayName, truncateDesc, type StatsVisibility } from "./format.js";
 import type { LiveView } from "../spawn/spawn-coordinator.js";
+import { agentLogHint } from "./log-link.js";
 
 // Re-export Theme so existing consumers (searchable-select, result-viewer) don't break
 export type { Theme } from "./types.js";
@@ -139,7 +140,8 @@ function describeActivity(activeTools: Map<string, string>, responseText?: strin
 function buildWorktreeOutputParts(a: AgentRecord): string[] {
   const parts: string[] = [];
   if (a.display.worktreeLabel) parts.push(`@${a.display.worktreeLabel}`);
-  if (a.display.outputFile) parts.push(`tail -f ${a.display.outputFile}`);
+  const hint = agentLogHint(a.display.outputFile);
+  if (hint) parts.push(hint);
   return parts;
 }
 

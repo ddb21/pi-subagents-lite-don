@@ -8,13 +8,13 @@
  *   hint line below the items itself; SelectList renders inline descriptions)
  * - Bottom separator line
  *
- * The Back button has been removed. Menus still close via Escape, the
- * back-arrow key, and Ctrl-C — the underlying list components call their
- * `onCancel` on those keys, and the wrapper wires that to `closeMenu` for
- * SelectList (SettingsList receives its own `onCancel` at construction).
+ * The Back button was removed; menus close via Escape, back-arrow, and Ctrl-C.
+ * The list components call `onCancel` on those keys, which the wrapper wires
+ * to `closeMenu` for SelectList (SettingsList gets its own at construction).
  */
 
 import { type Component, isFocusable } from "@earendil-works/pi-tui";
+import { installSeparatorSkip } from "../helpers.js";
 
 export interface SettingsListWrapperTheme {
   bold: (text: string) => string;
@@ -31,6 +31,19 @@ export interface SettingsListWrapperOptions {
   /** Called with a rebuild(newItems) function so the caller can trigger in-place updates. */
   onRebuild?: (rebuild: (items: any[]) => void) => void;
 }
+
+/**
+ * Horizontal arrow encodings (with and without the CSI "O" prefix) mapped to
+ * the key they act as on the main list: → enters the selected item, ←
+ * escapes. On a submenu they pass through unchanged (Input needs them for
+ * cursor movement).
+ */
+const HORIZONTAL_ARROWS = new Map<string, string>([
+  ["\x1b[C", "\r"],
+  ["\x1bOC", "\r"],
+  ["\x1b[D", "\x1b"],
+  ["\x1bOD", "\x1b"],
+]);
 
 export class SettingsListWrapper implements Component {
   private settingsList: Component;
@@ -56,40 +69,10 @@ export class SettingsListWrapper implements Component {
       list.onCancel = () => closeMenu();
     }
 
-    // Auto-skip __sep__ items when navigating, so the cursor never lands on a
-    // separator section header. Menus push their own __sep__ items.
-    if (options.onCancel && Array.isArray(list.items)) {
-      const _rawIndex = Symbol("rawIndex");
-      const isSep = (item: any) => item?.value === "__sep__" || item?.id === "__sep__";
-      // Starting just past `start`, walk in `step` direction and return the
-      // first non-separator index (or an out-of-bounds sentinel if none).
-      const firstNonSepFrom = (start: number, step: number): number => {
-        let next = start + step;
-        while (next >= 0 && next < list.items.length && isSep(list.items[next])) next += step;
-        return next;
-      };
-      const inBounds = (i: number) => i >= 0 && i < list.items.length;
-      Object.defineProperty(list, "selectedIndex", {
-        get() { return list[_rawIndex] ?? 0; },
-        set(idx) {
-          const items = list.items;
-          const cur = list[_rawIndex] ?? 0;
-          const clamped = Math.max(0, Math.min(idx, items.length - 1));
-          if (!isSep(items[clamped])) {
-            list[_rawIndex] = clamped;
-            return;
-          }
-          // Landed on a separator: search in the travel direction first,
-          // fall back to the opposite direction so the cursor always ends on
-          // a real item (or stays put if everything is a separator).
-          const step = idx > cur ? 1 : -1;
-          const fwd = firstNonSepFrom(clamped, step);
-          const back = firstNonSepFrom(clamped, -step);
-          list[_rawIndex] = inBounds(fwd) ? fwd : inBounds(back) ? back : clamped;
-        },
-        configurable: true,
-      });
-      list[_rawIndex] = list.selectedIndex ?? 0;
+    // Auto-skip separator items when navigating, so the cursor never lands on a
+    // section header. Menus push their own SEPARATOR_ID items.
+    if (options.onCancel) {
+      installSeparatorSkip(list);
     }
 
     // Expose rebuild callback. Items are set directly without appending any
@@ -110,9 +93,30 @@ export class SettingsListWrapper implements Component {
     this.settingsList.invalidate?.();
   }
 
+  private get submenuComponent(): Component | null {
+    return ((this.settingsList as any)?.submenuComponent ?? null) as Component | null;
+  }
+
   private get hasSubmenu(): boolean {
-    const submenu = (this.settingsList as any)?.submenuComponent ?? null;
-    return isFocusable(submenu);
+    return isFocusable(this.submenuComponent);
+  }
+
+  /**
+   * True when the active submenu's leaf accepts text input, so j/k must stay
+   * letters (SearchableSelectDialog filter, Input fields). Walks delegator
+   * wrappers (getActive) to the leaf — nested delegators (mode picker →
+   * nested level picker) are two hops; the walk is unbounded by construction.
+   * Duck-typed on the text API: getValue (Input) or searchInput
+   * (SearchableSelectDialog).
+   */
+  private isTextInputSubmenu(): boolean {
+    let leaf = this.submenuComponent;
+    while (leaf && typeof (leaf as any).getActive === "function") {
+      leaf = ((leaf as any).getActive() as Component | null) ?? null;
+    }
+    if (!leaf) return false;
+    const anyLeaf = leaf as any;
+    return typeof anyLeaf.getValue === "function" || anyLeaf.searchInput != null;
   }
 
   handleInput(data: string): void {
@@ -120,25 +124,23 @@ export class SettingsListWrapper implements Component {
       this.settingsList.handleInput?.(data);
       return;
     }
+    // j/k move the main list and list-type submenus; they stay letters only
+    // when the active submenu accepts text (searchable picker filter,
+    // numeric/text fields).
     if (data === "k" || data === "j") {
-      if (this.hasSubmenu) {
-        // Submenu: pass through as normal letters
-        this.settingsList.handleInput?.(data);
-      } else {
-        // Main list: convert to arrow keys
-        this.settingsList.handleInput?.(data === "k" ? "\x1b[A" : "\x1b[B");
-      }
-    } else if (data === "\x1b[C" || data === "\x1bOC" || data === "\x1b[D" || data === "\x1bOD") {
-      if (this.hasSubmenu) {
-        // Submenu: pass arrow keys through (Input needs them for cursor)
-        this.settingsList.handleInput?.(data);
-      } else {
-        // Main list: → enters, ← escapes
-        this.settingsList.handleInput?.(data.includes("C") ? "\r" : "\x1b");
-      }
-    } else {
-      this.settingsList.handleInput?.(data);
+      const arrow = data === "k" ? "\x1b[A" : "\x1b[B";
+      const isTextInput = this.hasSubmenu && this.isTextInputSubmenu();
+      this.settingsList.handleInput?.(isTextInput ? data : arrow);
+      return;
     }
+    // Main list: → enters, ← escapes. Submenu: pass arrow keys through
+    // (Input needs them for cursor movement).
+    const mainListKey = HORIZONTAL_ARROWS.get(data);
+    if (mainListKey !== undefined && !this.hasSubmenu) {
+      this.settingsList.handleInput?.(mainListKey);
+      return;
+    }
+    this.settingsList.handleInput?.(data);
   }
 
   render(width: number): string[] {
@@ -148,7 +150,6 @@ export class SettingsListWrapper implements Component {
     lines.push(this.separatorChar.repeat(width));
     lines.push("");
 
-    // Header (left-aligned with spacing, bold and colored)
     const styledTitle = this.theme.bold(this.theme.fg("accent", this.title));
     lines.push("  " + styledTitle);
     lines.push("");

@@ -12,14 +12,8 @@ import { validateNumeric } from "../helpers.js";
 
 /**
  * Returns a `(initialValue, done) => submenu` function wired to
- * `ctx.ui.notify` for errors.
- *
- * If `required` is true, empty input errors.
- * If `required` is false (default), empty input calls `done()` to clear.
- *
- * Usage:
- *   createNumericSubmenu(ctx, onValid)
- *   createNumericSubmenu(ctx, { min, required? }, onValid, onEmpty?)
+ * `ctx.ui.notify` for errors. When `required`, empty input errors;
+ * otherwise empty input calls `done()` to clear.
  */
 export function createNumericSubmenu(
   ctx: ExtensionCommandContext,
@@ -27,9 +21,8 @@ export function createNumericSubmenu(
   onValid?: (parsed: number) => void,
   onEmpty?: () => void,
 ): (initialValue: string, done: (selectedValue?: string) => void) => Component {
-  const opts = typeof optionsOrCallback === "function"
-    ? { onValid: optionsOrCallback }
-    : { onValid, ...optionsOrCallback };
+  const opts =
+    typeof optionsOrCallback === "function" ? { onValid: optionsOrCallback } : { onValid, ...optionsOrCallback };
   const min = opts.min ?? 1;
   const required = opts.required ?? false;
   const fmtLabel = (n: number) => (n === 0 ? "\u2265 0" : `\u2265 ${n}`);
@@ -68,10 +61,8 @@ export function createNumericSubmenu(
 }
 
 /**
- * Returns a `(initialValue, done) => Input` function for plain text submenus.
- *
- * If `required` is true, empty input shows an error and does not call `done`.
- * If `required` is false (default), empty input calls `done()` to clear.
+ * `(initialValue, done) => Input` for plain-text submenus. When `required`,
+ * empty input errors; otherwise empty input calls `done()` to clear.
  */
 export function createInputSubmenu(
   ctx: ExtensionCommandContext,

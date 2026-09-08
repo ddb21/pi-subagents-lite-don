@@ -1,5 +1,47 @@
-# This package is loaded by pi directly from src/ (TS). No build output.
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+*.tsbuildinfo
+coverage/
+
+# Logs
 *.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
 .DS_Store
+Thumbs.db
+*.pem
+
+# Playwright CLI artifacts
+.playwright-cli/
+
+# Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Tasks (keep only lessons.md)
+tasks/*
+!tasks/lessons.md
+
+# Review and result files
+arch-review-*.md
+refactor-*.md
+result-*.md
+review-*.md
+
+tags

@@ -1,0 +1,689 @@
+/**
+ * menu-mock-setup.ts — Shared mock setup for menu tests.
+ *
+ * This file MUST be imported as the FIRST import in each menu test file.
+ * It sets up vi.mock() calls for all menu dependencies.
+ *
+ * The mutable mock state is created through vi.hoisted() so the vi.mock()
+ * factories below can reference it regardless of hoist order. Tests mutate
+ * the shared mockModules object; a single resetConfig() restores every
+ * field to its default in afterEach hooks, so a failing test can never leak
+ * stale state into later tests.
+ */
+
+import { vi } from "vitest";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentManager } from "../src/agents/agent-manager.js";
+import type { SystemPromptMode } from "../src/agents/types.js";
+import type { ConfigStore, RawConcurrency } from "../src/config/config-store.js";
+import type { SessionModelOverrides, SubagentsConfig } from "../src/models/model-precedence.js";
+import type { SpawnIntent } from "../src/spawn/spawn-coordinator.js";
+import type { SelectOption } from "../src/ui/searchable-select.js";
+import type { Theme } from "../src/ui/types.js";
+import type { ThinkingLevel } from "../src/types.js";
+
+// Create the mutable mock state via vi.hoisted so the vi.mock factories
+// (which vitest hoists above the rest of the module) can reference it.
+const hoisted = vi.hoisted(() => {
+  const mockConfig: { agent: Partial<SubagentsConfig["agent"]>; concurrency: RawConcurrency } = {
+    agent: { default: null, forceBackground: false, outputTranscript: false },
+    concurrency: { default: 4 },
+  };
+
+  const mockProjectConfig: { agent: Partial<SubagentsConfig["agent"]>; concurrency: RawConcurrency } = {
+    // {} = project layer carries no agent settings (hasProjectModelSettings must stay false).
+    agent: {},
+    concurrency: {},
+  };
+
+  const mockSessionOverrides: SessionModelOverrides = { default: null };
+  const mockSessionConcurrency: RawConcurrency = {};
+  const mockProjectTargetOffered = false;
+  const mockStoreOverride = null as ConfigStore | null;
+  const mockSessionShowCost = undefined as boolean | undefined;
+
+  const mockManager = {
+    setConcurrency: vi.fn(),
+    listAgents: vi.fn<AgentManager["listAgents"]>(() => []),
+    getRecord: vi.fn(),
+    abort: vi.fn(),
+    steer: vi.fn(),
+    spawn: vi.fn<AgentManager["spawn"]>(() => "agent-id-123"),
+    clear: vi.fn(),
+  };
+
+  const parentModel: { provider: string; id: string } | undefined = {
+    provider: "test",
+    id: "parent-model",
+  };
+  /** The model subset the fake registry resolves; src reads provider/id (+reasoning). */
+  interface FakeModel {
+    provider: string;
+    id: string;
+    reasoning: boolean;
+  }
+
+  const mockSessionCtx = {
+    modelRegistry: {
+      find: vi.fn((provider: string, modelId: string) => {
+        const known: Record<string, FakeModel> = {
+          "openai/gpt-4o": { provider: "openai", id: "gpt-4o", reasoning: false },
+          "anthropic/claude-sonnet-4-20250514": {
+            provider: "anthropic",
+            id: "claude-sonnet-4-20250514",
+            reasoning: true,
+          },
+        };
+        return known[`${provider}/${modelId}`];
+      }),
+      getAvailable: vi.fn(() => [
+        { provider: "anthropic", id: "claude-sonnet-4-20250514" },
+        { provider: "openai", id: "gpt-4o" },
+      ]),
+    },
+    // TS 7 (native tsc) infers the control-flow-narrowed type of the annotated const
+    // for object-literal properties, losing the `| undefined` (verified in isolation
+    // under 7.0.2); the assertion keeps the union so tests can toggle model off.
+    model: parentModel as { provider: string; id: string } | undefined,
+    cwd: "/test",
+  };
+
+  const mockPiExec = vi.fn();
+  // Annotated with ReturnType<typeof vi.fn> (the inferred Mock<Procedure> is
+  // too narrow): consumers swap in their own ReturnType<typeof vi.fn> mocks.
+  const mockPiInstance: {
+    sendUserMessage: ReturnType<typeof vi.fn>;
+    exec: ReturnType<typeof vi.fn>;
+  } = {
+    sendUserMessage: vi.fn(),
+    exec: mockPiExec,
+  };
+
+  return {
+    mockConfig,
+    mockProjectConfig,
+    mockSessionOverrides,
+    mockSessionConcurrency,
+    mockProjectTargetOffered,
+    mockStoreOverride,
+    mockSessionShowCost,
+    mockManager,
+    mockSessionCtx,
+    mockPiExec,
+    mockPiInstance,
+  };
+});
+
+export const mockModules = {
+  mockConfig: hoisted.mockConfig,
+  mockProjectConfig: hoisted.mockProjectConfig,
+  mockSessionOverrides: hoisted.mockSessionOverrides,
+  mockSessionConcurrency: hoisted.mockSessionConcurrency,
+  mockProjectTargetOffered: hoisted.mockProjectTargetOffered,
+  mockStoreOverride: hoisted.mockStoreOverride,
+  mockSessionShowCost: hoisted.mockSessionShowCost,
+  mockManager: hoisted.mockManager,
+  mockSessionCtx: hoisted.mockSessionCtx,
+  mockPiExec: hoisted.mockPiExec,
+  mockPiInstance: hoisted.mockPiInstance,
+};
+
+/**
+ * Restore every field of the shared mockModules state to its default.
+ * Wire this into an afterEach hook in each menu test file so stale state
+ * from a failed test never leaks into later tests.
+ */
+export function resetConfig(): void {
+  mockModules.mockConfig = {
+    agent: { default: null, forceBackground: false, outputTranscript: false },
+    concurrency: { default: 4 },
+  };
+  mockModules.mockProjectConfig = {
+    agent: {},
+    concurrency: {},
+  };
+  mockModules.mockSessionOverrides = { default: null };
+  mockModules.mockSessionConcurrency = {};
+  mockModules.mockProjectTargetOffered = false;
+  mockModules.mockStoreOverride = null;
+  mockModules.mockSessionShowCost = undefined;
+  mockModules.mockManager.setConcurrency.mockReset();
+  mockModules.mockManager.listAgents.mockReset();
+  mockModules.mockManager.getRecord.mockReset();
+  mockModules.mockManager.abort.mockReset();
+  mockModules.mockManager.steer.mockReset();
+  mockModules.mockManager.spawn.mockReset();
+  mockModules.mockManager.clear.mockReset();
+  mockModules.mockPiExec.mockReset();
+  resetSelectDialogInstances();
+}
+
+// --- vi.mock() calls ---
+
+vi.mock("../src/agents/agent-types.js", () => ({
+  getConfig: vi.fn(() => ({ displayName: "unknown" })),
+  getAgentConfig: vi.fn(),
+  getAvailableTypes: vi.fn(() => ["general-purpose", "Explore"]),
+  getAllTypes: vi.fn(() => ["general-purpose", "Explore"]),
+  getToolNamesForType: vi.fn(() => ["read", "bash", "edit", "write"]),
+  resolveType: vi.fn((name: string) => ({ kind: "resolved", key: name })),
+  discoverNewAgents: vi.fn(async () => 0),
+}));
+
+// Capture SearchableSelectDialog instances for tests that need them
+// Mirrors the (non-exported) SelectDialogCallbacks in src/ui/searchable-select.ts.
+interface SelectDialogCallbacks {
+  onSelect: (value: string) => void;
+  onCancel: () => void;
+}
+export let selectDialogInstances: Array<{ items: SelectOption[]; callbacks: SelectDialogCallbacks }> = [];
+export function resetSelectDialogInstances() {
+  selectDialogInstances = [];
+}
+
+vi.mock("../src/ui/searchable-select.js", () => ({
+  SearchableSelectDialog: class MockSearchableSelectDialog {
+    items: SelectOption[];
+    callbacks: SelectDialogCallbacks;
+    constructor(items: SelectOption[], _currentValue: string | null, callbacks: SelectDialogCallbacks, _theme: Theme) {
+      this.items = items;
+      this.callbacks = callbacks;
+      selectDialogInstances.push(this);
+    }
+    handleInput(_data: string) {}
+    invalidate() {}
+  },
+}));
+
+vi.mock("../src/ui/format.js", async () => {
+  // formatMs is the real implementation: menu tests pin its actual output
+  // in row labels instead of a hand-copied shape.
+  const actual = await vi.importActual<typeof import("../src/ui/format.js")>("../src/ui/format.js");
+  return {
+    getDisplayName: vi.fn((t: string) => t),
+    agentBulletPrefix: vi.fn(() => ""),
+    agentColoredText: vi.fn((text: string) => text),
+    formatMs: actual.formatMs,
+  };
+});
+
+vi.mock("../src/config/config-io.js", async () => {
+  // Re-export the real constants so the shell mock below derives its defaults
+  // from src (DEFAULT_AGENT etc.) instead of hand-copied literals.
+  const actual = await vi.importActual<typeof import("../src/config/config-io.js")>("../src/config/config-io.js");
+  return {
+    ...actual,
+    CUSTOM_PROMPT_PATH: "/home/test/.pi/agent/subagents-lite-prompt.md",
+    DEFAULT_CONFIG: {
+      agent: { default: null, forceBackground: false },
+      concurrency: { default: 4 },
+    },
+  };
+});
+
+vi.mock("../src/agents/tool-execution.js", () => ({
+  buildAgentDetails: vi.fn(() => ({})),
+  successResult: vi.fn((text: string, details?: Record<string, unknown>) => ({
+    content: [{ type: "text", text }],
+    details,
+  })),
+  errorResult: vi.fn((text: string, details?: Record<string, unknown>) => ({
+    content: [{ type: "text", text }],
+    isError: true,
+    details,
+  })),
+}));
+
+vi.mock("../src/shell.js", async () => {
+  // Derive the getter defaults from src's real config constants (via the mocked
+  // config-io module above) so menu tests pin src's defaults, not a hand copy.
+  const { DEFAULT_AGENT, DEFAULT_CONCURRENCY } = await import("../src/config/config-io.js");
+  const { resolveModel, resolveSpawn } = await import("../src/models/model-precedence.js");
+  const {
+    agentLayerHasModelSettings,
+    sessionOverridesHasModelSettings,
+    CLEAR_ALL_KEPT_AGENT_KEYS,
+    concurrencyLayerHasSettings,
+  } = await import("../src/config/config-store.js");
+  const mockStore = {
+    get projectTargetOffered() {
+      return mockModules.mockProjectTargetOffered;
+    },
+    get agent() {
+      // Effective agent: project layer over global layer (model keys only).
+      const a = { ...mockModules.mockConfig.agent, ...mockModules.mockProjectConfig.agent };
+      // DEFAULT_AGENT always carries widgetMaxLines (typed optional via the layer type).
+      const widgetMaxLines = a.widgetMaxLines ?? DEFAULT_AGENT.widgetMaxLines!;
+      return {
+        defaultModel: a.default ?? null,
+        forceBackground: a.forceBackground === true,
+        showCost: mockModules.mockSessionShowCost ?? a.showCost === true,
+        graceTurns: a.graceTurns ?? DEFAULT_AGENT.graceTurns,
+        toolTimeoutMinutes: a.toolTimeoutMinutes ?? DEFAULT_AGENT.toolTimeoutMinutes,
+        idleTimeoutMinutes: a.idleTimeoutMinutes ?? DEFAULT_AGENT.idleTimeoutMinutes,
+        widgetMaxLines,
+        widgetMaxLinesCompact: a.widgetMaxLinesCompact ?? Math.floor(widgetMaxLines / 2),
+        widgetCompact: a.widgetCompact === true,
+        showCompletionCards: a.showCompletionCards !== false,
+        widgetShortcut: a.widgetShortcut === true,
+        widgetDescLengthFull: a.widgetDescLengthFull ?? DEFAULT_AGENT.widgetDescLengthFull,
+        widgetDescLengthCompact: a.widgetDescLengthCompact ?? DEFAULT_AGENT.widgetDescLengthCompact,
+        systemPromptMode: a.systemPromptMode ?? DEFAULT_AGENT.systemPromptMode,
+        includeContextFiles: a.includeContextFiles ?? DEFAULT_AGENT.includeContextFiles,
+        defaultThinking: a.defaultThinking,
+        defaultMaxTurns: a.defaultMaxTurns,
+        loadSkillsImplicitly: a.loadSkillsImplicitly !== false,
+        loadExtensionsImplicitly: a.loadExtensionsImplicitly !== false,
+        showTools: a.showTools === true,
+        showTurns: a.showTurns !== false,
+        showInput: a.showInput !== false,
+        showOutput: a.showOutput !== false,
+        showContext: a.showContext !== false,
+        showTime: a.showTime !== false,
+        outputTranscript: a.outputTranscript !== false,
+        outputThinkingBufferSize: a.outputThinkingBufferSize ?? 0,
+        finishedRetentionMinutes: a.finishedRetentionMinutes ?? DEFAULT_AGENT.finishedRetentionMinutes,
+        modelDisplayStyle: a.modelDisplayStyle === "id" ? "id" : "name",
+        statusBarFormat: a.statusBarFormat === "compact" ? "compact" : "full",
+        widgetShowModel: a.widgetShowModel !== false,
+        widgetShowThinking: a.widgetShowThinking !== false,
+        widgetNavHint: a.widgetNavHint !== false,
+      };
+    },
+    get concurrency() {
+      const globalConc = mockModules.mockConfig.concurrency ?? {};
+      const projectConc = mockModules.mockProjectConfig.concurrency ?? {};
+      const sessionConc = mockModules.mockSessionConcurrency;
+      return {
+        default: sessionConc.default ?? projectConc.default ?? globalConc.default ?? DEFAULT_CONCURRENCY.default,
+        providers: {
+          ...(globalConc.providers ?? {}),
+          ...(projectConc.providers ?? {}),
+          ...(sessionConc.providers ?? {}),
+        },
+        models: {
+          ...(globalConc.models ?? {}),
+          ...(projectConc.models ?? {}),
+          ...(sessionConc.models ?? {}),
+        },
+      };
+    },
+    get projectConcurrency() {
+      return mockModules.mockProjectConfig.concurrency ?? {};
+    },
+    get sessionConcurrency() {
+      return mockModules.mockSessionConcurrency;
+    },
+    get globalConcurrency() {
+      return mockModules.mockConfig.concurrency ?? {};
+    },
+    get hasSessionConcurrencySettings() {
+      return concurrencyLayerHasSettings(mockModules.mockSessionConcurrency);
+    },
+    get hasGlobalConcurrencySettings() {
+      return concurrencyLayerHasSettings(mockModules.mockConfig.concurrency ?? {});
+    },
+    get hasProjectConcurrencySettings() {
+      return concurrencyLayerHasSettings(mockModules.mockProjectConfig.concurrency ?? {});
+    },
+    get sessionDefaultModel() {
+      return mockModules.mockSessionOverrides.default ?? null;
+    },
+    sessionModelOverride(type: string) {
+      return mockModules.mockSessionOverrides[type] ?? null;
+    },
+    hasGlobalModelKey(key: string) {
+      return mockModules.mockConfig.agent[key] !== undefined;
+    },
+    hasProjectModelKey(key: string) {
+      return mockModules.mockProjectConfig.agent[key] !== undefined;
+    },
+    get hasSessionModelSettings() {
+      // Delegate to the real helpers so the mock cannot drift from src.
+      return sessionOverridesHasModelSettings(mockModules.mockSessionOverrides);
+    },
+    get hasGlobalModelSettings() {
+      return agentLayerHasModelSettings(mockModules.mockConfig);
+    },
+    get hasProjectModelSettings() {
+      return agentLayerHasModelSettings(mockModules.mockProjectConfig);
+    },
+    get hasSessionShowCost() {
+      return mockModules.mockSessionShowCost !== undefined;
+    },
+    agentConfigSnapshot() {
+      return { ...mockModules.mockConfig.agent, ...mockModules.mockProjectConfig.agent };
+    },
+    modelFor(type: string, parentModelId: string, agentConfig?: { model?: string }) {
+      // Delegate to the real chain so the mock cannot drift from resolveModel.
+      return resolveModel({
+        subagentType: type,
+        agentConfig,
+        config: {
+          agent: { ...DEFAULT_AGENT, ...mockModules.mockConfig.agent, ...mockModules.mockProjectConfig.agent },
+        },
+        parentModelId,
+        sessionOverrides: mockModules.mockSessionOverrides,
+      });
+    },
+    spawnFor(type: string, parentModelId: string, agentConfig?: { model?: string }, explicitModel?: string) {
+      // Delegate to the real chain so the mock cannot drift from resolveSpawn.
+      return resolveSpawn({
+        subagentType: type,
+        agentConfig,
+        config: {
+          agent: { ...DEFAULT_AGENT, ...mockModules.mockConfig.agent, ...mockModules.mockProjectConfig.agent },
+        },
+        parentModelId,
+        sessionOverrides: mockModules.mockSessionOverrides,
+        explicitModel,
+      });
+    },
+    modelAliases: undefined,
+    providerPreference: undefined,
+    mutate: {
+      agent: {
+        setDefaultModel(value: string | null, target: string = "global") {
+          if (target === "session") mockModules.mockSessionOverrides.default = value;
+          else if (target === "project") mockModules.mockProjectConfig.agent.default = value;
+          else mockModules.mockConfig.agent.default = value;
+        },
+        setModelOverride(type: string, value: string | null, target: string = "global") {
+          if (target === "session") mockModules.mockSessionOverrides[type] = value;
+          else if (target === "project") mockModules.mockProjectConfig.agent[type] = value;
+          else mockModules.mockConfig.agent[type] = value;
+        },
+        clearModelOverride(type: string, target: string = "global") {
+          if (target === "session") {
+            delete mockModules.mockSessionOverrides[type];
+          } else if (target === "all") {
+            delete mockModules.mockSessionOverrides[type];
+            delete mockModules.mockConfig.agent[type];
+            delete mockModules.mockProjectConfig.agent[type];
+          } else if (target === "project") {
+            delete mockModules.mockProjectConfig.agent[type];
+          } else {
+            delete mockModules.mockConfig.agent[type];
+          }
+        },
+        clearAllModelOverrides(target: string = "global") {
+          // Mirror the store: clear the model family + per-type keys, keep non-model settings.
+          const clearAgent = (agent: Partial<SubagentsConfig["agent"]>) => {
+            for (const key of Object.keys(agent)) {
+              if (!CLEAR_ALL_KEPT_AGENT_KEYS.has(key)) delete agent[key];
+            }
+          };
+          if (target === "session") {
+            mockModules.mockSessionOverrides = { default: null };
+          } else if (target === "all") {
+            mockModules.mockSessionOverrides = { default: null };
+            clearAgent(mockModules.mockConfig.agent);
+            clearAgent(mockModules.mockProjectConfig.agent);
+          } else if (target === "project") {
+            clearAgent(mockModules.mockProjectConfig.agent);
+          } else {
+            clearAgent(mockModules.mockConfig.agent);
+          }
+        },
+        setForceBackground(enabled: boolean) {
+          mockModules.mockConfig.agent.forceBackground = enabled;
+        },
+        setShowCost(enabled: boolean) {
+          mockModules.mockConfig.agent.showCost = enabled;
+        },
+        setGraceTurns(n: number) {
+          mockModules.mockConfig.agent.graceTurns = n;
+        },
+        setToolTimeoutMinutes(n: number) {
+          mockModules.mockConfig.agent.toolTimeoutMinutes = n;
+        },
+        setIdleTimeoutMinutes(n: number) {
+          mockModules.mockConfig.agent.idleTimeoutMinutes = n;
+        },
+        setSystemPromptMode(mode: SystemPromptMode) {
+          mockModules.mockConfig.agent.systemPromptMode = mode;
+        },
+        setIncludeContextFiles(enabled: boolean) {
+          mockModules.mockConfig.agent.includeContextFiles = enabled;
+        },
+        setDefaultThinking(level: ThinkingLevel | undefined, target: string = "global") {
+          const agent = target === "project" ? mockModules.mockProjectConfig.agent : mockModules.mockConfig.agent;
+          if (level === undefined) delete agent.defaultThinking;
+          else agent.defaultThinking = level;
+        },
+        setDefaultMaxTurns(n: number | undefined, target: string = "global") {
+          const agent = target === "project" ? mockModules.mockProjectConfig.agent : mockModules.mockConfig.agent;
+          if (n === undefined) delete agent.defaultMaxTurns;
+          else agent.defaultMaxTurns = n;
+        },
+        clearDefaultMaxTurns(target: string = "global") {
+          if (target === "all") {
+            delete mockModules.mockConfig.agent.defaultMaxTurns;
+            delete mockModules.mockProjectConfig.agent.defaultMaxTurns;
+          } else if (target === "project") {
+            delete mockModules.mockProjectConfig.agent.defaultMaxTurns;
+          } else {
+            delete mockModules.mockConfig.agent.defaultMaxTurns;
+          }
+        },
+        setLoadSkillsImplicitly(value: boolean) {
+          mockModules.mockConfig.agent.loadSkillsImplicitly = value;
+        },
+        setLoadExtensionsImplicitly(value: boolean) {
+          mockModules.mockConfig.agent.loadExtensionsImplicitly = value;
+        },
+        setAgentToolStrictMode(value: boolean) {
+          mockModules.mockConfig.agent.agentToolStrictMode = value;
+        },
+        setShowTools(enabled: boolean) {
+          mockModules.mockConfig.agent.showTools = enabled;
+        },
+        setShowTurns(enabled: boolean) {
+          mockModules.mockConfig.agent.showTurns = enabled;
+        },
+        setShowInput(enabled: boolean) {
+          mockModules.mockConfig.agent.showInput = enabled;
+        },
+        setShowOutput(enabled: boolean) {
+          mockModules.mockConfig.agent.showOutput = enabled;
+        },
+        setShowContext(enabled: boolean) {
+          mockModules.mockConfig.agent.showContext = enabled;
+        },
+        setShowTime(enabled: boolean) {
+          mockModules.mockConfig.agent.showTime = enabled;
+        },
+        setOutputThinkingBufferSize(size: number) {
+          mockModules.mockConfig.agent.outputThinkingBufferSize = size;
+        },
+        setFinishedRetentionMinutes(n: number) {
+          mockModules.mockConfig.agent.finishedRetentionMinutes = n;
+        },
+        setAgentStatusLimit(n: number) {
+          mockModules.mockConfig.agent.agentStatusLimit = n;
+        },
+        setOutputTranscript(enabled: boolean) {
+          mockModules.mockConfig.agent.outputTranscript = enabled;
+        },
+      },
+      widget: {
+        setCompact(enabled: boolean) {
+          mockModules.mockConfig.agent.widgetCompact = enabled;
+        },
+        setShowCompletionCards(enabled: boolean) {
+          mockModules.mockConfig.agent.showCompletionCards = enabled;
+        },
+        setMaxLines(lines: number) {
+          mockModules.mockConfig.agent.widgetMaxLines = lines;
+        },
+        setMaxLinesCompact(lines: number) {
+          mockModules.mockConfig.agent.widgetMaxLinesCompact = lines;
+        },
+        setDescLengthFull(n: number) {
+          mockModules.mockConfig.agent.widgetDescLengthFull = n;
+        },
+        setDescLengthCompact(n: number) {
+          mockModules.mockConfig.agent.widgetDescLengthCompact = n;
+        },
+        setShortcut(enabled: boolean) {
+          mockModules.mockConfig.agent.widgetShortcut = enabled;
+        },
+        setShowModel(enabled: boolean) {
+          mockModules.mockConfig.agent.widgetShowModel = enabled;
+        },
+        setShowThinking(enabled: boolean) {
+          mockModules.mockConfig.agent.widgetShowThinking = enabled;
+        },
+        setNavHint(enabled: boolean) {
+          mockModules.mockConfig.agent.widgetNavHint = enabled;
+        },
+        setModelDisplayStyle(style: "id" | "name") {
+          mockModules.mockConfig.agent.modelDisplayStyle = style;
+        },
+        setStatusBarFormat(format: "full" | "compact") {
+          mockModules.mockConfig.agent.statusBarFormat = format;
+        },
+      },
+      concurrency: {
+        setDefault(n: number, target: string = "global") {
+          if (target === "session") mockModules.mockSessionConcurrency.default = n;
+          else if (target === "project") mockModules.mockProjectConfig.concurrency.default = n;
+          else mockModules.mockConfig.concurrency.default = n;
+        },
+        setProvider(key: string, n: number, target: string = "global") {
+          const section =
+            target === "session"
+              ? mockModules.mockSessionConcurrency
+              : target === "project"
+                ? mockModules.mockProjectConfig.concurrency
+                : mockModules.mockConfig.concurrency;
+          if (!section.providers) section.providers = {};
+          section.providers[key] = n;
+        },
+        setModel(key: string, n: number, target: string = "global") {
+          const section =
+            target === "session"
+              ? mockModules.mockSessionConcurrency
+              : target === "project"
+                ? mockModules.mockProjectConfig.concurrency
+                : mockModules.mockConfig.concurrency;
+          if (!section.models) section.models = {};
+          section.models[key] = n;
+        },
+        removeDefault(target: string = "global") {
+          if (target === "session") {
+            delete mockModules.mockSessionConcurrency.default;
+          } else if (target === "all") {
+            delete mockModules.mockSessionConcurrency.default;
+            delete mockModules.mockConfig.concurrency.default;
+            delete mockModules.mockProjectConfig.concurrency.default;
+          } else if (target === "project") {
+            delete mockModules.mockProjectConfig.concurrency.default;
+          } else {
+            delete mockModules.mockConfig.concurrency.default;
+          }
+        },
+        removeProvider(key: string, target: string = "global") {
+          if (target === "session") {
+            if (mockModules.mockSessionConcurrency.providers) delete mockModules.mockSessionConcurrency.providers[key];
+          } else if (target === "all") {
+            if (mockModules.mockSessionConcurrency.providers) delete mockModules.mockSessionConcurrency.providers[key];
+            if (mockModules.mockConfig.concurrency.providers) delete mockModules.mockConfig.concurrency.providers[key];
+            if (mockModules.mockProjectConfig.concurrency.providers) {
+              delete mockModules.mockProjectConfig.concurrency.providers[key];
+            }
+          } else if (target === "project") {
+            if (mockModules.mockProjectConfig.concurrency.providers) {
+              delete mockModules.mockProjectConfig.concurrency.providers[key];
+            }
+          } else if (mockModules.mockConfig.concurrency.providers) {
+            delete mockModules.mockConfig.concurrency.providers[key];
+          }
+        },
+        removeModel(key: string, target: string = "global") {
+          if (target === "session") {
+            if (mockModules.mockSessionConcurrency.models) delete mockModules.mockSessionConcurrency.models[key];
+          } else if (target === "all") {
+            if (mockModules.mockSessionConcurrency.models) delete mockModules.mockSessionConcurrency.models[key];
+            if (mockModules.mockConfig.concurrency.models) delete mockModules.mockConfig.concurrency.models[key];
+            if (mockModules.mockProjectConfig.concurrency.models) {
+              delete mockModules.mockProjectConfig.concurrency.models[key];
+            }
+          } else if (target === "project") {
+            if (mockModules.mockProjectConfig.concurrency.models) {
+              delete mockModules.mockProjectConfig.concurrency.models[key];
+            }
+          } else if (mockModules.mockConfig.concurrency.models) {
+            delete mockModules.mockConfig.concurrency.models[key];
+          }
+        },
+        clearAll(target: string = "global") {
+          if (target === "session") {
+            mockModules.mockSessionConcurrency = {};
+          } else if (target === "all") {
+            mockModules.mockSessionConcurrency = {};
+            mockModules.mockConfig.concurrency = {};
+            mockModules.mockProjectConfig.concurrency = {};
+          } else if (target === "project") {
+            mockModules.mockProjectConfig.concurrency = {};
+          } else {
+            mockModules.mockConfig.concurrency = {};
+          }
+        },
+      },
+      session: {
+        setOverride(type: string, model: string) {
+          mockModules.mockSessionOverrides[type] = model;
+        },
+        clearOverride(type: string) {
+          delete mockModules.mockSessionOverrides[type];
+        },
+        clearAll() {
+          mockModules.mockSessionOverrides = { default: null };
+        },
+        setShowCost(enabled: boolean) {
+          mockModules.mockSessionShowCost = enabled;
+        },
+        clearShowCost() {
+          mockModules.mockSessionShowCost = undefined;
+        },
+      },
+    },
+  };
+
+  return {
+    getStore: () => mockModules.mockStoreOverride ?? mockStore,
+    getManager: () => mockModules.mockManager,
+    getWidget: vi.fn(() => undefined),
+    getPiInstance: () => mockModules.mockPiInstance,
+    getSessionCtx: () => mockModules.mockSessionCtx,
+    getCoordinator: vi.fn(() => ({
+      spawn: vi.fn(async (_pi: ExtensionAPI, _ctx: ExtensionContext, intent: SpawnIntent) => {
+        const id = mockModules.mockManager.spawn(_pi, _ctx, intent.type, intent.prompt, {
+          description: intent.description,
+          model: intent.model,
+          maxTurns: intent.maxTurns,
+          thinkingLevel: intent.thinkingLevel,
+          isBackground: intent.runInBackground,
+          modelKey: intent.modelKey,
+          graceTurns: intent.graceTurns,
+          worktreePath: intent.worktreePath,
+          worktreeLabel: intent.worktreeLabel,
+          invocation: intent.invocation,
+          // Mirror the real coordinator's spread: the signal key exists only
+          // when the intent carried one — menu-wizard spawns never do.
+          ...(intent.signal !== undefined ? { signal: intent.signal } : {}),
+        });
+        const record = mockModules.mockManager.getRecord(id);
+        if (!intent.runInBackground && record?.execution?.promise) {
+          await record.execution.promise;
+        }
+        return { agentId: id, record };
+      }),
+      isBackground: vi.fn(() => false),
+      scheduleNudge: vi.fn(),
+      onAgentComplete: vi.fn(),
+      dispose: vi.fn(),
+    })),
+  };
+});

@@ -14,12 +14,28 @@
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { SelectList, type SelectItem } from "@earendil-works/pi-tui";
-import { getAgentConfig, getAvailableTypes, getAllTypes } from "../../agents/agent-types.js";
+import { getAgentConfig, getAvailableTypes, getAllTypes, getToolNamesForType } from "../../agents/agent-types.js";
+import { readDefaultTools } from "../../pi-settings.js";
 import { buildSelectListTheme } from "./helpers.js";
 import { SettingsListWrapper } from "./wrappers/settings-list.js";
 import { getPiInstance } from "../../shell.js";
+import { handleRestartLastAgents } from "../../agents/restart-last-agents.js";
 
+/** Render a tool set; the zero-tool state is explicit, not a glitch. */
+function formatTools(tools: string[]): string {
+  return tools.length > 0 ? tools.join(", ") : "(none)";
+}
+
+/**
+ * pi's defaultTools setting for the menu's cwd, via the same version-tolerant
+ * accessor the spawn path uses. One SettingsManager per action, with default
+ * trust (matching the spawn default when projectTrusted is unset).
+ */
+function readMenuDefaultTools(cwd: string): string[] | undefined {
+  return readDefaultTools(SettingsManager.create(cwd, getAgentDir()));
+}
 async function showAgentTypes(ctx: ExtensionCommandContext): Promise<void> {
   const types = getAllTypes();
   if (types.length === 0) {
@@ -28,14 +44,13 @@ async function showAgentTypes(ctx: ExtensionCommandContext): Promise<void> {
   }
 
   const lines: string[] = ["Available agent types:\n"];
+  const defaultTools = readMenuDefaultTools(ctx.cwd);
   for (const name of types) {
     const cfg = getAgentConfig(name);
     if (!cfg) continue;
     const hidden = cfg.hidden === true ? " [HIDDEN]" : "";
     const model = cfg.model ? `  Model: ${cfg.model}` : "";
-    const tools = cfg.registeredTools
-      ? `  Tools: ${cfg.registeredTools.join(", ")}`
-      : "  Tools: all built-in tools";
+    const tools = `  Tools: ${formatTools(getToolNamesForType(name, defaultTools))}`;
     const source = cfg.source ? `  Source: ${cfg.source}` : "";
     lines.push(`  ${name}${hidden}`);
     lines.push(`    ${cfg.description}`);
@@ -51,7 +66,7 @@ async function showAgentTypes(ctx: ExtensionCommandContext): Promise<void> {
 async function handleAgentBriefing(ctx: ExtensionCommandContext): Promise<void> {
   const types = getAvailableTypes();
   const agents = types.map((t) => ({ name: t, config: getAgentConfig(t) }));
-
+  const defaultTools = readMenuDefaultTools(ctx.cwd);
   const lines: string[] = [
     "# Agent Types and Capabilities\n",
     "The following agent types are available. Use the `agent` parameter to select one.\n",
@@ -63,9 +78,8 @@ async function handleAgentBriefing(ctx: ExtensionCommandContext): Promise<void> 
     lines.push(config.description);
     lines.push("");
 
-    if (config.registeredTools) {
-      lines.push(`**Tools:** ${config.registeredTools.join(", ")}`);
-    }
+    // Always present: the effective set, whether explicit or resolved.
+    lines.push(`**Tools:** ${formatTools(getToolNamesForType(name, defaultTools))}`);
     if (config.model) {
       lines.push(`**Default model:** ${config.model}`);
     }
@@ -82,9 +96,13 @@ async function handleAgentBriefing(ctx: ExtensionCommandContext): Promise<void> 
   lines.push("| `prompt` | The task for the agent (required) |");
   lines.push("| `description` | One-line summary of what the agent should do (required) |");
   lines.push("| `agent` | Which agent type to use (default: general-purpose) |");
-  lines.push("| `thinking` | Optional thinking mode override (e.g., `off`, `minimal`, `low`, `medium`, `high`, `xhigh`) |");
-  lines.push("| `run_in_background` | When `true`, result is auto-delivered — do NOT poll. Continue working while waiting. |");
-  lines.push("| `worktree_path` | Optional path to a git worktree of the parent's repo. See below for details. |");
+  lines.push(
+    "| `thinking` | Optional thinking mode override (e.g., `off`, `minimal`, `low`, `medium`, `high`, `xhigh`) |",
+  );
+  lines.push(
+    "| `run_in_background` | When `true`, result is auto-delivered — do NOT poll. Continue working while waiting. |",
+  );
+  lines.push("| `worktree_path` | Optional path inside any git repository on disk. See below for details. |");
   lines.push("");
 
   // Usage guidelines
@@ -94,22 +112,62 @@ async function handleAgentBriefing(ctx: ExtensionCommandContext): Promise<void> 
   lines.push("  → Results are auto-delivered — do NOT poll, the result will arrive when ready");
   lines.push("");
   lines.push("## `worktree_path` Parameter\n");
-  lines.push("Use `worktree_path` to run a subagent in a different git worktree of the parent's repository.");
+  lines.push(
+    "Use `worktree_path` to run a subagent in a directory inside any git repository on disk: a worktree of the parent's repo, its main checkout, or a different repo entirely.",
+  );
   lines.push("");
   lines.push("- **Optional.** Omit to run the subagent in the parent's working directory (default behavior).");
-  lines.push("- **Must be a path** inside a git worktree of the parent's repo, including the main checkout. Not a different repo, not a non-git directory.");
+  lines.push("- **Must be a path** inside a git repository (any repo on disk). Not a non-git directory.");
   lines.push("- **Relative paths** are resolved against the parent's working directory.");
-  lines.push("- **On failure** the validator returns a specific reason (e.g., 'not a worktree of the parent's repository', 'path does not exist') — use this to self-correct.");
-  lines.push("- **Agent type discovery:** The worktree's `.pi/agents/` directory is scanned for agent types when this param is set, so worktree-local types become available to that spawn.");
+  lines.push(
+    "- **On failure** the validator returns a specific reason (e.g., 'not inside a git repository', 'path does not exist') — use this to self-correct.",
+  );
+  lines.push(
+    "- **Agent type discovery:** The target's `.pi/agents/` directory is scanned for agent types when this param is set, so repo-local types become available to that spawn.",
+  );
+  lines.push(
+    "- **Cross-repo trust:** a target in a different git repo is gated by pi's trust framework. An untrusted target still spawns, but its project resources (.pi/ settings, extensions, skills, prompts, themes, system prompt files, .agents/skills) are ignored and its `.pi/agents` types are not discovered.",
+  );
   getPiInstance().sendUserMessage(lines.join("\n"));
   ctx.ui.notify("Agent briefing sent to LLM", "info");
+}
+
+async function handleRestartLastAgentsMenu(ctx: ExtensionCommandContext): Promise<void> {
+  const { restarted, skipped } = await handleRestartLastAgents(ctx);
+
+  if (restarted.length === 0 && skipped.length === 0) {
+    ctx.ui.notify("No recent Agent tool calls found in session history.", "info");
+    return;
+  }
+
+  const lines: string[] = [];
+  if (restarted.length > 0) {
+    lines.push(`Restarted ${restarted.length} agent(s):`);
+    for (const r of restarted) lines.push(`  • ${r}`);
+  }
+  if (skipped.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push(`Skipped ${skipped.length} agent(s):`);
+    for (const s of skipped) lines.push(`  • ${s}`);
+  }
+
+  ctx.ui.notify(lines.join("\n"), "info");
 }
 
 export async function showDebugMenu(ctx: ExtensionCommandContext): Promise<void> {
   await ctx.ui.custom((_tui, theme, _kb, done) => {
     const items: SelectItem[] = [
       { value: "agent-types", label: "Agent types", description: "List available agent types and their configs" },
-      { value: "agent-briefing", label: "Agent briefing", description: "Send agent types/capabilities info to LLM (Optional, if having issues)" },
+      {
+        value: "agent-briefing",
+        label: "Agent briefing",
+        description: "Send agent types/capabilities info to LLM (Optional, if having issues)",
+      },
+      {
+        value: "restart-last-agents",
+        label: "Restart last agents",
+        description: "Replay the most recent Agent tool calls from session history",
+      },
     ];
 
     const selectList = new SelectList(items, 10, buildSelectListTheme(theme));
@@ -118,6 +176,8 @@ export async function showDebugMenu(ctx: ExtensionCommandContext): Promise<void>
         await showAgentTypes(ctx);
       } else if (item.value === "agent-briefing") {
         await handleAgentBriefing(ctx);
+      } else if (item.value === "restart-last-agents") {
+        await handleRestartLastAgentsMenu(ctx);
       }
     };
     return new SettingsListWrapper(selectList, { title: "Debug", theme, onCancel: () => done(undefined) });

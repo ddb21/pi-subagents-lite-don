@@ -1,0 +1,434 @@
+/**
+ * agent-widget-navigation.test.ts — Tests for keyboard navigation in AgentWidget.
+ */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { agentConfigMock } from "../agent-types-mock.js";
+import type { AgentManager } from "../../src/agents/agent-manager.js";
+import type { LiveView, AgentRecord } from "../../src/types.js";
+import { AgentWidget } from "../../src/ui/agent-widget.js";
+import {
+  makeMockManager,
+  renderWidgetLines,
+  makeRunningAgent,
+  makeFinishedAgent,
+  makeQueuedAgent,
+  makeActivity,
+} from "./widget-helpers.js";
+
+/* ------------------------------------------------------------------ */
+/*  Mock setup                                                        */
+/* ------------------------------------------------------------------ */
+
+vi.mock("../../src/agents/agent-types.js", () => ({
+  getConfig: (type: string) => ({
+    displayName: type.charAt(0).toUpperCase() + type.slice(1),
+    tools: [],
+    maxTurns: undefined,
+    thinkingLevel: undefined,
+  }),
+  getAgentConfig: agentConfigMock(),
+}));
+
+vi.mock("@earendil-works/pi-tui", () => ({
+  truncateToWidth: (text: string, width: number) => text,
+  visibleWidth: (text: string) => text.length,
+}));
+
+/* ------------------------------------------------------------------ */
+/*  Navigation state machine tests                                    */
+/* ------------------------------------------------------------------ */
+
+describe("navigation state machine", () => {
+  let widget: AgentWidget;
+  let manager: AgentManager;
+  let activity: Map<string, LiveView>;
+
+  beforeEach(() => {
+    manager = makeMockManager([]);
+    activity = new Map();
+    widget = new AgentWidget(manager, (id) => activity.get(id));
+  });
+
+  describe("initial state", () => {
+    it("starts with navigation inactive", () => {
+      expect(widget.isNavActive()).toBe(false);
+    });
+
+    it("highlighted index is 0 when inactive", () => {
+      expect(widget.highlightedIndex()).toBe(0);
+    });
+
+    it("viewer is not open by default", () => {
+      expect(widget.isViewerOpen()).toBe(false);
+    });
+  });
+
+  describe("navActivate", () => {
+    it("activates navigation with no agents", () => {
+      widget.navActivate();
+      expect(widget.isNavActive()).toBe(true);
+      expect(widget.highlightedIndex()).toBe(0);
+    });
+
+    it("activates navigation highlighting first agent when agents exist", () => {
+      const agent = makeRunningAgent("a1");
+      activity.set("a1", makeActivity("a1"));
+      manager.listAgents = () => [agent];
+      const finished = makeFinishedAgent("f1");
+      manager.listAgents = () => [finished, agent];
+
+      widget.navActivate();
+      expect(widget.isNavActive()).toBe(true);
+      // Index 0 = first finished agent
+      expect(widget.highlightedIndex()).toBe(0);
+    });
+
+    it("is idempotent", () => {
+      widget.navActivate();
+      const firstIndex = widget.highlightedIndex();
+      widget.navActivate();
+      expect(widget.highlightedIndex()).toBe(firstIndex);
+    });
+  });
+
+  describe("navDown", () => {
+    it("moves highlight down one position", () => {
+      const finished = makeFinishedAgent("f1");
+      const running = makeRunningAgent("r1");
+      activity.set("r1", makeActivity("r1"));
+      manager.listAgents = () => [finished, running];
+
+      widget.navActivate(); // highlights index 0 (first finished)
+      expect(widget.highlightedIndex()).toBe(0);
+
+      widget.navDown(); // moves to running agent
+      expect(widget.highlightedIndex()).toBe(1);
+    });
+
+    it("wraps from last agent to first", () => {
+      const finished = makeFinishedAgent("f1");
+      manager.listAgents = () => [finished];
+
+      widget.navActivate(); // index 0
+      widget.navDown(); // wraps to first (index 0)
+      expect(widget.highlightedIndex()).toBe(0);
+    });
+  });
+
+  describe("navUp", () => {
+    it("moves highlight up one position", () => {
+      const finished = makeFinishedAgent("f1");
+      const running = makeRunningAgent("r1");
+      activity.set("r1", makeActivity("r1"));
+      manager.listAgents = () => [finished, running];
+
+      widget.navActivate();
+      widget.navDown(); // index 1 (running)
+      expect(widget.highlightedIndex()).toBe(1);
+
+      widget.navUp(); // back to finished
+      expect(widget.highlightedIndex()).toBe(0);
+    });
+
+    it("wraps from first to last agent", () => {
+      const finished = makeFinishedAgent("f1");
+      manager.listAgents = () => [finished];
+
+      widget.navActivate(); // index 0
+      widget.navUp(); // wraps to last agent (index 1)
+      widget.navUp(); // to first agent (index 0)
+      expect(widget.highlightedIndex()).toBe(0);
+      expect(widget.isNavActive()).toBe(true);
+    });
+  });
+
+  describe("navSelect", () => {
+    it("returns the first agent when no agents beyond the highlighted one", () => {
+      widget.navActivate();
+      expect(widget.highlightedIndex()).toBe(0);
+      expect(widget.navSelect()).toBeNull();
+    });
+    it("returns the agent record when highlighting an agent", () => {
+      const finished = makeFinishedAgent("f1");
+      manager.listAgents = () => [finished];
+
+      widget.navActivate();
+      expect(widget.navSelect()).toBe(finished);
+    });
+
+    it("returns null when no agent at highlighted index", () => {
+      widget.navActivate();
+      // No agents, so roster is empty
+      expect(widget.navSelect()).toBeNull();
+    });
+  });
+
+  describe("navDeactivate", () => {
+    it("deactivates navigation", () => {
+      widget.navActivate();
+      expect(widget.isNavActive()).toBe(true);
+      widget.navDeactivate();
+      expect(widget.isNavActive()).toBe(false);
+    });
+
+    it("resets highlighted index to 0", () => {
+      widget.navActivate();
+      widget.navDown();
+      widget.navDeactivate();
+      expect(widget.highlightedIndex()).toBe(0);
+    });
+
+    it("is idempotent when already inactive", () => {
+      widget.navDeactivate();
+      widget.navDeactivate();
+      expect(widget.isNavActive()).toBe(false);
+    });
+  });
+
+  describe("viewer open guard", () => {
+    it("setViewerOpen toggles the viewer open state", () => {
+      expect(widget.isViewerOpen()).toBe(false);
+      widget.setViewerOpen(true);
+      expect(widget.isViewerOpen()).toBe(true);
+      widget.setViewerOpen(false);
+      expect(widget.isViewerOpen()).toBe(false);
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Roster building tests                                             */
+/* ------------------------------------------------------------------ */
+
+describe("navigation roster", () => {
+  let widget: AgentWidget;
+  let manager: AgentManager;
+  let activity: Map<string, LiveView>;
+
+  beforeEach(() => {
+    manager = makeMockManager([]);
+    activity = new Map();
+    widget = new AgentWidget(manager, (id) => activity.get(id));
+  });
+
+  it("includes finished at index 0, then running, queued", () => {
+    const finished = makeFinishedAgent("f1");
+    const running = makeRunningAgent("r1");
+    activity.set("r1", makeActivity("r1"));
+    const queued = makeQueuedAgent("q1");
+    manager.listAgents = () => [finished, running, queued];
+
+    widget.navActivate();
+
+    // Roster: finished(0), running(1), queued(2)
+    expect(widget.highlightedIndex()).toBe(0); // first agent
+    widget.navDown(); // running
+    expect(widget.highlightedIndex()).toBe(1);
+    widget.navDown(); // queued
+    expect(widget.highlightedIndex()).toBe(2);
+  });
+
+  it("queued agents expand to individual rows during navigation", () => {
+    const q1 = makeQueuedAgent("q1");
+    const q2 = makeQueuedAgent("q2");
+    manager.listAgents = () => [q1, q2];
+
+    widget.navActivate();
+    // Roster: q1(0), q2(1)
+    expect(widget.highlightedIndex()).toBe(0);
+    widget.navDown();
+    expect(widget.highlightedIndex()).toBe(1);
+  });
+
+  it("queued agents aggregate when navigation is inactive", () => {
+    const q1 = makeQueuedAgent("q1");
+    const q2 = makeQueuedAgent("q2");
+    manager.listAgents = () => [q1, q2];
+
+    // Without nav active, queued agents render as "2 queued" block
+    const lines = renderWidgetLines(widget);
+    expect(lines.some((l: string) => l.includes("2 queued"))).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Rendering tests                                                   */
+/* ------------------------------------------------------------------ */
+
+describe("navigation rendering", () => {
+  let widget: AgentWidget;
+  let manager: AgentManager;
+  let activity: Map<string, LiveView>;
+
+  beforeEach(() => {
+    manager = makeMockManager([]);
+    activity = new Map();
+    widget = new AgentWidget(manager, (id) => activity.get(id));
+  });
+
+  describe("heading hint text", () => {
+    it("shows 'down to navigate' hint when navigation is inactive", () => {
+      const running = makeRunningAgent("r1");
+      activity.set("r1", makeActivity("r1"));
+      manager.listAgents = () => [running];
+
+      const lines = renderWidgetLines(widget);
+      expect(lines[0]).toContain("to navigate");
+    });
+
+    it("shows navigation hint when navigation is active", () => {
+      const running = makeRunningAgent("r1");
+      activity.set("r1", makeActivity("r1"));
+      manager.listAgents = () => [running];
+      widget.navActivate();
+
+      const lines = renderWidgetLines(widget);
+      expect(lines[0]).toContain("navigate");
+      expect(lines[0]).toContain("enter view");
+      expect(lines[0]).toContain("esc back");
+    });
+  });
+
+  describe("highlight marker", () => {
+    it("renders '→' marker on the highlighted running agent", () => {
+      const running = makeRunningAgent("r1");
+      activity.set("r1", makeActivity("r1"));
+      manager.listAgents = () => [running];
+      widget.navActivate(); // highlights index 1 = the running agent
+
+      const lines = renderWidgetLines(widget);
+      // The agent line (after heading) should contain '→'
+      const agentLine = lines[1];
+      expect(agentLine).toContain("→");
+    });
+
+    it("renders '→' marker on the highlighted finished agent", () => {
+      const finished = makeFinishedAgent("f1");
+      manager.listAgents = () => [finished];
+      widget.navActivate();
+
+      const lines = renderWidgetLines(widget);
+      const agentLine = lines[1];
+      expect(agentLine).toContain("→");
+    });
+
+    it("does not render '→' marker when navigation is inactive", () => {
+      const running = makeRunningAgent("r1");
+      activity.set("r1", makeActivity("r1"));
+      manager.listAgents = () => [running];
+
+      const lines = renderWidgetLines(widget);
+      // No '→' marker in agent lines
+      const agentLine = lines[1];
+      expect(agentLine).not.toContain("→");
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Auto-deactivation tests                                           */
+/* ------------------------------------------------------------------ */
+
+describe("auto-deactivation", () => {
+  let widget: AgentWidget;
+  let manager: AgentManager;
+  let activity: Map<string, LiveView>;
+
+  beforeEach(() => {
+    manager = makeMockManager([]);
+    activity = new Map();
+    widget = new AgentWidget(manager, (id) => activity.get(id));
+  });
+
+  it("deactivates navigation when all agents clear", () => {
+    const uiCtx = { setStatus: vi.fn(), setWidget: vi.fn() };
+    widget.setUICtx(uiCtx);
+
+    const running = makeRunningAgent("r1");
+    activity.set("r1", makeActivity("r1"));
+    manager.listAgents = () => [running];
+    widget.navActivate();
+    expect(widget.isNavActive()).toBe(true);
+
+    // Agents clear
+    manager.listAgents = () => [];
+    widget.update(); // triggers clearWidget path
+    expect(widget.isNavActive()).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Overflow + navigation tests                                       */
+/* ------------------------------------------------------------------ */
+
+describe("overflow with navigation", () => {
+  let widget: AgentWidget;
+  let manager: AgentManager;
+  let activity: Map<string, LiveView>;
+
+  beforeEach(() => {
+    manager = makeMockManager([]);
+    activity = new Map();
+    widget = new AgentWidget(manager, (id) => activity.get(id));
+  });
+
+  it("pinned block appears when navigating to a hidden agent", () => {
+    // Create 15 finished agents — body budget is maxLines-1 = 11,
+    // so 4 agents are hidden by overflow without pinning.
+    const agents = Array.from({ length: 15 }, (_, i) => {
+      const agent = makeFinishedAgent(`f${i}`);
+      agent.display.description = `Finished agent ${i}`;
+      return agent;
+    });
+    manager.listAgents = () => agents;
+
+    // Activate nav — highlights index 0 (agent 0)
+    widget.navActivate();
+
+    // Navigate down to index 12 -> agent 12 (would be hidden by overflow)
+    for (let i = 0; i < 12; i++) widget.navDown();
+    expect(widget.highlightedIndex()).toBe(12);
+
+    const lines = renderWidgetLines(widget);
+
+    // The pinned (highlighted) block must appear in the output
+    const highlightedLine = lines.find((line: string) => line.includes("Finished agent 12"));
+    expect(highlightedLine).toBeDefined();
+    expect(highlightedLine).toContain("→");
+
+    // Overflow summary line must be present (some agents are hidden)
+    const overflowLine = lines.find((line: string) => line.includes("more"));
+    expect(overflowLine).toBeDefined();
+  });
+});
+
+describe("navigation highlight adoption on roster shrink", () => {
+  let manager: AgentManager;
+  let widget: AgentWidget;
+
+  beforeEach(() => {
+    manager = makeMockManager([]);
+    widget = new AgentWidget(manager, () => undefined);
+  });
+
+  it("returns the adopted live record when roster shrinks during navSelect", () => {
+    const agents = Array.from({ length: 5 }, (_, i) => makeFinishedAgent(`a${i}`));
+    manager.listAgents = () => agents;
+
+    widget.navActivate();
+    for (let i = 0; i < 4; i++) widget.navDown();
+    expect(widget.highlightedIndex()).toBe(4);
+
+    manager.listAgents = () => agents.slice(0, 2);
+
+    // Roster shrinks to 2 agents mid-freeze, no render in between. navSelect
+    // resolves the nav state itself: a4 is gone, so identity-based adoption
+    // picks the nearest remaining agent (index min(4, len-1) = 1) and
+    // returns that live record.
+    const selected = widget.navSelect();
+    expect(selected).not.toBeNull();
+    expect(selected!.id).toBe("a1");
+    expect(widget.highlightedIndex()).toBe(1);
+  });
+});

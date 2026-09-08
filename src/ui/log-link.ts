@@ -32,6 +32,7 @@ export interface LinkEnv {
 export function agentLogUrl(outputFile: string, workspaceId: string): string | undefined {
   const workspace = workspaceId.trim();
   if (!WORKSPACE_UUID.test(workspace)) return undefined;
+  // eslint-disable-next-line no-control-regex
   if (outputFile !== outputFile.trim() || /[\x00-\x1f\x7f\\]/.test(outputFile)) return undefined;
   const dir = AGENT_LOG_DIRS.find((candidate) => outputFile.startsWith(candidate));
   if (!dir) return undefined;

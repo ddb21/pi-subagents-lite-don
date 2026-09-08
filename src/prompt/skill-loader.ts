@@ -17,14 +17,10 @@
  * mode (no root files) is not exported.
  */
 
-import { readFileSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import {
-  loadSkills,
-  loadSkillsFromDir,
-  type Skill,
-} from "@earendil-works/pi-coding-agent";
+import { loadSkills, loadSkillsFromDir, type Skill } from "@earendil-works/pi-coding-agent";
 import { isUnsafeName } from "../utils.js";
 
 export interface PreloadedSkill {
@@ -43,33 +39,18 @@ export interface SkillMeta {
   content?: string;
 }
 
-/**
- * Load all skills in correct precedence order.
- *
- * Precedence (first match wins by name):
- *   1. Ancestor .agents/skills directories (cwd → git root)
- *   2. ~/.agents/skills
- *   3. Pi defaults: ~/.pi/agent/skills, <cwd>/.pi/skills
- *
- * Deduplication: by canonical path (symlink dedup) and by name (first match wins).
- */
+/** Load all skills in precedence order, deduped by canonical path and name (first match wins). */
 export function loadAllSkills(cwd: string): Skill[] {
   const resolvedCwd = resolve(cwd);
 
-  // Ancestor .agents/skills (highest precedence)
   const ancestorsSkills = loadAncestorAgentsSkills(resolvedCwd);
 
-  // ~/.agents/skills
   const homeAgentsResult = loadSkillsFromDir({
     dir: join(homedir(), ".agents", "skills"),
     source: "agents",
   });
-  const homeAgentsSkills = filterRootMdFiles(
-    homeAgentsResult.skills,
-    join(homedir(), ".agents", "skills"),
-  );
+  const homeAgentsSkills = filterRootMdFiles(homeAgentsResult.skills, join(homedir(), ".agents", "skills"));
 
-  // Pi defaults: ~/.pi/agent/skills and <cwd>/.pi/skills
   const defaultsResult = loadSkills({
     cwd: resolvedCwd,
     agentDir: join(homedir(), ".pi", "agent"),
@@ -135,14 +116,13 @@ function filterRootMdFiles(skills: Skill[], skillsRoot: string): Skill[] {
   });
 }
 
-/** Walk up from dir to find the git root (directory containing .git). */
 function findGitRoot(dir: string): string {
   let current = resolve(dir);
   while (true) {
-    try {
-      const entries = readdirSync(current);
-      if (entries.includes(".git")) return current;
-    } catch { /* ignore */ }
+    // One constant-time existence probe per level; no directory listing.
+    // existsSync never throws (EACCES → false), so unreadable ancestors
+    // are skipped exactly like the old readdirSync catch-and-continue.
+    if (existsSync(join(current, ".git"))) return current;
     const parent = resolve(current, "..");
     if (parent === current) return current; // filesystem root
     current = parent;
@@ -151,7 +131,11 @@ function findGitRoot(dir: string): string {
 
 /** Resolve path to canonical form, following symlinks. Falls back to raw path. */
 function canonicalizePath(filePath: string): string {
-  try { return realpathSync(filePath); } catch { return filePath; }
+  try {
+    return realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
 }
 
 export function preloadSkills(skillNames: string[], cwd: string): PreloadedSkill[] {
@@ -162,12 +146,20 @@ export function preloadSkills(skillNames: string[], cwd: string): PreloadedSkill
     }
     const match = skills.find((s) => s.name === name);
     if (!match) {
-      return { name, description: "", content: `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)` };
+      return {
+        name,
+        description: "",
+        content: `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)`,
+      };
     }
     try {
       return { name, description: match.description, content: readFileSync(match.filePath, "utf-8").trim() };
     } catch {
-      return { name, description: "", content: `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)` };
+      return {
+        name,
+        description: "",
+        content: `(Skill "${name}" not found in .pi/skills/, .agents/skills/, or global skill locations)`,
+      };
     }
   });
 }
@@ -191,5 +183,3 @@ export function loadSkillMeta(skillNames: string[], cwd: string): SkillMeta[] {
     };
   });
 }
-
-

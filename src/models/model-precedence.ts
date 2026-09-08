@@ -4,19 +4,19 @@
  * Pure function — no side effects, no file I/O, no pi SDK imports.
  *
  * Precedence chain (highest to lowest):
- *   1. sessionOverrides[subagentType]  (session per-type override, /agents menu)
- *   2. sessionOverrides["default"]     (session global default)
- *   3. config.agent[subagentType]      (config per-type override)
- *   4. config.agent["default"]         (config global default)
- *   5. explicitModel                 (per-call `model` param from the parent)
- *   6. ambientOverrides[subagentType]  (session ambient route, /pool)
- *   7. ambientOverrides["default"]     (session ambient default)
- *   8. modelAgents[parent model ID]  (exact-parent map, per-type then default)
- *   9. providerAgents[parent provider] (provider-follow map, per-type then default)
- *  10. agentConfig?.model            (agent config / frontmatter)
- *  11. parentModelId                 (inherit from parent)
+ *   1. sessionOverrides[subagentType]   (session per-type override, /agents menu)
+ *   2. sessionOverrides["default"]      (session global default)
+ *   3. config.agent[subagentType]       (config per-type override)
+ *   4. config.agent["default"]          (config global default)
+ *   5. explicitModel                    (per-call `model` param from the parent)
+ *   6. ambientOverrides[subagentType]   (session ambient route, /pool)
+ *   7. ambientOverrides["default"]      (session ambient default)
+ *   8. modelAgents[parent model ID]     (exact-parent map, per-type then default)
+ *   9. providerAgents[parent provider]  (provider-follow map, per-type then default)
+ *  10. agentConfig?.model               (agent config / frontmatter)
+ *  11. parentModelId                    (inherit from parent)
  *
- * Tiers 5–9 are the Don-fork additions: an explicit per-call model wins over
+ * Tiers 5-9 are the Don-fork additions: an explicit per-call model wins over
  * both maps and frontmatter (so targeted overrides like a Luna trial work),
  * while exact parent-model routes take precedence over provider routes. All
  * maps still lose to user-set session/config pins.
@@ -34,6 +34,7 @@
 
 import type { ThinkingLevel } from "../types.js";
 import type { SystemPromptMode } from "../agents/types.js";
+import type { ModelThinkingPlacement } from "../config/types.js";
 import { parseThinkingLevel } from "../utils.js";
 
 /**
@@ -51,9 +52,15 @@ export interface SubagentsConfig {
     forceBackground: boolean;
     graceTurns?: number;
     showCost?: boolean;
+    /** Stop an agent when a single tool call runs longer than this (minutes). 0 disables. Default: 45. */
+    toolTimeoutMinutes?: number;
+    /** Stop an agent showing no activity (tool events, streamed text) for this long (minutes). 0 disables. Default: 45. */
+    idleTimeoutMinutes?: number;
     widgetMaxLines?: number;
     widgetMaxLinesCompact?: number;
     widgetCompact?: boolean;
+    /** Show background completion cards in the TUI. Default: true. */
+    showCompletionCards?: boolean;
     widgetShortcut?: boolean;
     /** System prompt mode: replace (default), inherit parent, or custom file. */
     systemPromptMode?: SystemPromptMode;
@@ -69,7 +76,9 @@ export interface SubagentsConfig {
     loadExtensionsImplicitly?: boolean;
     /** When true, skip built-in default agents (general-purpose, Explore) at registration. */
     disableDefaultAgents?: boolean;
-    /** Whether to show toolUses count in widget stats line. Default: true. */
+    /** When true, use strict-mode schema for the Agent tool. Costs more tokens due to nullable field encoding. */
+    agentToolStrictMode?: boolean;
+    /** Whether to show toolUses count in widget stats line. Default: false. */
     showTools?: boolean;
     /** Whether to show turn count in widget stats line. Default: true. */
     showTurns?: boolean;
@@ -81,12 +90,23 @@ export interface SubagentsConfig {
     showContext?: boolean;
     /** Whether to show elapsed time in widget stats line. Default: true. */
     showTime?: boolean;
-    /** Max description length in widget full mode. Default: 50. */
-    widgetDescLengthFull?: number;
-    /** Max description length in widget compact mode. Default: 30. */
-    widgetDescLengthCompact?: number;
+    /** Whether to stream the agent transcript to the output file. Default: false. */
+    outputTranscript?: boolean;
+    /** When true, agent colors (spinner, status icons, picker bullets) are enabled. Default: true. */
+    showAgentColors?: boolean;
+
     /** When > 0, thinking deltas stream to output file during message_update events. Default: 0 (disabled). */
     outputThinkingBufferSize?: number;
+    /** Minutes to retain finished agents in the widget. Default: 1. */
+    finishedRetentionMinutes?: number;
+    /** Max settled agents the AgentStatus tool lists. 0 or absent = auto: 2 × default concurrency. */
+    agentStatusLimit?: number;
+    /** How to display the model label: short ID or full name. Default: 'name'. */
+    modelDisplayStyle?: "id" | "name";
+    /** Where model/thinking appears in full mode: 'header' (1st line) or 'metadata' (2nd line). Default: 'header'. */
+    modelThinkingPlacement?: ModelThinkingPlacement;
+    /** Status bar format: 'full' (default) or 'compact'. */
+    statusBarFormat?: "full" | "compact";
     [agentType: string]: string | null | undefined | boolean | number;
   };
   concurrency: {
@@ -95,7 +115,7 @@ export interface SubagentsConfig {
     models?: Record<string, number>;
   };
   /**
-   * Provider-follow map: orchestrator (parent) provider → per-agent-type
+   * Don fork: provider-follow map. Orchestrator (parent) provider -> per-agent-type
    * entries, with "default" as the within-provider fallback. Lets the whole
    * cast follow when the orchestrator switches provider, without editing
    * frontmatter. Thinking in an entry applies only when that entry supplied
@@ -103,7 +123,7 @@ export interface SubagentsConfig {
    */
   providerAgents?: Record<string, Record<string, ProviderAgentEntry>>;
   /**
-   * Exact-parent model map: full parent `provider/model` key → per-agent-type
+   * Don fork: exact-parent model map. Full parent `provider/model` key -> per-agent-type
    * entries, with "default" as the within-model fallback. Checked before
    * providerAgents so a deliberate parent-model route can specialize a cast
    * without changing the broader provider default.
@@ -124,8 +144,7 @@ export interface SubagentsConfig {
 }
 
 /**
- * Shape of session-only model overrides.
- * Same as config.agent but without the forceBackground flag.
+ * Session-only model overrides: "default" plus per-agent-type entries.
  * Not persisted — cleared on session_start.
  */
 export interface SessionModelOverrides {
@@ -133,23 +152,38 @@ export interface SessionModelOverrides {
   [agentType: string]: string | null | undefined;
 }
 
-/** Options for resolveModel. */
 export interface ResolveModelOptions {
   /** The type of subagent being spawned. */
   subagentType: string;
   /** The agent's config (from .md frontmatter or defaults). */
   agentConfig?: { model?: string };
-  /** The global subagents-lite.json config (model overrides). */
-  config: SubagentsConfig;
+  /** The subagents-lite.json config (model overrides); the agent section plus the Don-fork routing maps. */
+  config: Pick<SubagentsConfig, "agent"> & Partial<Pick<SubagentsConfig, "modelAgents" | "providerAgents">>;
   /** The parent agent's model ID (final fallback). */
   parentModelId: string;
   /** Session-only overrides (checked first). */
   sessionOverrides?: SessionModelOverrides;
-  /** Ambient session routes from /pool. Below explicitModel on purpose. */
+  /** Don fork: ambient session routes from /pool. Below explicitModel on purpose. */
   ambientOverrides?: SessionModelOverrides;
-  /** Explicit per-call `model` param from the parent's Agent tool call. */
+  /** Don fork: explicit per-call `model` param from the parent's Agent tool call. */
   explicitModel?: string;
 }
+
+/** Which chain position won resolution (see resolveModelSource). */
+export type ModelSource =
+  | "session-per-type"
+  | "session-default"
+  | "config-per-type"
+  | "config-default"
+  | "explicit"
+  | "ambient-per-type"
+  | "ambient-default"
+  | "model-map-per-type"
+  | "model-map-default"
+  | "provider-map-per-type"
+  | "provider-map-default"
+  | "frontmatter"
+  | "parent";
 
 /** Extract the provider segment from a "provider/model" key, if present. */
 export function providerOf(modelKey: string | null | undefined): string | undefined {
@@ -161,6 +195,7 @@ export function providerOf(modelKey: string | null | undefined): string | undefi
 /** A resolved spawn: the model plus any settings that traveled with it. */
 export interface ResolvedSpawn {
   model: string;
+  source: ModelSource;
   /** Set only when the winning tier was a follow-map entry carrying thinking. */
   thinking?: ThinkingLevel;
 }
@@ -184,21 +219,27 @@ function normalizeEntry(
 }
 
 /**
- * Resolve the model for a subagent invocation.
+ * Resolve the model for a subagent invocation and report which chain
+ * position won. resolveModel() is the model-only projection; callers that
+ * need the winning layer (the Model settings menu's provenance tags) use
+ * this instead of re-deriving precedence from the inputs.
  *
  * Returns the first non-null, non-undefined, non-empty-string value
- * from the precedence chain. If all are empty/null, returns parentModelId.
+ * from the precedence chain; parentModelId (always valid) is the final
+ * fallback.
  */
-export function resolveModel(options: ResolveModelOptions): string {
-  return resolveSpawn(options).model;
+export function resolveModelSource(options: ResolveModelOptions): { model: string; source: ModelSource } {
+  const { model, source } = resolveSpawn(options);
+  return { model, source };
 }
 
 /**
  * Resolve the model AND the settings that travel with it. Same precedence as
- * resolveModel; thinking is populated only when a follow-map entry won.
+ * resolveModelSource; thinking is populated only when a follow-map entry won.
  */
 export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
-  const { subagentType, agentConfig, config, parentModelId, sessionOverrides, ambientOverrides, explicitModel } = options;
+  const { subagentType, agentConfig, config, parentModelId, sessionOverrides, ambientOverrides, explicitModel } =
+    options;
 
   const parentProvider = providerOf(parentModelId);
   const modelMap = parentModelId ? config.modelAgents?.[parentModelId] : undefined;
@@ -208,33 +249,59 @@ export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
   const providerTypedEntry = normalizeEntry(providerMap?.[subagentType]);
   const providerDefaultEntry = normalizeEntry(providerMap?.["default"]);
 
-  // Precedence: session > config > per-call > exact model map > provider map > frontmatter > parent
   // Cast agent values: index signature includes number (graceTurns), but models are always strings
-  const candidates: Array<{ model: string | boolean | null | undefined; thinking?: ThinkingLevel }> = [
-    { model: sessionOverrides?.[subagentType] },
-    { model: sessionOverrides?.["default"] },
-    { model: config.agent[subagentType] as string | null | undefined },
-    { model: config.agent["default"] },
-    { model: explicitModel },
-    { model: ambientOverrides?.[subagentType] },
-    { model: ambientOverrides?.["default"] },
-    { model: exactTypedEntry?.model, thinking: exactTypedEntry?.thinking },
-    { model: exactDefaultEntry?.model, thinking: exactDefaultEntry?.thinking },
-    { model: providerTypedEntry?.model, thinking: providerTypedEntry?.thinking },
-    { model: providerDefaultEntry?.model, thinking: providerDefaultEntry?.thinking },
-    { model: agentConfig?.model },
-    { model: parentModelId }, // final fallback (always a valid string)
+  const candidates: Array<{ source: ModelSource; model: string | null | undefined; thinking?: ThinkingLevel }> = [
+    // Order IS the routing contract. Three requirements meet here, and taken
+    // literally they form a cycle, so read the resolution before reordering:
+    //
+    //   a. A config per-type pin beats an explicit per-call model. Deliberate
+    //      per-agent routing outranks a caller's argument.
+    //   b. An explicit per-call model beats the ambient session route, so an
+    //      escalation still wins after a /pool switch.
+    //   c. The ambient route must beat the config DEFAULT. Otherwise setting a
+    //      default once through the /agents menu writes agent.default and turns
+    //      every later session-scoped /pool switch into a silent no-op, while
+    //      the bridge still reports the pool model as active.
+    //
+    // a + b + c cannot all hold if config is one tier, so config is split. The
+    // per-type pin keeps its authority above explicit; the generic default
+    // drops below the ambient route.
+    //
+    // KNOWN LIMIT: a config per-type pin still outranks the ambient route, so a
+    // /pool switch does not move an agent that carries its own per-type pin.
+    // That is the cost of requirement (a). It is visible in /agents, unlike the
+    // default case, which was invisible.
+    { source: "session-per-type", model: sessionOverrides?.[subagentType] },
+    { source: "session-default", model: sessionOverrides?.["default"] },
+    { source: "config-per-type", model: config.agent[subagentType] as string | null | undefined },
+    { source: "explicit", model: explicitModel },
+    { source: "ambient-per-type", model: ambientOverrides?.[subagentType] },
+    { source: "ambient-default", model: ambientOverrides?.["default"] },
+    { source: "config-default", model: config.agent["default"] },
+    { source: "model-map-per-type", model: exactTypedEntry?.model, thinking: exactTypedEntry?.thinking },
+    { source: "model-map-default", model: exactDefaultEntry?.model, thinking: exactDefaultEntry?.thinking },
+    { source: "provider-map-per-type", model: providerTypedEntry?.model, thinking: providerTypedEntry?.thinking },
+    { source: "provider-map-default", model: providerDefaultEntry?.model, thinking: providerDefaultEntry?.thinking },
+    { source: "frontmatter", model: agentConfig?.model },
   ];
-  const winner = candidates.find((c) => isValidValue(c.model));
-  return winner
-    ? { model: winner.model as string, thinking: winner.thinking }
-    : { model: parentModelId };
+  for (const candidate of candidates) {
+    if (isValidModelValue(candidate.model)) {
+      return { model: candidate.model, source: candidate.source, thinking: candidate.thinking };
+    }
+  }
+  // Parent model id is the final fallback (always a valid string).
+  return { model: parentModelId, source: "parent" };
 }
 
 /**
- * Check if a value is a valid non-empty model string.
- * Returns true for non-null, non-undefined, non-empty strings.
+ * Resolve the model for a subagent invocation — model-only projection of
+ * resolveModelSource() for callers that do not need the winning source.
  */
-function isValidValue(value: string | boolean | null | undefined): value is string {
+export function resolveModel(options: ResolveModelOptions): string {
+  return resolveSpawn(options).model;
+}
+
+/** True when the value is a usable model string (null/undefined/empty are unset). */
+export function isValidModelValue(value: string | null | undefined): value is string {
   return typeof value === "string" && value.length > 0;
 }

@@ -1,152 +1,197 @@
-import { Type } from "@sinclair/typebox";
+import { Type, type TSchema } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { getAvailableTypes } from "./agents/agent-types.js";
 import { executeAgentTool, executeStopAgentTool } from "./agents/tool-execution.js";
 import { executeAgentStatusTool } from "./agents/agent-status.js";
-import { renderAgentToolCall, renderAgentToolResult, renderSubagentResult } from "./ui/renderer.js";
+import {
+  renderAgentToolCall,
+  renderAgentToolResult,
+  renderSubagentResult,
+  registerAgentInvalidation,
+} from "./ui/renderer.js";
 import { showAgentsMainMenu } from "./ui/menu/menus.js";
-import { getPiInstance, getStore } from "./shell.js";
-import { emitLifecycle, lifecycleEnabled } from "./benchmark-lifecycle.js";
+import { getStore } from "./shell.js";
 
-// ============================================================================
-// Agent tool registration helper — dynamic enum for agent types
-// ============================================================================
+// Provider-side json_schema enforcement; "prefer" falls back gracefully on
+// providers without strict mode (e.g. local Ollama).
+const CONSTRAINED_SAMPLING = { type: "json_schema", strict: "prefer" };
+
+// --- Agent tool registration — dynamic enum for agent types ---
 
 /**
  * Register (or re-register) the Agent tool with current agent types.
- * At init time only defaults exist; call again from session_start after
- * user/project agents are loaded to update the enum.
+ * Call again from session_start after user/project agents load.
  */
-type RegistryForDescription = {
-  getAvailable(): Array<{ provider: string; id: string }>;
-  hasConfiguredAuth?(model: { provider: string; id: string }): boolean;
-};
-
-export function registerAgentTool(pi: ExtensionAPI, ctx?: { modelRegistry?: RegistryForDescription }): void {
+export function registerAgentTool(pi: ExtensionAPI): void {
   const types = getAvailableTypes();
-  // Don fork: the model param used to be an undocumented bare string, so a
-  // constrained orchestrator guessed keys ("terra", "gpt-5.4", "default") and
-  // burned a turn per guess on a non-retryable error. Publish the format and
-  // the live registry keys in the schema instead.
-  const modelParam = Type.Optional(Type.String({ description: buildModelParamDescription(ctx) }));
-  // Use plain string to avoid verbose anyOf in prompt.
-  // Available types are listed in description for discoverability.
-  const agentParam = types.length > 0
-    ? Type.Optional(Type.String({ description: types.join(",") }))
-    : Type.Optional(Type.String());
-  // @ts-expect-error — description removed to save prompt tokens
-  pi.registerTool({
+  const useConstrained = getStore().agent.agentToolStrictMode;
+
+  // Plain string (not anyOf) keeps the prompt concise; types listed in description for discoverability.
+  const agentType = types.length > 0 ? Type.String({ description: types.join(",") }) : Type.String();
+
+  // Constrained sampling (strict mode) requires every property in `required`,
+  // so optional fields become nullable unions instead of Type.Optional.
+  const optional = <T extends TSchema>(base: T) =>
+    useConstrained ? Type.Union([base, Type.Null()]) : Type.Optional(base);
+
+  const params = Type.Object(
+    {
+      prompt: Type.String(),
+      description: optional(Type.String()),
+      agent: optional(agentType),
+      run_in_background: optional(Type.Boolean()),
+      worktree_path: optional(Type.String()),
+      // Don fork: optional named, resumable child session. The schema rejects a
+      // whitespace-only placeholder before execution; one-shot calls omit it.
+      session_key: optional(
+        Type.String({
+          minLength: 1,
+          pattern: ".*\\S.*",
+          description:
+            "Optional persistent-session key. If unused, omit this field. Must contain a non-whitespace " +
+            "character and is mutually exclusive with a non-empty worktree_path.",
+        }),
+      ),
+      // Don fork: per-call overrides. execute() has always read these, but they
+      // were absent from the schema, so a constrained provider could never emit
+      // them and the per-call model contract was unreachable.
+      model: optional(Type.String()),
+      thinking: optional(Type.String()),
+      max_turns: optional(Type.Number()),
+    },
+    useConstrained
+      ? {
+          additionalProperties: false,
+          required: [
+            "prompt",
+            "description",
+            "agent",
+            "run_in_background",
+            "worktree_path",
+            "session_key",
+            "model",
+            "thinking",
+            "max_turns",
+          ],
+        }
+      : { additionalProperties: false },
+  );
+
+  const tool = {
     name: "Agent",
     label: "Agent",
-    parameters: Type.Object({
-      prompt: Type.String(),
-      description: Type.Optional(Type.String()),
-      agent: agentParam,
-      run_in_background: Type.Optional(Type.Boolean()),
-      worktree_path: Type.Optional(Type.String({ description: "Path to a separate git worktree of this repo. Omit it for normal work, including work in the current directory. Never send the parent working directory, and never send it with session_key." })),
-      // Don fork: optional named, resumable child-session executor. The schema
-      // rejects empty/whitespace placeholders before execution; one-shot
-      // reviewer calls should omit session_key entirely.
-      session_key: Type.Optional(Type.String({ minLength: 1, pattern: ".*\\S.*", description: "Optional persistent-session key. If unused, omit this field. Must contain a non-whitespace character and is mutually exclusive with a non-empty worktree_path." })),
-      // Don fork: per-call overrides. These were always read by the executor
-      // but absent from the schema, so constrained providers could never emit
-      // them. model: "provider/model-id"; thinking: off..max.
-      model: modelParam,
-      thinking: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh|max" })),
-      max_turns: Type.Optional(Type.Number()),
-    }),
+    parameters: params,
     execute: executeAgentTool,
+    ...(useConstrained ? { constrainedSampling: CONSTRAINED_SAMPLING } : {}),
 
-    renderCall: (args, theme) => renderAgentToolCall(args as Record<string, unknown>, theme),
+    renderCall: (
+      args: Record<string, unknown>,
+      theme: any,
+      context?: { state?: Record<string, unknown>; toolCallId?: string },
+    ) => renderAgentToolCall(args, theme, context),
 
-    renderResult: (result, options, theme) => {
-      const showCost = getStore().agent.showCost;
+    renderResult: (
+      result: { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown> },
+      options: { expanded?: boolean },
+      theme: any,
+      context: {
+        isError?: boolean;
+        invalidate?: () => void;
+        state?: Record<string, unknown>;
+        executionStarted?: boolean;
+      },
+    ) => {
+      const isError = context?.isError ?? false;
+      const store = getStore();
+      const agentId = result.details?.agentId as string | undefined;
+      // Register invalidate callback so onComplete can trigger a re-render
+      if (agentId && context?.invalidate) {
+        registerAgentInvalidation(agentId, context.invalidate);
+        // Store agentId and background flag in context state so call renderer can access it on re-render
+        if (context.state) {
+          context.state.agentId = agentId;
+          context.state.isBackground = true;
+        }
+      }
       return renderAgentToolResult(
-        result as { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown>; isError?: boolean },
-        options as { expanded?: boolean },
+        { ...result, isError },
+        options,
         theme,
-        showCost,
+        store.agent.showCost,
+        store.agent.modelDisplayStyle,
+        context,
       );
     },
-  });
+  };
+  // @ts-expect-error — description removed to save prompt tokens
+  pi.registerTool(tool);
 }
 
-/** Format hint plus the live registry keys, capped to stay prompt-cheap. */
-function buildModelParamDescription(ctx?: { modelRegistry?: RegistryForDescription }): string {
-  const base = 'Model as "provider/model-id" or "provider/model-id:thinking". "default" inherits the parent model.';
-  let keys: string[] = [];
-  try {
-    const registry = ctx?.modelRegistry;
-    const entries = registry?.getAvailable() ?? [];
-    // The list is a menu, not an inventory: show the providers Don actually
-    // uses first (providerPreference), then any authenticated provider.
-    const preference = getStore().providerPreference;
-    const rank = (m: { provider: string; id: string }): number => {
-      const idx = preference.indexOf(m.provider);
-      if (idx >= 0) return idx;
-      return registry?.hasConfiguredAuth?.(m) ? preference.length : preference.length + 1;
-    };
-    keys = entries
-      .map((entry, index) => ({ entry, index }))
-      .sort((a, b) => rank(a.entry) - rank(b.entry) || a.index - b.index)
-      .map(({ entry }) => `${entry.provider}/${entry.id}`);
-  } catch {
-    keys = [];
-  }
-  if (keys.length === 0) return base;
-  const listed = keys.slice(0, MODEL_DESCRIPTION_LIMIT);
-  const suffix = keys.length > listed.length ? `, ... (${keys.length} total)` : "";
-  return `${base} Available: ${listed.join(", ")}${suffix}`;
-}
+// --- Tool/Command/Message registration ---
 
-const MODEL_DESCRIPTION_LIMIT = 24;
-
-// ============================================================================
-// Tool/Command/Message registration
-// ============================================================================
-
-/** Register all tools, commands, and message renderers. */
 export function registerTools(pi: ExtensionAPI): void {
-  if (lifecycleEnabled()) emitLifecycle("extension_loaded", { extension: "pi-subagents-lite" });
-  // Agent tool — stealth schema with dynamic agent type enum
   registerAgentTool(pi);
 
-  // StopAgent tool — stealth schema, stop a running agent by ID
-  // @ts-expect-error — description removed to save prompt tokens
-  pi.registerTool({
+  const stopAgentTool = {
     name: "StopAgent",
     label: "StopAgent",
-    parameters: Type.Object({
-      agent_id: Type.String(),
-    }),
+    parameters: Type.Object(
+      {
+        agent_id: Type.String(),
+      },
+      { additionalProperties: false },
+    ),
     execute: executeStopAgentTool,
-  });
-
-  // AgentStatus tool — stealth schema, list all agents and their statuses
+    constrainedSampling: CONSTRAINED_SAMPLING,
+    renderResult: (
+      result: { content: Array<{ type: string; text?: string }> },
+      _options: { expanded?: boolean },
+      theme: any,
+      context: { isError?: boolean },
+    ) => {
+      const isError = context?.isError ?? false;
+      const text = result.content[0]?.type === "text" ? (result.content[0].text ?? "") : "";
+      const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      return new Text(`${icon} ${text}`, 0, 0);
+    },
+  };
   // @ts-expect-error — description removed to save prompt tokens
-  pi.registerTool({
+  pi.registerTool(stopAgentTool);
+
+  const agentStatusTool = {
     name: "AgentStatus",
     label: "AgentStatus",
-    parameters: Type.Object({}),
+    parameters: Type.Object({}, { additionalProperties: false }),
     execute: executeAgentStatusTool,
-  });
+    constrainedSampling: CONSTRAINED_SAMPLING,
+  };
+  // @ts-expect-error — description removed to save prompt tokens
+  pi.registerTool(agentStatusTool);
 
   // Message renderer — subagent-result (background agent completion)
   pi.registerMessageRenderer("subagent-result", (message, options, theme) => {
-    const showCost = getStore().agent.showCost;
+    const store = getStore();
     return renderSubagentResult(
       message as { content?: string; details?: Record<string, unknown> },
       options as { expanded?: boolean },
       theme,
-      showCost,
+      store.agent.showCost,
+      store.agent.modelDisplayStyle,
+      !store.agent.showCompletionCards,
     );
   });
 
-  // Command registration
   pi.registerCommand("agents", {
     description: "Manage subagents: agent briefing, model settings, concurrency, running agents, agent types",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      const modelOptions = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+      // ctx.scopedModels added in pi 0.83.0 — session-scoped model list from --models / enabledModels.
+      // Empty array means no scoping (all models usable). Undefined on pi < 0.83.
+      const scoped = (ctx as any).scopedModels as
+        ReadonlyArray<{ model: { provider: string; id: string } }> | undefined;
+      const modelOptions = scoped?.length
+        ? scoped.map((s) => `${s.model.provider}/${s.model.id}`)
+        : ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
       await showAgentsMainMenu(ctx, modelOptions);
     },
   });

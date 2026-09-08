@@ -5,24 +5,56 @@
  * the UI layer. Previously scattered across agent-widget.ts, output-file.ts,
  * and agent-types.ts by historical accident.
  *
- * Pure functions — no module-level state, no side effects.
+ * Display formatting helpers with minimal runtime dependencies (config store, agent registry).
+ *
+ * Color-gated functions use applyAgentColor to check the showAgentColors toggle
+ * via getStore() and disable agent-specific coloring globally.
  */
 
-import { getConfig } from "../agents/agent-types.js";
-import type { SubagentType } from "../agents/types.js";
+import { getAgentConfig } from "../agents/agent-types.js";
+import { agentLogHint } from "./log-link.js";
+import { agentColorAnsi } from "../agent-color.js";
+import { getStore } from "../shell.js";
+import type { SubagentType, AgentInvocation } from "../agents/types.js";
+import type { AgentRecord, AgentStatus } from "../types.js";
 import type { Theme } from "./types.js";
 import { formatTokens, formatCost } from "../agents/usage.js";
+import type { ModelThinkingPlacement } from "../config/types.js";
 
-/** Truncate a description string to `maxLen` characters, appending "..." if truncated. */
-export function truncateDesc(text: string, maxLen: number): string {
-  return text.length > maxLen ? text.slice(0, maxLen - 3) + "..." : text;
+// ---- Agent color toggle ----
+
+/** Wrap text with an agent's ANSI color when showAgentColors is ON and a color is available.
+ * @param text the text to wrap
+ * @param ansiColor raw ANSI foreground code from agentColorAnsi()
+ * @param fallback called when colors are off or no agent color is configured
+ */
+export function applyAgentColor(text: string, ansiColor: string, fallback: () => string): string {
+  if (!getStore().agent.showAgentColors) return fallback();
+  return ansiColor ? `${ansiColor}${text}\u001b[39m` : fallback();
 }
 
-/** Max length for a truncated command in tool arg summaries. */
-const MAX_COMMAND_DISPLAY_LENGTH = 100;
+// ---- Status icons ----
 
-/** Max length for a truncated string value in default tool arg summaries. */
-const MAX_DEFAULT_STRING_DISPLAY_LENGTH = 200;
+/** Single source of truth for per-agent status icons, shared by the tool call lines,
+ * the subagent status widget, and the conversation viewer. */
+const STATUS_ICON: Record<AgentStatus, { icon: string; color: "accent" | "success" | "warning" | "error" | "dim" }> = {
+  queued: { icon: "◆", color: "accent" },
+  running: { icon: "◈", color: "accent" },
+  completed: { icon: "✓", color: "success" },
+  turn_limited: { icon: "✓", color: "warning" },
+  error: { icon: "✗", color: "error" },
+  aborted: { icon: "✗", color: "error" },
+  stopped: { icon: "■", color: "dim" },
+};
+
+/** Colored icon for an agent status, or a plain ▸ when no status is known yet.
+ * When agentType has a configured color, the icon is tinted with that color
+ * instead of the theme's status color. */
+export function statusIcon(status: string | undefined, theme: Theme, agentType?: string): string {
+  const entry = STATUS_ICON[status as AgentStatus];
+  if (!entry) return "▸";
+  return applyAgentColor(entry.icon, agentColorAnsi(agentType), () => theme.fg(entry.color, entry.icon));
+}
 
 // ---- Internal helpers (used by buildStatsParts) ----
 
@@ -36,7 +68,7 @@ const MAX_DEFAULT_STRING_DISPLAY_LENGTH = 200;
  *   "↑12k↓8k ↻ 2"                 — compactions only (e.g. right after compact)
  *   "↑12k↓8k 45% ↻ 2"             — both
  */
-function formatSessionTokens(
+export function formatSessionTokens(
   inputTokens: number,
   outputTokens: number,
   percent: number | null,
@@ -97,14 +129,13 @@ export interface StatsVisibility {
   showContext?: boolean;
   showCost?: boolean;
   showTime?: boolean;
+  showModel?: boolean;
+  showThinking?: boolean;
 }
 
 /**
  * Build common stats parts: toolUses · turns · input↓ output with context % · cost · time.
- * Shared by AgentWidget and index.ts for consistent stats display.
- *
- * @param visible - Optional visibility flags. All default to true for backward compatibility.
- * @param durationMs - Optional duration in ms. When provided and showTime is not false, appends formatted time.
+ * Shared by the widget, viewer, and renderer for consistent stats display.
  */
 export function buildStatsParts(
   args: {
@@ -122,20 +153,24 @@ export function buildStatsParts(
   visible?: StatsVisibility,
 ): string[] {
   const parts: string[] = [];
-  if (visible?.showTools !== false && args.toolUses > 0) parts.push(`${args.toolUses}🛠 `);
-  if (visible?.showTurns !== false && args.turnCount != null) parts.push(formatTurns(args.turnCount, args.maxTurns, theme));
+  if (visible?.showTools !== false && args.toolUses > 0) parts.push(`${args.toolUses}⚒ `);
+  if (visible?.showTurns !== false && args.turnCount != null)
+    parts.push(formatTurns(args.turnCount, args.maxTurns, theme));
   if (visible?.showInput !== false || visible?.showOutput !== false) {
     const showIn = visible?.showInput !== false;
     const showOut = visible?.showOutput !== false;
     const inputTokens = showIn ? args.input : 0;
     const outputTokens = showOut ? args.output : 0;
     if (inputTokens > 0 || outputTokens > 0) {
-      parts.push(formatSessionTokens(
-        inputTokens, outputTokens,
-        visible?.showContext !== false ? args.contextPercent : null,
-        theme,
-        visible?.showContext !== false ? args.compactions : 0,
-      ));
+      parts.push(
+        formatSessionTokens(
+          inputTokens,
+          outputTokens,
+          visible?.showContext !== false ? args.contextPercent : null,
+          theme,
+          visible?.showContext !== false ? args.compactions : 0,
+        ),
+      );
     }
   }
   if (visible?.showCost !== false && args.cost != null && args.cost > 0) parts.push(formatCost(args.cost));
@@ -145,67 +180,159 @@ export function buildStatsParts(
 
 /** Get display name for any agent type (built-in or custom). */
 export function getDisplayName(type: SubagentType): string {
-  return getConfig(type).displayName;
+  const config = getAgentConfig(type);
+  return config?.displayName ?? config?.name ?? "Agent";
 }
 
-/**
- * Summarize tool arguments for log-friendly display.
- *
- * Heavy tools (read, write, edit, bash, grep, rg) get compact summaries.
- * Other tools fall back to the default JSON formatting.
- */
-export function summarizeToolArgs(name: string, rawArgs: Record<string, unknown> | undefined): string {
-  if (!rawArgs || typeof rawArgs !== "object" || Object.keys(rawArgs).length === 0) return "";
+/** Colored bullet prefix for agent names in pickers/menus.
+ * Returns "• " with agent color when showAgentColors is ON and agent has a configured color,
+ * or empty string when colors are off or agent has no color. */
+export function agentBulletPrefix(agentType: string | undefined): string {
+  const bullet = applyAgentColor("•", agentColorAnsi(agentType), () => "");
+  return bullet ? `${bullet} ` : "";
+}
 
-  switch (name) {
-    case "read": {
-      // read("/path/to/file") — just the path
-      const path = typeof rawArgs.path === "string" ? rawArgs.path : "";
-      return `(${JSON.stringify(path)})`;
+/** Wrap text with agent color when showAgentColors is ON and agent has a configured color.
+ * Returns plain text when colors are off, agent has no color, or agentType is undefined. */
+export function agentColoredText(text: string, agentType: string | undefined): string {
+  return applyAgentColor(text, agentColorAnsi(agentType), () => text);
+}
+
+/** Tool name to human-readable action for activity descriptions. */
+const TOOL_DISPLAY: Record<string, string> = {
+  read: "reading",
+  bash: "running command",
+  edit: "editing",
+  write: "writing",
+  grep: "searching",
+  rg: "searching",
+  find: "searching",
+};
+
+export function describeActivity(activeTools: Map<string, string>, responseText?: string): string {
+  if (activeTools.size > 0) {
+    const groups = new Map<string, number>();
+    for (const toolName of activeTools.values()) {
+      const action = TOOL_DISPLAY[toolName] ?? toolName;
+      groups.set(action, (groups.get(action) ?? 0) + 1);
     }
-    case "write": {
-      // write("/path/to/file", <N> chars) — path + content size
-      const path = typeof rawArgs.file_path === "string" ? rawArgs.file_path : "";
-      const content = rawArgs.content;
-      const size = typeof content === "string" ? content.length : 0;
-      return `(${JSON.stringify(path)}, ${size} chars)`;
-    }
-    case "edit": {
-      // edit("/path/to/file", <N> edits) — path + edit count
-      const path = typeof rawArgs.path === "string" ? rawArgs.path : "";
-      const edits = rawArgs.edits;
-      const editCount = Array.isArray(edits) ? edits.length : 0;
-      return `(${JSON.stringify(path)}, ${editCount} edits)`;
-    }
-    case "bash": {
-      // bash("command") — just the command, strip heredoc, truncate long
-      const cmd = typeof rawArgs.command === "string" ? rawArgs.command : "";
-      // Strip heredoc: truncate at << followed by delimiter
-      const heredocIdx = cmd.search(/<<\s*['"]?\w+['"]?/);
-      const cleanCmd = heredocIdx >= 0 ? cmd.slice(0, heredocIdx).trim() : cmd.trim();
-      // Truncate long commands
-      const display = cleanCmd.length > MAX_COMMAND_DISPLAY_LENGTH
-        ? cleanCmd.slice(0, MAX_COMMAND_DISPLAY_LENGTH) + "…" : cleanCmd;
-      return `(${JSON.stringify(display)})`;
-    }
-    case "grep":
-    case "rg": {
-      // grep("pattern", "/path") — pattern + path
-      const pattern = typeof rawArgs.pattern === "string" ? rawArgs.pattern : "";
-      const path = typeof rawArgs.path === "string" ? rawArgs.path : "";
-      return `(${JSON.stringify(pattern)}, ${JSON.stringify(path)})`;
-    }
-    default: {
-      // Default behavior for other tools: single-arg shorthand or JSON dump
-      const keys = Object.keys(rawArgs);
-      if (keys.length === 1) {
-        const val = rawArgs[keys[0]];
-        const display = typeof val === "string" && val.length > MAX_DEFAULT_STRING_DISPLAY_LENGTH
-          ? JSON.stringify(val.slice(0, MAX_DEFAULT_STRING_DISPLAY_LENGTH) + "...")
-          : JSON.stringify(val);
-        return `(${display})`;
+
+    const parts: string[] = [];
+    for (const [action, count] of groups) {
+      if (count > 1) {
+        parts.push(`${action} ${count} ${action === "searching" ? "patterns" : "files"}`);
+      } else {
+        parts.push(action);
       }
-      return ` ${JSON.stringify(rawArgs)}`;
+    }
+    return parts.join(", ") + "\u2026";
+  }
+
+  // No tools active — show first line of response text if available
+  if (responseText && responseText.trim().length > 0) {
+    const firstLine = responseText.trim().split("\n")[0] ?? "";
+    return firstLine;
+  }
+
+  return "thinking\u2026";
+}
+
+/** Apply foreground styling while restoring it after nested ANSI resets. */
+export function fgPreservingNestedStyles(theme: Theme, color: string, text: string): string {
+  const styledEmpty = theme.fg(color, "");
+  const styleStart = styledEmpty.replace(/\u001b\[(?:0|39)m/g, "");
+  return theme.fg(
+    color,
+    text.replace(/\u001b\[(?:0|39)m/g, (reset) => `${reset}${styleStart}`),
+  );
+}
+
+export function buildInvocationTags(invocation: AgentInvocation | undefined): string[] {
+  const tags: string[] = [];
+  if (!invocation) return [];
+  if (invocation.thinkingLevel) tags.push(`thinking: ${invocation.thinkingLevel}`);
+  if (invocation.runInBackground) tags.push("background");
+  if (invocation.maxTurns != null) tags.push(`max turns: ${invocation.maxTurns}`);
+  return tags;
+}
+
+/** Build the visible model/thinking parts (no parentheses) for widget display.
+ *
+ * Returns `[modelName, thinkingLevel]` (empty entries dropped), or `[]`
+ * when neither is visible or data is undefined. */
+export function buildModelThinkingParts(
+  modelName: string | undefined,
+  thinkingLevel: string | undefined,
+  visible?: StatsVisibility,
+): string[] {
+  const showModel = visible?.showModel !== false;
+  const showThinking = visible?.showThinking !== false;
+  const model = showModel ? modelName?.trim() : undefined;
+  const thinking = showThinking ? thinkingLevel?.trim() : undefined;
+  return [model, thinking].filter((p): p is string => p !== undefined && p.length > 0);
+}
+
+/** Build a parenthesized model/thinking tag for widget display.
+ *
+ * Returns `(modelName • thinkingLevel)`, one of them, or empty string
+ * when neither is visible or data is undefined. Never returns `()`. */
+export function buildModelThinkingTag(
+  modelName: string | undefined,
+  thinkingLevel: string | undefined,
+  visible?: StatsVisibility,
+): string {
+  const parts = buildModelThinkingParts(modelName, thinkingLevel, visible);
+  return parts.length > 0 ? `(${parts.join(" • ")})` : "";
+}
+
+/** Pick the model label based on display style, trimming whitespace. Returns undefined for empty. */
+export function resolveModelLabel(
+  style: "id" | "name",
+  labelName: string | undefined,
+  labelId: string | undefined,
+): string | undefined {
+  const label = style === "name" ? labelName : labelId;
+  return label?.trim() || undefined;
+}
+
+/** Resolve model label from an AgentRecord, preferring session model over invocation fallback. */
+export function resolveAgentModelLabel(a: AgentRecord, style: "id" | "name"): string | undefined {
+  const model = a.execution.session?.model;
+  if (model) return resolveModelLabel(style, model.name, model.id);
+  return a.display.invocation?.modelName?.trim() || undefined;
+}
+
+export function resolveAgentModelThinking(a: AgentRecord, style: "id" | "name"): { model?: string; thinking?: string } {
+  const model = resolveAgentModelLabel(a, style);
+  const thinking = a.execution.session?.thinkingLevel ?? a.display.invocation?.thinkingLevel;
+  return { model, thinking };
+}
+
+/** Build metadata line parts for an agent record.
+ * Model/thinking is included (bare format, no parentheses) only when
+ * modelThinkingPlacement is "metadata". With "header" placement it stays
+ * in the widget header line.
+ */
+export function buildMetadataLineParts(
+  a: AgentRecord,
+  modelDisplayStyle: "id" | "name",
+  statsVisibility?: StatsVisibility,
+  modelThinkingPlacement: ModelThinkingPlacement = "header",
+): string[] {
+  const parts: string[] = [];
+
+  if (modelThinkingPlacement === "metadata") {
+    const { model, thinking } = resolveAgentModelThinking(a, modelDisplayStyle);
+    const modelThinkingParts = buildModelThinkingParts(model, thinking, statsVisibility);
+    if (modelThinkingParts.length > 0) {
+      parts.push(modelThinkingParts.join(" • "));
     }
   }
+
+  if (a.display.worktreeLabel) parts.push(`@${a.display.worktreeLabel}`);
+
+  const logHint = agentLogHint(a.display.outputFile);
+  if (logHint) parts.push(logHint);
+
+  return parts;
 }

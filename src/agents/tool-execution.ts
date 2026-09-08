@@ -1,4 +1,4 @@
-import { getStatusNote } from "../status-note.js";
+import { getStatusNote, formatStopReason } from "../status-note.js";
 /**
  * tool-execution.ts — Agent tool execution handlers.
  *
@@ -7,105 +7,31 @@ import { getStatusNote } from "../status-note.js";
  * to spawn-coordinator.ts. buildAgentDetails stays here as a pure helper.
  */
 
-import type { ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionContext, type ToolCallEvent } from "@earendil-works/pi-coding-agent";
 
-import type { AgentRecord, ThinkingLevel } from "../types.js";
+import type { AgentRecord } from "../types.js";
 import { SHORT_ID_LENGTH } from "../types.js";
-import type { AgentConfig, SessionLifecycle } from "./types.js";
-import { resolveType, getAgentConfig, discoverNewAgents } from "./agent-types.js";
-import { getLifetimeTotal, getSessionContextPercent } from "./usage.js";
+import { resolveType, getAgentConfig, resolveTypeOrDiscover, type TypeResolution } from "./agent-types.js";
+import type { SessionLifecycle } from "./types.js";
+import { getSessionContextPercent } from "./usage.js";
 import { validateWorktreePath, isParentCwdPath } from "../spawn/worktree-validator.js";
+import { resolveSubagentTrust, createSubagentTrustDeps, untrustedProjectWarning } from "../spawn/project-trust.js";
 
 import { parseModelKey, findModelInRegistry, parseThinkingLevel, splitModelThinkingSuffix } from "../utils.js";
 import { resolveModelSpec } from "../models/model-spec.js";
-import {
-  getPiInstance,
-  getSessionCtx,
-  getStore,
-  getCoordinator,
-  getManager,
-} from "../shell.js";
+import type { ThinkingLevel } from "../types.js";
+import { getPiInstance, getSessionCtx, getStore, getCoordinator, getManager } from "../shell.js";
 
-// ============================================================================
-// Tool result helpers
-// ============================================================================
+// --- Tool result helpers ---
 
-/** Shortcut for a successful tool result. */
 function successResult(text: string, details?: Record<string, unknown>) {
   return { content: [{ type: "text", text }], details };
 }
 
-/** Shortcut for an error tool result. */
-function errorResult(text: string, details?: Record<string, unknown>) {
-  return { content: [{ type: "text", text }], isError: true as const, details };
-}
-
-const NON_RETRYABLE_VALIDATION_NOTE = "This validation error is non-retryable; do not repeat the same Agent call unchanged.";
-
-type ToolTextResult = {
-  content: Array<{ type: string; text?: string }>;
-  details?: Record<string, unknown>;
-  isError?: true;
-};
-
-function withNormalizationWarnings<T extends ToolTextResult>(result: T, warnings: string[]): T {
-  if (warnings.length === 0) return result;
-
-  const warningText = warnings.map((warning) => `[note: ${warning}]`).join("\n");
-  const firstContent = result.content[0];
-  return {
-    ...result,
-    content: firstContent?.type === "text"
-      ? [
-        { ...firstContent, text: `${warningText}\n\n${firstContent.text ?? ""}` },
-        ...result.content.slice(1),
-      ]
-      : result.content,
-    details: {
-      ...result.details,
-      normalizationWarnings: warnings,
-    },
-  };
-}
-
-/** Non-retryable preflight validation error. The text carries the instruction because details are not consumed by pi. */
-function nonRetryableValidationErrorResult(text: string, details?: Record<string, unknown>) {
-  return errorResult(`${text} ${NON_RETRYABLE_VALIDATION_NOTE}`, {
-    errorType: "validation",
-    retryable: false,
-    ...details,
-  });
-}
-
-function resolveSessionLifecycleForDispatch(
-  agentName: string,
-  agentConfig: AgentConfig | undefined,
-): { ok: true; sessionLifecycle: SessionLifecycle } | { ok: false; error: string } {
-  const metadataLifecycle = agentConfig?.sessionLifecycle;
-  const aliasLifecycle = agentConfig?.persistentSession === undefined
-    ? undefined
-    : agentConfig.persistentSession ? "persistent" : "stateless";
-
-  if (metadataLifecycle && aliasLifecycle && metadataLifecycle !== aliasLifecycle) {
-    return { ok: false, error: `Agent '${agentName}' has conflicting session_lifecycle and persistent_session metadata` };
-  }
-
-  return { ok: true, sessionLifecycle: metadataLifecycle ?? aliasLifecycle ?? "stateless" };
-}
-
-// ============================================================================
-// Activity tracking
-// ============================================================================
-
 /**
- * Build a details Record from an AgentRecord, controlled by options.
- *
- * Always includes `type` and `description`. Optional groups:
- * - `includeStatus`: adds `status`, `outputFile`
- * - `includeStats`: adds turn/token/cost/context/compaction/model fields
- *
- * Consolidates the identical field-selection logic previously duplicated
- * across emitIndividualNudge, executeSpawnForeground, and executeSpawnBackground.
+ * Build a details record from an AgentRecord. Always includes type and
+ * description; includeStatus adds status/outputFile/stopReason, includeStats
+ * adds turn/token/cost/context/compaction/model fields.
  */
 export function buildAgentDetails(
   record: AgentRecord,
@@ -123,6 +49,8 @@ export function buildAgentDetails(
   if (opts?.includeStatus) {
     details.status = record.lifecycle.status;
     details.outputFile = record.display.outputFile;
+    const stopReason = formatStopReason(record.lifecycle);
+    if (stopReason) details.stopReason = stopReason;
   }
 
   if (opts?.includeStats) {
@@ -136,7 +64,9 @@ export function buildAgentDetails(
     details.contextPercent = getSessionContextPercent(record.execution.session);
     details.durationMs = elapsedMs;
     details.compactions = record.stats.compactionCount;
-    details.modelName = record.display.invocation?.modelName;
+    details.modelName = record.execution.session?.model?.name ?? record.display.invocation?.modelName;
+    details.modelId = record.execution.session?.model?.id ?? record.display.invocation?.modelName;
+    details.thinkingLevel = record.execution.session?.thinkingLevel ?? record.display.invocation?.thinkingLevel;
     details.cost = record.stats.lifetimeUsage.cost;
   }
 
@@ -144,18 +74,22 @@ export function buildAgentDetails(
 }
 
 /**
- * Result text plus status note, for display.
+ * Result text plus status note, for display. For error status, appends the
+ * recorded error message so the nudge explains the failure.
  *
  * Shared by the foreground tool result and the subagent-result nudge so both
  * callers stay in sync on the nullish default and separator handling — they
  * have diverged before. getStatusNote owns the leading separator.
  */
 export function formatResultContent(record: AgentRecord): string {
+  // Only the nudge path formats error-status records as text: the foreground
+  // handler intercepts error status earlier and throws instead.
+  const errorNote = record.lifecycle.status === "error" && record.error ? `\n\nError: ${record.error}` : "";
   const result = record.result ?? "";
   // Don fork: never hand the parent a silent empty string. A model that fails
-  // before its first token, for example on a provider quota cap, resolves with
-  // no text and a "completed" status, so the caller saw "no output or errors"
-  // and had no idea the reviewer never ran.
+  // before its first token, for example on a provider quota cap, can resolve
+  // with no text and a "completed" status, so the caller read "no output and no
+  // errors" and had no idea the agent never ran.
   if (result.trim().length === 0) {
     const reason = record.error ? `: ${record.error}` : "";
     const model = record.display.invocation?.modelName;
@@ -166,161 +100,91 @@ export function formatResultContent(record: AgentRecord): string {
       getStatusNote(record.lifecycle)
     );
   }
-  return result + getStatusNote(record.lifecycle);
+  return result + errorNote + getStatusNote(record.lifecycle);
 }
 
-// ============================================================================
-// Tool execute handlers
-// ============================================================================
+// --- Tool execute handlers ---
 
-export async function executeAgentTool(
-  _toolCallId: string,
-  params: Record<string, unknown>,
-  signal: AbortSignal | undefined,
-  _onUpdate: ((update: any) => void) | undefined,
+/**
+ * Validate worktree_path and gate cross-repo trust, surfacing warnings via
+ * ctx.ui. Errors are LLM-facing and self-correctable.
+ */
+async function resolveWorktree(
   ctx: ExtensionContext,
-): Promise<any> {
-  // Don fork: capture lineage before a queued spawn can outlive this session.
-  const parentSessionFile = ctx.sessionManager.getSessionFile();
-
-  // Don fork: normalize optional-string placeholders and decide after agent
-  // lifecycle resolution whether a non-empty key should persist or be ignored.
-  if (params.session_key !== undefined && typeof params.session_key !== "string") {
-    return nonRetryableValidationErrorResult("session_key must be a string when provided.");
+  rawWorktreePath: string | undefined,
+): Promise<
+  { ok: true; resolvedPath?: string; worktreeLabel?: string; projectTrusted: boolean } | { ok: false; error: string }
+> {
+  // Empty/whitespace → omitted: nothing to validate, nothing to gate.
+  if (!rawWorktreePath || rawWorktreePath.trim() === "") {
+    return { ok: true, projectTrusted: true };
   }
-  const rawSessionKey = typeof params.session_key === "string" ? params.session_key.trim() : undefined;
-  let sessionKey = rawSessionKey || undefined;
-  const rawWorktreePath = typeof params.worktree_path === "string" ? params.worktree_path.trim() : undefined;
-  let effectiveWorktreePath = rawWorktreePath;
-  const normalizationWarnings: string[] = [];
-  if (params.session_key !== undefined && !sessionKey) {
-    normalizationWarnings.push("empty session_key ignored; spawned without a session key");
-  }
-  if (params.session_key !== undefined) {
-    const hasMeaningfulValue = (value: unknown): boolean => {
-      if (value === undefined || value === null || value === false) return false;
-      if (typeof value === "string") return value.trim().length > 0;
-      return true;
-    };
-    const forkStyleParam = ["context", "fork", "fork_from", "parent_session", "parentSession"]
-      .find((name) => hasMeaningfulValue(params[name]));
-    if (forkStyleParam) {
-      return nonRetryableValidationErrorResult(`session_key cannot be used with ${forkStyleParam}.`);
-    }
-  }
-
-  // Validate worktree_path lazily. It is needed before on-demand discovery for
-  // unknown types, but known persistent+key+worktree calls should fail without
-  // mutating or normalizing either piece of persistent intent.
-  let validatedWorktreePath: string | undefined;
-  let worktreeLabel: string | undefined;
-  let worktreeValidated = false;
-  const validateWorktreeForDispatch = async (): Promise<ReturnType<typeof errorResult> | undefined> => {
-    if (!effectiveWorktreePath || worktreeValidated) return undefined;
-    worktreeValidated = true;
-    try {
-      const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
-      const warnings: string[] = [];
-      const onWarning = (msg: string) => { warnings.push(msg); };
-      const validation = await validateWorktreePath(getPiInstance(), effectiveWorktreePath, parentCwd, onWarning);
-      if (!validation.ok) {
-        for (const msg of warnings) {
-          if (ctx.ui?.notify) ctx.ui.notify(`[pi-subagents-lite] ${msg}`, "warning");
-        }
-        return errorResult(validation.error);
-      }
-      validatedWorktreePath = validation.resolvedPath;
-      worktreeLabel = validation.label;
-      return undefined;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return errorResult(`worktree_path validation failed: ${msg}`);
-    }
-  };
-
-  const type = (params.agent as string) || "general-purpose";
-  let resolvedType = resolveType(type);
-  if (!resolvedType) {
-    // Not found in registry — try scanning filesystem for agents added during the session.
-    // When worktree_path is set, also scan the worktree's .pi/agents/ directory.
-    const worktreeError = await validateWorktreeForDispatch();
-    if (worktreeError) return withNormalizationWarnings(worktreeError, normalizationWarnings);
-    const worktreeDir = validatedWorktreePath ? `${validatedWorktreePath}/.pi/agents` : undefined;
-    await discoverNewAgents(worktreeDir);
-    resolvedType = resolveType(type);
-  }
-  if (!resolvedType) {
-    return withNormalizationWarnings(nonRetryableValidationErrorResult(`Unknown agent type: ${type}.`), normalizationWarnings);
-  }
-  const agentConfig = getAgentConfig(resolvedType);
-  const lifecycleResolution = resolveSessionLifecycleForDispatch(resolvedType, agentConfig);
-  if (!lifecycleResolution.ok) {
-    return withNormalizationWarnings(nonRetryableValidationErrorResult(`${lifecycleResolution.error}. Fix the agent metadata before retrying.`, {
-      agent: resolvedType,
-    }), normalizationWarnings);
-  }
-  const { sessionLifecycle } = lifecycleResolution;
-  if (sessionKey && sessionLifecycle !== "persistent") {
-    normalizationWarnings.push(`session_key ignored for stateless agent '${resolvedType}'; spawned as one-shot`);
-    sessionKey = undefined;
-  }
-  if (sessionKey && effectiveWorktreePath) {
-    // Don fork: a worktree_path equal to the parent working directory selects no
-    // other worktree. Models that fill every optional field send exactly that,
-    // then repeat the identical call after a hard error. Ignore the no-op value
-    // and keep the persistent session instead of failing the delegation.
+  try {
     const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
-    if (isParentCwdPath(effectiveWorktreePath, parentCwd)) {
-      normalizationWarnings.push(
-        `worktree_path '${effectiveWorktreePath}' is the parent working directory, not a separate git worktree; ignored so session_key '${sessionKey}' applies. Omit worktree_path unless you target a different worktree.`,
-      );
-      effectiveWorktreePath = undefined;
-      validatedWorktreePath = undefined;
-      worktreeLabel = undefined;
-      worktreeValidated = true;
-    } else {
-      return nonRetryableValidationErrorResult(
-        `session_key cannot be used with a non-empty worktree_path for persistent agents; omit one of these fields. `
-        + `worktree_path was '${effectiveWorktreePath}', which is not the parent working directory '${parentCwd}'. `
-        + `To reuse session_key '${sessionKey}', resend the same call with worktree_path omitted.`,
-      );
+    const warnings: string[] = [];
+    const onWarning = (msg: string) => {
+      warnings.push(msg);
+    };
+    const validation = await validateWorktreePath(getPiInstance(), rawWorktreePath, parentCwd, onWarning);
+    if (!validation.ok) {
+      for (const msg of warnings) {
+        if (ctx.ui?.notify) ctx.ui.notify(`[pi-subagents-lite] ${msg}`, "warning");
+      }
+      return { ok: false, error: validation.error };
     }
+
+    const resolvedPath = validation.resolvedPath!; // non-empty paths always resolve
+
+    // Cross-repo targets are gated by pi's trust framework. Same-repo paths
+    // are never gated; an untrusted target still spawns but with its project
+    // resources ignored and a warning surfaced.
+    const projectTrusted = resolveSubagentTrust({
+      targetPath: resolvedPath,
+      sameRepo: validation.sameRepo === true,
+      deps: createSubagentTrustDeps(getAgentDir(), parentCwd),
+    });
+    if (!projectTrusted && ctx.ui?.notify) {
+      ctx.ui.notify(`[pi-subagents-lite] ${untrustedProjectWarning(resolvedPath)}`, "warning");
+    }
+    return {
+      ok: true,
+      resolvedPath,
+      worktreeLabel: validation.label,
+      projectTrusted,
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `worktree_path validation failed: ${msg}` };
   }
+}
 
-  const worktreeError = await validateWorktreeForDispatch();
-  if (worktreeError) return withNormalizationWarnings(worktreeError, normalizationWarnings);
-
-  const prompt = params.prompt as string;
-  const description = (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
-  const runInBackground = params.run_in_background as boolean | undefined;
-  let isBackground = runInBackground || getStore().agent.forceBackground;
-  // Don fork: in one-shot mode (no UI: pi -p / --mode json) the parent process
-  // exits when the turn ends, killing any background child mid-work. There is
-  // no later turn to collect the result, so background delegation can never
-  // succeed — force foreground instead of losing the work.
-  const forcedForeground = isBackground && !ctx.hasUI;
-  if (forcedForeground) isBackground = false;
-  const maxTurns = params.max_turns as number | undefined ?? agentConfig?.maxTurns;
-
-  // Pick up an external config edit (pool-profile switch) before resolving the
-  // model, so a switch made mid-session routes the very next delegation.
-  getStore().refreshIfChanged?.();
-  const modelStr = params.model as string | undefined;
-  // Don fork: a requested model that isn't in the registry is an error, not a
-  // silent fallback to the parent model — a typo in a modelAgents/providerAgents entry or
-  // per-call override would otherwise run the wrong model (and any thinking
-  // that traveled with the configured entry would disagree with it).
-  // The spec is resolved tolerantly first (aliases, bare ids, "terra high",
-  // "default" = inherit) so a near-miss spelling costs zero extra turns, and
-  // any failure message carries the format plus the candidate list.
+/**
+ * Don fork: resolve the model for a spawn through the full precedence chain,
+ * then through tolerant spec resolution (aliases, bare ids, "terra high",
+ * "default" = inherit).
+ *
+ * A caller-typed spec that does not resolve is a hard error, not a silent
+ * fallback to the parent model: a typo in a modelAgents/providerAgents entry or
+ * a per-call override would otherwise run the wrong model. A stale config or
+ * frontmatter pin must not block the spawn, but it must not be silent either,
+ * so it degrades to the parent model with a note.
+ */
+function resolveSpawnModel(
+  ctx: ExtensionContext,
+  resolvedType: string,
+  callerModelStr: string | undefined,
+): {
+  model: ReturnType<typeof findModelInRegistry>;
+  modelKey: string | undefined;
+  specThinking: ThinkingLevel | undefined;
+  modelWarnings: string[];
+  modelError?: string;
+} {
+  const warnings: string[] = [];
+  const agentConfig = getAgentConfig(resolvedType);
   let specThinking: ThinkingLevel | undefined;
-  // Don fork: resolve the full precedence chain here rather than trusting the
-  // tool_call listener. The listener does not fire in one-shot (`pi -p`) runs,
-  // which is exactly how two-context delegations spawn children, so a pinned
-  // heavy agent (lmd-science, analyst) silently inherited the orchestrator's
-  // cheap model. execute() is now the authoritative resolver; the listener
-  // only canonicalizes what the caller typed for display.
-  let modelSpec = modelStr;
+
+  let modelSpec = callerModelStr;
   if (!modelSpec) {
     const parentModelId = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
     const configured = getStore().spawnFor(resolvedType, parentModelId, agentConfig, undefined);
@@ -329,6 +193,7 @@ export async function executeAgentTool(
       specThinking = configured.thinking;
     }
   }
+
   let resolvedModelStr = modelSpec;
   if (modelSpec) {
     const resolution = resolveModelSpec(modelSpec, ctx.modelRegistry, {
@@ -337,122 +202,308 @@ export async function executeAgentTool(
       parentProvider: ctx.model?.provider,
     });
     if (resolution.kind === "error") {
-      // A caller-typed spec is a hard error; a stale config/frontmatter pin
-      // must not block the spawn, but it must not be silent either.
-      if (modelStr) {
-        return withNormalizationWarnings(nonRetryableValidationErrorResult(resolution.message), normalizationWarnings);
-      }
-      normalizationWarnings.push(
+      if (callerModelStr) return { model: undefined, modelKey: undefined, specThinking, modelWarnings: warnings, modelError: resolution.message };
+      warnings.push(
         `agent '${resolvedType}' pins model '${modelSpec}', which did not resolve; using the parent model. ${resolution.message}`,
       );
+      specThinking = undefined;
+      resolvedModelStr = undefined;
+    } else {
+      specThinking = resolution.thinking ?? specThinking;
+      resolvedModelStr = resolution.kind === "resolved" ? resolution.key : undefined;
+      // Only surface a note for a spelling the caller actually typed; a
+      // frontmatter or config pin resolving is not news for the caller.
+      if (resolution.note && callerModelStr) warnings.push(resolution.note);
     }
-    specThinking = (resolution.kind === "error" ? undefined : resolution.thinking) ?? specThinking;
-    resolvedModelStr = resolution.kind === "resolved" ? resolution.key : undefined;
-    // Only surface a note for a spelling the caller actually typed; a
-    // frontmatter or config pin resolving is not news for the caller.
-    if (resolution.kind !== "error" && resolution.note && modelStr) normalizationWarnings.push(resolution.note);
   }
+
   const model = findModelInRegistry(resolvedModelStr, ctx.modelRegistry, resolvedModelStr ? undefined : ctx.model);
   if (resolvedModelStr && !model) {
-    return withNormalizationWarnings(
-      nonRetryableValidationErrorResult(`Model not found in registry: ${resolvedModelStr}.`),
-      normalizationWarnings,
+    return {
+      model: undefined,
+      modelKey: undefined,
+      specThinking,
+      modelWarnings: warnings,
+      modelError: `Model not found in registry: ${resolvedModelStr}.`,
+    };
+  }
+  return {
+    model,
+    modelKey: model ? `${model.provider}/${model.id}` : undefined,
+    specThinking,
+    modelWarnings: warnings,
+  };
+}
+
+/**
+ * Appended to every preflight validation error. pi does not surface tool
+ * details to the model, so the instruction has to ride in the text or an
+ * orchestrator repeats the identical failing call.
+ */
+const NON_RETRYABLE_VALIDATION_NOTE =
+  "This validation error is non-retryable; do not repeat the same Agent call unchanged.";
+
+/**
+ * Don fork: resolve an agent's session lifecycle. `sessionLifecycle` is
+ * authoritative; `persistentSession` is the legacy boolean. Anything unset
+ * defaults to stateless, so persistence is always opt-in.
+ */
+function resolveSessionLifecycle(resolvedType: string): SessionLifecycle {
+  const config = getAgentConfig(resolvedType);
+  return config?.sessionLifecycle ?? (config?.persistentSession === true ? "persistent" : "stateless");
+}
+
+/** True when a param carries a value a caller actually meant to set. */
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === undefined || value === null || value === false) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  return true;
+}
+
+/** Prefix a tool result text with any spawn-time normalization notes. */
+function withNotes(text: string, warnings: string[]): string {
+  if (warnings.length === 0) return text;
+  return `${warnings.map((warning) => `[note: ${warning}]`).join("\n")}\n\n${text}`;
+}
+
+export async function executeAgentTool(
+  _toolCallId: string,
+  params: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  _onUpdate: ((update: any) => void) | undefined,
+  ctx: ExtensionContext,
+): Promise<any> {
+  // Don fork: pick up an external config edit (a pool-profile switch) before
+  // ANY store read, so a switch made mid-session routes the very next
+  // delegation instead of waiting for the next session_start. This must be the
+  // first store touch in the function: reading defaultMaxTurns before the
+  // refresh and the model after it would mix two config generations in one
+  // spawn. The method is synchronous and Node is single-threaded, so no read
+  // below can tear against it.
+  getStore().refreshIfChanged();
+
+  /** Don fork: spawn-time notes surfaced to the caller alongside the result. */
+  const normalizationWarnings: string[] = [];
+  // Don fork: capture lineage before a queued spawn can outlive this session.
+  const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
+
+  // Don fork: normalize the session_key placeholder before anything reads it.
+  // Models that fill every optional field send "" here; that is not a key.
+  if (params.session_key !== undefined && typeof params.session_key !== "string") {
+    throw new Error(`session_key must be a string when provided. ${NON_RETRYABLE_VALIDATION_NOTE}`);
+  }
+  const sessionKey = (params.session_key as string | undefined)?.trim() || undefined;
+  if (params.session_key !== undefined && !sessionKey) {
+    normalizationWarnings.push("empty session_key ignored; spawned without a session key");
+  }
+  if (sessionKey) {
+    // A key resumes one named session. A fork-style param asks for a copy of a
+    // different session, so the two cannot both be honoured.
+    const forkStyleParam = ["context", "fork", "fork_from", "parent_session", "parentSession"].find((name) =>
+      hasMeaningfulValue(params[name]),
+    );
+    if (forkStyleParam) {
+      throw new Error(`session_key cannot be used with ${forkStyleParam}. ${NON_RETRYABLE_VALIDATION_NOTE}`);
+    }
+  }
+
+  // Validate worktree_path early — needed for on-demand agent discovery
+  const rawWorktreePath = params.worktree_path as string | undefined;
+  // Don fork: an empty or whitespace-only placeholder selects no worktree.
+  let effectiveWorktreePath = rawWorktreePath?.trim() || undefined;
+
+  if (sessionKey && effectiveWorktreePath) {
+    // Don fork: a worktree_path equal to the parent working directory selects no
+    // OTHER worktree. Models that fill every optional field send exactly that,
+    // and a hard error here made one live session repeat the identical call 11
+    // times. Ignore the no-op value and keep the session instead.
+    const parentCwd = getSessionCtx()?.cwd ?? ctx.cwd;
+    if (isParentCwdPath(effectiveWorktreePath, parentCwd)) {
+      normalizationWarnings.push(
+        `worktree_path '${effectiveWorktreePath}' is the parent working directory, not a separate git worktree; ` +
+          `ignored so session_key '${sessionKey}' applies. Omit worktree_path unless you target a different worktree.`,
+      );
+      effectiveWorktreePath = undefined;
+    } else {
+      // A genuinely different worktree cannot host a session keyed to this one.
+      // Name the failed value, the parent cwd, and the exact retry, so the
+      // caller can tell which of the two arguments to drop.
+      throw new Error(
+        `session_key cannot be used with a non-empty worktree_path for persistent agents; ` +
+          `omit one of these fields. worktree_path was '${effectiveWorktreePath}', which is not the parent ` +
+          `working directory '${parentCwd}'. To reuse session_key '${sessionKey}', resend the same call with ` +
+          `worktree_path omitted. ${NON_RETRYABLE_VALIDATION_NOTE}`,
+      );
+    }
+  }
+
+  const resolved = await resolveWorktree(ctx, effectiveWorktreePath);
+  if (!resolved.ok) throw new Error(resolved.error);
+  const validatedWorktreePath = resolved.resolvedPath;
+  const worktreeLabel = resolved.worktreeLabel;
+  const projectTrusted = resolved.projectTrusted;
+
+  const type = (params.agent as string) || "general-purpose";
+  // When worktree_path is set, also scan the target's .pi/agents/ directory, unless
+  // the target is an untrusted cross-repo project (its agent types stay hidden).
+  const targetAgentsDir = projectTrusted && validatedWorktreePath ? `${validatedWorktreePath}/.pi/agents` : undefined;
+  const resolution = await resolveTypeOrDiscover(type, targetAgentsDir);
+  if (resolution.kind === "ambiguous") {
+    // Two or more registered types differ only by case — never a silent pick.
+    throw new Error(
+      `Ambiguous agent type: ${type}. Candidates: ${resolution.candidates.join(", ")}. Use the exact registered name.`,
     );
   }
-  const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+  if (resolution.kind === "not-found") {
+    throw new Error(`Unknown agent type: ${type}`);
+  }
+  const resolvedType = resolution.key;
+
+  // Don fork: only a "persistent" agent may be addressed by a named key. A key
+  // sent to a stateless agent is dropped with a note rather than thrown,
+  // because the caller cannot see agent frontmatter and an error here just
+  // loses the work: an orchestrator whose routing config names a key would
+  // resend the identical call. The note tells it the key had no effect.
+  const lifecycle = resolveSessionLifecycle(resolvedType);
+  const effectiveSessionKey = sessionKey && lifecycle === "persistent" ? sessionKey : undefined;
+  if (sessionKey && !effectiveSessionKey) {
+    normalizationWarnings.push(
+      `session_key '${sessionKey}' ignored: agent '${resolvedType}' is stateless, so this call is one-shot. ` +
+        `Omit session_key, or set session_lifecycle: persistent in that agent's frontmatter.`,
+    );
+  }
+
+  const prompt = params.prompt as string;
+  const description =
+    (params.description as string | undefined) || prompt.split("\n")[0].slice(0, 80) || prompt.slice(0, 80);
+  const runInBackground = params.run_in_background as boolean | undefined;
+  const maxTurns =
+    (params.max_turns as number | undefined) ??
+    getAgentConfig(resolvedType)?.maxTurns ??
+    getStore().agent.defaultMaxTurns;
+
+  const modelStr = params.model as string | undefined;
+  // Don fork: resolve the full precedence chain here rather than trusting the
+  // tool_call listener. The listener does not fire in one-shot (`pi -p`) runs,
+  // which is exactly how two-context delegations spawn children, so a pinned
+  // heavy agent (lmd-science, analyst) silently inherited the orchestrator's
+  // cheap model. execute() is the authoritative resolver; the listener only
+  // canonicalizes what the caller typed for display.
+  const { model, modelKey, specThinking, modelWarnings, modelError } = resolveSpawnModel(
+    ctx,
+    resolvedType,
+    modelStr,
+  );
+  if (modelError) throw new Error(modelError);
+  normalizationWarnings.push(...modelWarnings);
 
   // Determine modelName for invocation (always capture for display)
   const modelName = model?.id;
 
-  // Resolve thinking: explicit param > agent config (frontmatter) > undefined (inherit)
-  const thinkingLevel = parseThinkingLevel(params.thinking as string | undefined)
-    ?? specThinking
-    ?? agentConfig?.thinkingLevel;
+  // Resolve thinking: explicit param > settings that traveled with the resolved
+  // model > agent config (frontmatter) > spawn options default > inherit
+  const thinkingLevel =
+    parseThinkingLevel(params.thinking as string | undefined) ??
+    specThinking ??
+    getAgentConfig(resolvedType)?.thinkingLevel ??
+    getStore().agent.defaultThinking;
 
-  // Use SpawnCoordinator for unified spawn path
   const coordinator = getCoordinator()!;
-  let result: Awaited<ReturnType<typeof coordinator.spawn>>;
-  try {
-    result = await coordinator.spawn(getPiInstance(), ctx, {
-      type: resolvedType,
-      prompt,
-      description,
-      model,
-      modelKey,
-      maxTurns,
-      thinkingLevel,
-      graceTurns: getStore().agent.graceTurns,
-      worktreePath: validatedWorktreePath,
-      worktreeLabel,
-      invocation: { modelName },
-      ...(isBackground ? {} : { signal }),
-      parentSessionFile,
-      // Scope keyed sessions by normalized parent cwd, resolved type, and caller key.
-      ...(sessionKey ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd, sessionKeyAgentType: resolvedType } : {}),
-      runInBackground: isBackground,
-    });
-  } catch (err: unknown) {
-    // Don fork: surface manager-level executor contention as a normal tool error.
-    return withNormalizationWarnings(
-      errorResult(err instanceof Error ? err.message : String(err)),
-      normalizationWarnings,
+  // Background spawns (explicit or forceBackground) never bind to the parent
+  // run's interrupt signal — only foreground spawns can be interrupted.
+  let isBackground = runInBackground || getStore().agent.forceBackground;
+  // Don fork: in one-shot mode (no UI: pi -p / --mode json) the parent process
+  // exits when the turn ends, killing any background child mid-work. There is
+  // no later turn to collect the result, so background delegation can never
+  // succeed. Force foreground instead of losing the work.
+  const forcedForeground = isBackground && !ctx.hasUI;
+  if (forcedForeground) {
+    isBackground = false;
+    normalizationWarnings.push(
+      "run_in_background was ignored: one-shot mode has no later turn to collect a background result, " +
+        "so the agent ran in the foreground",
     );
   }
 
+  const result = await coordinator.spawn(getPiInstance(), ctx, {
+    type: resolvedType,
+    prompt,
+    description,
+    model,
+    modelKey,
+    maxTurns,
+    thinkingLevel,
+    graceTurns: getStore().agent.graceTurns,
+    worktreePath: validatedWorktreePath,
+    worktreeLabel,
+    projectTrusted,
+    parentSessionFile,
+    // Don fork: scope a keyed session by normalized parent cwd, canonical type,
+    // and caller key, so the same key under two projects stays two sessions.
+    ...(effectiveSessionKey
+      ? {
+          sessionKey: effectiveSessionKey,
+          sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd,
+          sessionKeyAgentType: resolvedType,
+        }
+      : {}),
+    invocation: { modelName, thinkingLevel, maxTurns },
+    runInBackground: isBackground,
+    signal: isBackground ? undefined : signal,
+  });
+
   const { agentId, record } = result;
 
+  // Store toolCallId in record for call renderer to find agent
+  if (_toolCallId) {
+    record.display.toolCallId = _toolCallId;
+  }
+
   if (isBackground) {
-    // Background: return immediately
-    const suffix = `A notification will arrive when done - User asks you not to poll, check status or duplicate the delegated work.\n\nAgent ID: ${agentId}`;
+    const suffix = `Success! You delegated to an agent. A notification will arrive when done - USER: do not poll, don't check status and don't duplicate the delegated work!\n\nAgent ID: ${agentId}`;
     const label = record.lifecycle.status === "queued" ? "Agent queued" : "Agent running";
-    return withNormalizationWarnings(successResult(`[${label}] ${suffix}`, buildAgentDetails(record)), [
-      ...normalizationWarnings,
-      ...(record.warnings ?? []),
-    ]);
+    const details = buildAgentDetails(record);
+    details.agentId = agentId;
+    details.status = record.lifecycle.status;
+    return successResult(
+      withNotes(`[${label}] ${suffix}`, [...normalizationWarnings, ...(record.warnings ?? [])]),
+      details,
+    );
   }
 
   // Foreground: record.execution.promise is already awaited by coordinator.spawn()
   const details = buildAgentDetails(record, { includeStats: true });
 
   if (record.lifecycle.status === "error") {
-    return withNormalizationWarnings(errorResult(`Agent failed: ${record.error || "unknown error"}`, details), [
-      ...normalizationWarnings,
-      ...(record.warnings ?? []),
-    ]);
+    throw new Error(`Agent failed: ${record.error || "unknown error"}`);
   }
 
-  const resultText = forcedForeground
-    ? `[note: run_in_background was ignored — one-shot mode has no later turn to collect background results, so the agent ran in the foreground]\n\n${formatResultContent(record)}`
-    : formatResultContent(record);
-  return withNormalizationWarnings(successResult(resultText, details), [
-    ...normalizationWarnings,
-    ...(record.warnings ?? []),
-  ]);
+  // Don fork: setup warnings raised inside the run (for example a declared
+  // extension that matched nothing) reach the parent's result, not only the UI.
+  // A background or headless orchestrator has no UI to read.
+  return successResult(
+    withNotes(formatResultContent(record), [...normalizationWarnings, ...(record.warnings ?? [])]),
+    details,
+  );
 }
 
-// ============================================================================
-// Running agents list helper (used by executeStopAgentTool)
-// ============================================================================
+// --- Running agents list helper (used by executeStopAgentTool) ---
 
 /**
  * Build a compact list of running (or queued) agents.
  * Format: "short_id (type), short_id (type)" — one line, easy for LLM to parse.
  */
 function formatRunningAgents(): string {
-  const agents = getManager()!.listAgents().filter(
-    (a) => a.lifecycle.status === "running" || a.lifecycle.status === "queued",
-  );
+  const agents = getManager()!
+    .listAgents()
+    .filter((a) => a.lifecycle.status === "running" || a.lifecycle.status === "queued");
 
   if (agents.length === 0) return "none";
 
-  return agents
-    .map((a) => `${a.id.slice(0, SHORT_ID_LENGTH)} (${a.display.type})`)
-    .join(", ");
+  return agents.map((a) => `${a.id.slice(0, SHORT_ID_LENGTH)} (${a.display.type})`).join(", ");
 }
 
-// ============================================================================
-// StopAgent execute handler
-// ============================================================================
+// --- StopAgent execute handler ---
 
 export async function executeStopAgentTool(
   _toolCallId: string,
@@ -464,61 +515,47 @@ export async function executeStopAgentTool(
   const agentId = params.agent_id as string | undefined;
 
   if (!agentId) {
-    return errorResult("agent_id is required");
+    throw new Error("agent_id is required");
   }
 
-  let record: AgentRecord | undefined;
-  try {
-    record = getManager()!.getRecord(agentId);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return errorResult(message);
-  }
+  const record = getManager()!.getRecord(agentId);
 
   if (!record) {
-    // Agent not found → return error + list of running agents
-    return errorResult(
-      `Agent ${agentId} not found. Running agents: ${formatRunningAgents()}`,
-    );
+    throw new Error(`Agent ${agentId} not found. Running agents: ${formatRunningAgents()}`);
   }
 
-  // Check if already in a terminal state (not running or queued)
   if (record.lifecycle.status !== "running" && record.lifecycle.status !== "queued") {
     return successResult(
       `Agent ${agentId} is already ${record.lifecycle.status}. Running agents: ${formatRunningAgents()}`,
     );
   }
 
-  // Attempt to stop the running/queued agent
-  if (getManager()!.abort(record.id, "agent")) {
+  if (getManager()!.abort(agentId, "agent")) {
     return successResult(`Stopped agent ${agentId.slice(0, SHORT_ID_LENGTH)}`);
   }
 
-  return errorResult(`Failed to stop agent ${agentId}`);
+  throw new Error(`Failed to stop agent ${agentId}`);
 }
 
-// ============================================================================
-// Tool_call listener — inject model into Agent tool calls
-// =============================================================================
+// --- Tool_call listener — inject model into Agent tool calls ---
 
-export async function toolCallListener(
-  event: ToolCallEvent,
-  ctx: ExtensionContext,
-): Promise<void> {
+export async function toolCallListener(event: ToolCallEvent, ctx: ExtensionContext): Promise<void> {
   if (event.toolName !== "Agent") return;
 
   const input = event.input;
-  // Resolve the caller's spelling to the canonical type before any keyed
-  // lookup: session/config/modelAgents/providerAgents keys are canonical, so "Executor"
-  // or a display name would silently miss its per-type entries otherwise.
+  // Don fork: resolve the caller's spelling to the canonical type before any
+  // keyed lookup. Session, config, modelAgents, and providerAgents keys are
+  // canonical, so "Executor" or a display name would silently miss its
+  // per-type entries otherwise.
   const requestedType = typeof input.agent === "string" && input.agent ? input.agent : "general-purpose";
-  const subagentType = resolveType(requestedType) ?? requestedType;
+  const typeResolution = resolveType(requestedType);
+  const subagentType = typeResolution.kind === "resolved" ? typeResolution.key : requestedType;
   const agentConfig = getAgentConfig(subagentType);
 
   const parentModelId = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 
   // Don fork: feed the per-call model param into resolution instead of
-  // clobbering it — it now wins over the follow map and frontmatter (targeted
+  // clobbering it — it wins over the routing maps and frontmatter (targeted
   // overrides like a Luna trial) while still losing to session/config pins.
   const explicitModel = typeof input.model === "string" && input.model ? input.model : undefined;
   const spawn = getStore().spawnFor(subagentType, parentModelId, agentConfig, explicitModel);
@@ -527,14 +564,14 @@ export async function toolCallListener(
   // Don fork: canonicalize the resolved spelling before execute() validates it.
   // A tolerated spelling (alias, bare id, "terra high") becomes the registry
   // key here; "default" clears the override so the parent model is inherited;
-  // an unresolvable spelling is left untouched so execute() can report the
+  // an unresolvable spelling is left untouched so execute() reports the
   // actionable error exactly once.
   const specResolution = modelWithSuffix?.model
     ? resolveModelSpec(modelWithSuffix.model, ctx.modelRegistry, {
-      aliases: getStore().modelAliases,
-      providerPreference: getStore().providerPreference,
-      parentProvider: ctx.model?.provider,
-    })
+        aliases: getStore().modelAliases,
+        providerPreference: getStore().providerPreference,
+        parentProvider: ctx.model?.provider,
+      })
     : undefined;
   if (specResolution?.kind === "resolved") {
     input.model = specResolution.key;
@@ -552,15 +589,14 @@ export async function toolCallListener(
   }
 
   // Inject thinking if not explicitly passed: settings that traveled with the
-  // resolved model (follow-map entry), a pi CLI-style model suffix, else agent
-  // config (frontmatter).
+  // resolved model (routing-map entry), a pi CLI-style model suffix, the
+  // resolved spec's own suffix, then agent frontmatter, then the spawn default.
   if (input.thinking === undefined) {
-    const thinking = spawn.thinking
-      ?? modelWithSuffix?.thinking
-      ?? (specResolution?.kind !== "error" ? specResolution?.thinking : undefined)
-      ?? agentConfig?.thinkingLevel;
-    if (thinking !== undefined) {
-      input.thinking = thinking;
-    }
+    input.thinking =
+      spawn.thinking ??
+      modelWithSuffix?.thinking ??
+      (specResolution?.kind !== "error" ? specResolution?.thinking : undefined) ??
+      agentConfig?.thinkingLevel ??
+      getStore().agent.defaultThinking;
   }
 }

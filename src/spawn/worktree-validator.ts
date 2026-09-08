@@ -1,11 +1,15 @@
 /**
  * worktree-validator.ts — Validate, resolve, and label a worktree path.
  *
- * Pure async functions that validate a `worktree_path` value against the parent's
- * git repository. Depends on `pi.exec` for git commands.
+ * Pure async functions that validate a `worktree_path` value: the target must
+ * exist, be a directory, and sit inside a git repository (any repo on disk —
+ * not only worktrees of the parent's repository). Depends on `pi.exec` for
+ * git commands.
  *
- * Validation strategy: compare `git-common-dir` of the parent and target paths.
- * If they share the same common dir, the target is a worktree of the parent's repo.
+ * Same-repo detection: compare `git-common-dir` of the parent and target
+ * paths. The parent is not required to be in a git repo; when it isn't (or
+ * the target lives in a different repo), the result flags `sameRepo: false`
+ * so the caller can apply the cross-repo trust gate.
  */
 
 import * as path from "node:path";
@@ -15,14 +19,11 @@ import { GIT_EXEC_TIMEOUT_MS } from "../utils.js";
 export const WORKTREE_VALIDATION_ERRORS = {
   PATH_DOES_NOT_EXIST: "worktree_path does not exist: the specified path was not found on disk",
   NOT_A_DIRECTORY: "worktree_path is not a directory: the specified path exists but is not a directory",
-  PARENT_NOT_IN_GIT_REPO: "worktree_path validation failed: the parent session is not inside a git repository",
   NOT_IN_GIT_REPO: "worktree_path is not inside a git repository",
-  DIFFERENT_REPO: "worktree_path is not a worktree of the parent's repository",
   GIT_NOT_FOUND: "worktree_path validation failed: git executable not found on this host",
   GIT_TIMEOUT: "worktree_path validation failed: git command timed out",
 } as const;
 
-/** Successful validation result. */
 export interface WorktreeValidationSuccess {
   ok: true;
   /** Resolved absolute path (symlinks followed, relative resolved). Undefined when path is empty/omitted. */
@@ -31,9 +32,15 @@ export interface WorktreeValidationSuccess {
   worktreeRoot?: string;
   /** Short display label for the widget. */
   label?: string;
+  /**
+   * True when the parent and target share the same git repository.
+   * False when the parent is not in a git repo or the target is in a
+   * different one — the caller then applies the cross-repo trust gate.
+   * Absent when the path was omitted (nothing to gate).
+   */
+  sameRepo?: boolean;
 }
 
-/** Failed validation result. */
 export interface WorktreeValidationFailure {
   ok: false;
   /** Human-readable error describing the specific failure reason. */
@@ -46,24 +53,28 @@ export type WorktreeValidationResult = WorktreeValidationSuccess | WorktreeValid
  * Minimal interface for the pi exec function — only what the validator needs.
  */
 interface PiExec {
-  exec(cmd: string, args: string[], opts?: { cwd?: string; timeout?: number }): Promise<{ code: number; stdout: string; stderr: string }>;
+  exec(
+    cmd: string,
+    args: string[],
+    opts?: { cwd?: string; timeout?: number },
+  ): Promise<{ code: number; stdout: string; stderr: string }>;
 }
 
 /**
  * Run `git rev-parse --git-common-dir` and return the trimmed result.
- * Returns a failure result if the command fails or git is unavailable.
+ * Returns a failure result when the command fails or git is unavailable;
+ * a non-repo directory yields NOT_IN_GIT_REPO.
  */
 async function getGitCommonDir(
   pi: PiExec,
   cwd: string,
-  notInRepoError: string,
   onWarning?: (msg: string) => void,
 ): Promise<{ ok: true; commonDir: string } | { ok: false; error: string }> {
   try {
     const result = await pi.exec("git", ["rev-parse", "--git-common-dir"], { cwd, timeout: GIT_EXEC_TIMEOUT_MS });
-    if (result.code !== 0) return { ok: false, error: notInRepoError };
+    if (result.code !== 0) return { ok: false, error: WORKTREE_VALIDATION_ERRORS.NOT_IN_GIT_REPO };
     const commonDir = result.stdout.trim();
-    if (!commonDir) return { ok: false, error: notInRepoError };
+    if (!commonDir) return { ok: false, error: WORKTREE_VALIDATION_ERRORS.NOT_IN_GIT_REPO };
     return { ok: true, commonDir };
   } catch (err: unknown) {
     const msg = String(err instanceof Error ? err.message : err);
@@ -78,22 +89,22 @@ async function getGitCommonDir(
   }
 }
 
+/** Resolve a git path and normalize it for reliable cross-platform comparison. */
+function normalizeGitPath(gitPath: string, cwd: string): string {
+  const isWindowsStyle =
+    /^[A-Za-z]:[\\/]/.test(gitPath) || /^[A-Za-z]:[\\/]/.test(cwd) || /^\\\\/.test(gitPath) || /^\\\\/.test(cwd);
+  const pathApi = isWindowsStyle ? path.win32 : path;
+  const absolutePath = pathApi.isAbsolute(gitPath) ? gitPath : pathApi.resolve(cwd, gitPath);
+  const normalizedPath = pathApi.normalize(absolutePath).replace(/\\/g, "/");
+
+  return isWindowsStyle ? normalizedPath.toLowerCase() : normalizedPath;
+}
+
 /**
- * Validate a worktree path against the parent's git repository.
- *
- * Resolution order:
- * 1. Empty/whitespace → treated as omitted (return ok with no path)
- * 2. Resolve relative against parent cwd
- * 3. Resolve symlinks (realpath)
- * 4. Check exists + is directory
- * 5. Get and compare git-common-dir for parent and target
- * 6. Get worktree root via --show-toplevel
- * 7. Normalize and compute display label
- *
- * @param pi - Minimal exec interface (pi.exec)
- * @param worktreePath - The raw worktree_path value from the LLM
- * @param parentCwd - The parent session's working directory
- * @returns Validation result with resolved path + label, or error
+ * Validate a worktree path against the git repository it must live in.
+ * Empty/whitespace is treated as omitted (ok with no path). Returns the
+ * resolved absolute path, worktree root, display label, and same-repo
+ * status against the parent (parent need not be in a repo).
  */
 export async function validateWorktreePath(
   pi: PiExec,
@@ -107,9 +118,7 @@ export async function validateWorktreePath(
   }
 
   // Step 2: Resolve relative paths against parent cwd
-  const resolved = path.isAbsolute(worktreePath)
-    ? worktreePath
-    : path.resolve(parentCwd, worktreePath);
+  const resolved = path.isAbsolute(worktreePath) ? worktreePath : path.resolve(parentCwd, worktreePath);
 
   // Step 3: Check existence
   if (!existsSync(resolved)) {
@@ -123,36 +132,32 @@ export async function validateWorktreePath(
     if (!stat.isDirectory()) {
       return { ok: false, error: WORKTREE_VALIDATION_ERRORS.NOT_A_DIRECTORY };
     }
-    // Resolve symlinks — use realpathSync to get the canonical path
     realPath = realpathSync(resolved);
   } catch {
     // stat failed — likely a broken symlink or permission issue
     return { ok: false, error: WORKTREE_VALIDATION_ERRORS.PATH_DOES_NOT_EXIST };
   }
 
-  // Step 5: Get and compare git-common-dir for parent and target
-  const parentResult = await getGitCommonDir(pi, parentCwd, WORKTREE_VALIDATION_ERRORS.PARENT_NOT_IN_GIT_REPO, onWarning);
-  if (!parentResult.ok) return parentResult;
-
-  const targetResult = await getGitCommonDir(pi, realPath, WORKTREE_VALIDATION_ERRORS.NOT_IN_GIT_REPO, onWarning);
+  // Step 5: the target must be inside a git repository (any repo on disk)
+  const targetResult = await getGitCommonDir(pi, realPath, onWarning);
   if (!targetResult.ok) return targetResult;
 
-  // Compare common dirs — must share the same repo
-  const parentCommonAbs = path.isAbsolute(parentResult.commonDir)
-    ? parentResult.commonDir
-    : path.resolve(parentCwd, parentResult.commonDir);
-  const targetCommonAbs = path.isAbsolute(targetResult.commonDir)
-    ? targetResult.commonDir
-    : path.resolve(realPath, targetResult.commonDir);
+  // Step 6: Detect same-repo vs cross-repo against the parent. The parent
+  // is not required to be in a git repo (issue: allow-several-repos); a
+  // failed parent probe just means the target is cross-repo and the trust
+  // gate may apply.
+  const parentResult = await getGitCommonDir(pi, parentCwd, onWarning);
+  const sameRepo =
+    parentResult.ok &&
+    normalizeGitPath(parentResult.commonDir, parentCwd) === normalizeGitPath(targetResult.commonDir, realPath);
 
-  if (parentCommonAbs !== targetCommonAbs) {
-    return { ok: false, error: WORKTREE_VALIDATION_ERRORS.DIFFERENT_REPO };
-  }
-
-  // Step 6: Get the worktree root via git rev-parse --show-toplevel
+  // Step 7: Get the worktree root via git rev-parse --show-toplevel
   let worktreeRoot: string;
   try {
-    const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: realPath, timeout: GIT_EXEC_TIMEOUT_MS });
+    const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+      cwd: realPath,
+      timeout: GIT_EXEC_TIMEOUT_MS,
+    });
     if (result.code !== 0) {
       worktreeRoot = realPath;
     } else {
@@ -163,16 +168,18 @@ export async function validateWorktreePath(
     worktreeRoot = realPath;
   }
 
-  // Step 7: Normalize and compute display label
+  // Step 8: Compute display label (normalizes internally), then normalize
+  // the returned paths.
+  const label = computeLabel(realPath, worktreeRoot);
   const normalizedRealPath = realPath.replace(/\\/g, "/");
   const normalizedRoot = worktreeRoot.replace(/\\/g, "/");
-  const label = computeLabel(normalizedRealPath, normalizedRoot);
 
   return {
     ok: true,
     resolvedPath: normalizedRealPath,
     worktreeRoot: normalizedRoot,
     label,
+    sameRepo,
   };
 }
 
@@ -181,7 +188,7 @@ export async function validateWorktreePath(
  * own working directory.
  *
  * A model that fills every optional field sends the parent cwd here. That value
- * selects no other worktree, so the fork treats it as a no-op instead of a
+ * selects no other worktree, so the caller treats it as a no-op instead of a
  * conflict with `session_key`. Comparison is pure and synchronous: resolve a
  * relative path against the parent cwd, then canonicalize both sides when the
  * filesystem allows it.
@@ -197,29 +204,19 @@ export function isParentCwdPath(worktreePath: string, parentCwd: string): boolea
   const trimmed = worktreePath.trim();
   const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(parentCwd, trimmed);
 
-  const normalize = (target: string): string => {
-    const normalized = path.resolve(target).replace(/\\/g, "/");
-    return normalized.length > 1 && normalized.endsWith("/")
-      ? normalized.slice(0, -1)
-      : normalized;
-  };
-  const canonical = (target: string): string | undefined => {
+  const canonical = (target: string): string => {
     try {
-      return normalize(realpathSync(target));
+      return realpathSync(target).replace(/\\/g, "/");
     } catch {
-      return undefined;
+      // Path missing or unreadable: fall back to a normalized comparison.
+      return path.resolve(target).replace(/\\/g, "/");
     }
   };
 
-  const resolvedPlain = normalize(resolved);
-  const parentPlain = normalize(parentCwd);
-  if (resolvedPlain === parentPlain) return true;
+  const stripTrailingSlash = (target: string): string =>
+    target.length > 1 && target.endsWith("/") ? target.slice(0, -1) : target;
 
-  const resolvedCanonical = canonical(resolved);
-  const parentCanonical = canonical(parentCwd);
-  return resolvedCanonical !== undefined
-    && parentCanonical !== undefined
-    && resolvedCanonical === parentCanonical;
+  return stripTrailingSlash(canonical(resolved)) === stripTrailingSlash(canonical(parentCwd));
 }
 
 /**
@@ -231,7 +228,6 @@ export function isParentCwdPath(worktreePath: string, parentCwd: string): boolea
  * - Always forward slashes regardless of host OS
  */
 export function computeLabel(resolvedPath: string, worktreeRoot: string): string {
-  // Normalize both paths to forward slashes for cross-platform comparison
   const normalizedResolved = resolvedPath.replace(/\\/g, "/");
   const normalizedRoot = worktreeRoot.replace(/\\/g, "/");
 
@@ -241,7 +237,6 @@ export function computeLabel(resolvedPath: string, worktreeRoot: string): string
     return rootBasename;
   }
 
-  // Compute relative path using posix separator
   const relative = path.posix.relative(normalizedRoot, normalizedResolved);
 
   return `${rootBasename}/${relative}`;

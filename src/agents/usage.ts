@@ -11,14 +11,13 @@ export type LifetimeUsage = { input: number; output: number; cacheWrite: number;
 
 /**
  * A single per-turn usage event as emitted upstream. Adds `cacheRead`, which
- * LifetimeUsage omits from totals (see issue #38). Used to estimate input
- * deltas for providers like vLLM that don't report cache hits.
+ * LifetimeUsage omits from totals (see issue #38).
  */
 export type AgentUsage = LifetimeUsage & { cacheRead: number };
 
-/** Sum of lifetime usage components (including cost), or 0 if undefined. */
+/** Sum of input + output token counts, or 0 if undefined. */
 export function getLifetimeTotal(u?: LifetimeUsage): number {
-  return u ? u.input + u.output + u.cacheWrite + u.cost : 0;
+  return u ? u.input + u.output : 0;
 }
 
 /** Add a usage delta into a target accumulator (mutates target). */
@@ -54,6 +53,9 @@ export function formatCost(cost: number): string {
  */
 export function getSessionContextPercent(session: SessionLike | undefined): number | null {
   if (!session) return null;
-  try { return session.getSessionStats().contextUsage?.percent ?? null; }
-  catch { return null; }
+  try {
+    return session.getSessionStats().contextUsage?.percent ?? null;
+  } catch {
+    return null;
+  }
 }

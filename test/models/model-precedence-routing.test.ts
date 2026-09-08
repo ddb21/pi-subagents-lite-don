@@ -1,0 +1,273 @@
+import { describe, expect, it } from "vitest";
+import {
+  providerOf,
+  resolveModel,
+  resolveSpawn,
+  type ProviderAgentEntry,
+  type SubagentsConfig,
+} from "../../src/models/model-precedence.js";
+
+const baseConfig = (extra: Partial<SubagentsConfig> = {}): SubagentsConfig => ({
+  agent: { default: null, forceBackground: false },
+  concurrency: { default: 4 },
+  ...extra,
+});
+
+const PROVIDER_MAP: SubagentsConfig["providerAgents"] = {
+  "github-copilot": {
+    default: "github-copilot/gpt-5.2",
+    "reviewer-adversarial": { model: "github-copilot/claude-opus-4.8", thinking: "medium" },
+  },
+  "openai-codex": {
+    default: { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
+  },
+};
+
+const MODEL_MAP: SubagentsConfig["modelAgents"] = {
+  "walmart-puppy/gpt-5.6-sol": {
+    executor: { model: "walmart-puppy/gpt-5.6-terra", thinking: "medium" },
+  },
+  "awb/claude-opus-4-8": {
+    default: "github-copilot/gpt-5.5",
+    executor: { model: "github-copilot/gpt-5.5", thinking: "high" },
+  },
+  "github-copilot/claude-opus-4.6": {
+    executor: { model: "github-copilot/gpt-5.5", thinking: "high" },
+  },
+  "github-copilot/gpt-5.5": {
+    executor: { model: "github-copilot/claude-opus-4.6", thinking: "xhigh" },
+  },
+};
+
+describe("Don fork routing tiers", () => {
+  it("follows the parent provider's map over frontmatter", () => {
+    const result = resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ providerAgents: PROVIDER_MAP }),
+      parentModelId: "github-copilot/gpt-5.2",
+      agentConfig: { model: "openai-codex/gpt-5.6-terra" },
+    });
+    expect(result).toBe("github-copilot/gpt-5.2");
+  });
+
+  it("prefers the per-type map entry over the map's default", () => {
+    const result = resolveModel({
+      subagentType: "reviewer-adversarial",
+      config: baseConfig({ providerAgents: PROVIDER_MAP }),
+      parentModelId: "github-copilot/gpt-5.2",
+      agentConfig: { model: "openai-codex/gpt-5.6-sol" },
+    });
+    expect(result).toBe("github-copilot/claude-opus-4.8");
+  });
+
+  it("falls back to frontmatter for an unmapped parent provider", () => {
+    const result = resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ providerAgents: PROVIDER_MAP }),
+      parentModelId: "my-custom-vllm/qwen3-max",
+      agentConfig: { model: "openai-codex/gpt-5.6-terra" },
+    });
+    expect(result).toBe("openai-codex/gpt-5.6-terra");
+  });
+
+  it("lets an explicit per-call model beat the map and frontmatter", () => {
+    const result = resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ providerAgents: PROVIDER_MAP }),
+      parentModelId: "github-copilot/gpt-5.2",
+      agentConfig: { model: "openai-codex/gpt-5.6-terra" },
+      explicitModel: "openai-codex/gpt-5.6-luna",
+    });
+    expect(result).toBe("openai-codex/gpt-5.6-luna");
+  });
+
+  it("lets session and config pins beat an explicit per-call model", () => {
+    const config = baseConfig({ providerAgents: PROVIDER_MAP });
+    config.agent["executor"] = "openai-codex/from-config";
+    expect(
+      resolveModel({
+        subagentType: "executor",
+        config,
+        parentModelId: "github-copilot/gpt-5.2",
+        explicitModel: "openai-codex/gpt-5.6-luna",
+      }),
+    ).toBe("openai-codex/from-config");
+
+    expect(
+      resolveModel({
+        subagentType: "executor",
+        config: baseConfig({ providerAgents: PROVIDER_MAP }),
+        parentModelId: "github-copilot/gpt-5.2",
+        explicitModel: "openai-codex/gpt-5.6-luna",
+        sessionOverrides: { default: "openai-codex/from-session" },
+      }),
+    ).toBe("openai-codex/from-session");
+  });
+
+  it("resolves all approved exact-parent executor routes with their thinking", () => {
+    const config = baseConfig({ modelAgents: MODEL_MAP });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "walmart-puppy/gpt-5.6-sol" }))
+      .toMatchObject({ model: "walmart-puppy/gpt-5.6-terra", thinking: "medium" });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "awb/claude-opus-4-8" }))
+      .toMatchObject({ model: "github-copilot/gpt-5.5", thinking: "high" });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "github-copilot/claude-opus-4.6" }))
+      .toMatchObject({ model: "github-copilot/gpt-5.5", thinking: "high" });
+    expect(resolveSpawn({ subagentType: "executor", config, parentModelId: "github-copilot/gpt-5.5" }))
+      .toMatchObject({ model: "github-copilot/claude-opus-4.6", thinking: "xhigh" });
+  });
+
+  it("checks the exact-parent map before the provider map", () => {
+    const config = baseConfig({
+      modelAgents: MODEL_MAP,
+      providerAgents: { "github-copilot": { executor: "github-copilot/provider-fallback" } },
+    });
+    expect(resolveSpawn({
+      subagentType: "executor",
+      config,
+      parentModelId: "github-copilot/gpt-5.5",
+    })).toMatchObject({ model: "github-copilot/claude-opus-4.6", thinking: "xhigh" });
+  });
+
+  it("uses exact-map default entries and ignores absent exact rules", () => {
+    const config = baseConfig({
+      modelAgents: MODEL_MAP,
+      providerAgents: { "walmart-puppy": { executor: "walmart-puppy/provider-fallback" } },
+    });
+    expect(resolveModel({
+      subagentType: "reviewer-adversarial",
+      config,
+      parentModelId: "awb/claude-opus-4-8",
+    })).toBe("github-copilot/gpt-5.5");
+    expect(resolveModel({
+      subagentType: "executor",
+      config,
+      parentModelId: "walmart-puppy/gpt-5.6-terra",
+      agentConfig: { model: "frontmatter/model" },
+    })).toBe("walmart-puppy/provider-fallback");
+  });
+
+  it("lets session, config, and explicit overrides retain higher precedence over exact maps", () => {
+    const config = baseConfig({ modelAgents: MODEL_MAP });
+    config.agent.executor = "config/model";
+    expect(resolveModel({ subagentType: "executor", config, parentModelId: "walmart-puppy/gpt-5.6-sol", explicitModel: "explicit/model" }))
+      .toBe("config/model");
+    expect(resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ modelAgents: MODEL_MAP }),
+      parentModelId: "walmart-puppy/gpt-5.6-sol",
+      explicitModel: "explicit/model",
+    })).toBe("explicit/model");
+    expect(resolveModel({
+      subagentType: "executor",
+      config: baseConfig({ modelAgents: MODEL_MAP }),
+      parentModelId: "walmart-puppy/gpt-5.6-sol",
+      sessionOverrides: { default: null, executor: "session/model" },
+    })).toBe("session/model");
+  });
+
+  it("does not consult a literal empty-string provider key", () => {
+    const config = baseConfig({
+      providerAgents: { "": { default: "sneaky/model" } },
+    });
+    expect(
+      resolveModel({ subagentType: "executor", config, parentModelId: "" }),
+    ).toBe("");
+    expect(
+      resolveModel({ subagentType: "executor", config, parentModelId: "bare-model" }),
+    ).toBe("bare-model");
+  });
+});
+
+describe("resolveSpawn thinking semantics", () => {
+  it("carries thinking only when the map entry supplied the model", () => {
+    const config = baseConfig({ providerAgents: PROVIDER_MAP });
+    // Map entry wins → its thinking travels with it
+    expect(
+      resolveSpawn({
+        subagentType: "reviewer-adversarial",
+        config,
+        parentModelId: "github-copilot/gpt-5.2",
+      }),
+    ).toMatchObject({ model: "github-copilot/claude-opus-4.8", thinking: "medium" });
+    // Default entry object → same
+    expect(
+      resolveSpawn({
+        subagentType: "executor",
+        config,
+        parentModelId: "openai-codex/gpt-5.6-sol",
+      }),
+    ).toMatchObject({ model: "openai-codex/gpt-5.6-terra", thinking: "high" });
+  });
+
+  it("drops map thinking when a higher tier chose the model", () => {
+    const config = baseConfig({ providerAgents: PROVIDER_MAP });
+    // Session override on the SAME provider/role as a thinking-carrying entry:
+    // the entry didn't supply the model, so its thinking must not leak.
+    const viaSession = resolveSpawn({
+      subagentType: "reviewer-adversarial",
+      config,
+      parentModelId: "github-copilot/gpt-5.2",
+      sessionOverrides: { default: null, "reviewer-adversarial": "github-copilot/gpt-4.1" },
+    });
+    expect(viaSession).toMatchObject({ model: "github-copilot/gpt-4.1", thinking: undefined });
+
+    const viaExplicit = resolveSpawn({
+      subagentType: "reviewer-adversarial",
+      config,
+      parentModelId: "github-copilot/gpt-5.2",
+      explicitModel: "openai-codex/gpt-5.6-luna",
+    });
+    expect(viaExplicit.thinking).toBeUndefined();
+  });
+
+  it("has no thinking for bare-string entries or frontmatter/parent wins", () => {
+    const config = baseConfig({ providerAgents: PROVIDER_MAP });
+    expect(
+      resolveSpawn({ subagentType: "executor", config, parentModelId: "github-copilot/gpt-5.2" }).thinking,
+    ).toBeUndefined();
+    expect(
+      resolveSpawn({ subagentType: "executor", config: baseConfig(), parentModelId: "openai-codex/parent" }).thinking,
+    ).toBeUndefined();
+  });
+
+  it("tolerates malformed hand-edited entries", () => {
+    const junk = {
+      "openai-codex": {
+        // typeof null === "object" — must not throw
+        executor: null,
+        researcher: ["not", "a", "model"],
+        scout: { model: 42, thinking: "high" },
+        default: { model: "openai-codex/ok", thinking: "not-a-level" },
+      },
+    } as unknown as SubagentsConfig["providerAgents"];
+    const config = baseConfig({ providerAgents: junk });
+
+    // null / array / wrong-typed model all fall through to the default entry;
+    // its invalid thinking string is dropped.
+    for (const type of ["executor", "researcher", "scout"]) {
+      expect(
+        resolveSpawn({ subagentType: type, config, parentModelId: "openai-codex/parent" }),
+      ).toMatchObject({ model: "openai-codex/ok", thinking: undefined });
+    }
+  });
+
+  it("treats an empty-string entry as absent", () => {
+    const config = baseConfig({
+      providerAgents: { "openai-codex": { executor: "" as ProviderAgentEntry, default: "openai-codex/ok" } },
+    });
+    expect(
+      resolveSpawn({ subagentType: "executor", config, parentModelId: "openai-codex/parent" }).model,
+    ).toBe("openai-codex/ok");
+  });
+});
+
+describe("providerOf", () => {
+  it("extracts the provider segment", () => {
+    expect(providerOf("openai-codex/gpt-5.6-sol")).toBe("openai-codex");
+    // First segment only: "provider/org/model" keys keep working
+    expect(providerOf("openrouter/qwen/qwen3-max")).toBe("openrouter");
+    expect(providerOf("bare-model")).toBeUndefined();
+    expect(providerOf("")).toBeUndefined();
+    expect(providerOf(undefined)).toBeUndefined();
+  });
+});

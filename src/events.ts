@@ -1,16 +1,18 @@
-import * as fs from "node:fs";
+import type { AgentRecord } from "./types.js";
+
 import * as path from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_AGENTS } from "./agents/default-agents.js";
-import { registerAgents, getAvailableTypes, setAgentScanDirs } from "./agents/agent-types.js";
-import { scanAgentFilesInDir, mergeAgents } from "./agents/agent-discovery.js";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { matchesKey, isKeyRelease } from "@earendil-works/pi-tui";
+import { registerAgents, setAgentScanDirs, scanAndMerge } from "./agents/agent-types.js";
 import { AgentManager } from "./agents/agent-manager.js";
 import { AgentWidget, type UICtx } from "./ui/agent-widget.js";
+import { ConversationViewer } from "./ui/conversation-viewer.js";
 import { SpawnCoordinator } from "./spawn/spawn-coordinator.js";
 import { toolCallListener } from "./agents/tool-execution.js";
+import { invalidateAgentRow, cleanupInvalidations } from "./ui/renderer.js";
 import { registerAgentTool } from "./registration.js";
 import {
-  getPiInstance,
   getManager,
   getWidget,
   getCoordinator,
@@ -21,113 +23,70 @@ import {
   setCoordinator,
 } from "./shell.js";
 
-// Don fork: retain persistent subagent session logs for two weeks.
-const SUBAGENT_SESSION_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-let hasSweptSubagentSessions = false;
+// --- Config loader — session_start handler logic ---
 
-function sweepSubagentSessions(): void {
-  if (hasSweptSubagentSessions) return;
-  hasSweptSubagentSessions = true;
-
-  try {
-    const subagentDir = path.join(getAgentDir(), "sessions-subagents");
-    const cutoff = Date.now() - SUBAGENT_SESSION_MAX_AGE_MS;
-    for (const entry of fs.readdirSync(subagentDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-      const sessionFile = path.join(subagentDir, entry.name);
-      if (fs.statSync(sessionFile).mtimeMs < cutoff) fs.unlinkSync(sessionFile);
-    }
-  } catch {
-    // Session cleanup is best-effort and must never block startup.
-  }
-}
-
-// ============================================================================
-// Config loader — session_start handler logic
-// ============================================================================
-
-/**
- * Ensure the manager and widget singletons exist.
- * Idempotent — safe to call on every session_start.
- */
+/** Idempotent — safe to call on every session_start. */
 export function ensureManagerAndWidget(): void {
   const currentManager = getManager();
   const currentWidget = getWidget();
 
-  // Create manager if missing
   if (!currentManager) {
-    // Coordinator will be created after manager, so use a placeholder onComplete
-    // that we'll replace once coordinator is created.
+    // Coordinator needs the manager, so wire onComplete after creating it.
+    // Invalidate row when agent starts running (queued → running transition)
+    const onStart = (record: AgentRecord) => {
+      invalidateAgentRow(record.id);
+      getWidget()?.update();
+    };
+
     const newManager = new AgentManager(
-      undefined, // onComplete wired below
-      getStore().concurrency as unknown as ConstructorParameters<typeof AgentManager>[1],
       undefined,
-      getStore().agent.outputThinkingBufferSize,
+      getStore().concurrency as unknown as ConstructorParameters<typeof AgentManager>[1],
+      onStart,
     );
     setManager(newManager);
     // Sync the manager as a config side-effect target (concurrency setters call setConcurrency).
     getStore().setDeps({ manager: newManager });
 
-    // Now create coordinator with the real manager
     const coordinator = new SpawnCoordinator(newManager);
     setCoordinator(coordinator);
 
-    // Wire the manager's onComplete to the coordinator
     newManager.setOnComplete((record) => {
-      // Delegate completion side-effects to coordinator
       coordinator.onAgentComplete(record);
-
-      // Mark finished and update widget
-      getWidget()?.markFinished(record.id);
+      invalidateAgentRow(record.id);
       getWidget()?.update();
     });
   }
 
-  // Create widget if missing (uses existing or newly created manager)
   if (!currentWidget) {
-    const newWidget = new AgentWidget(
-      getManager()!,
-      (id: string) => getCoordinator()?.liveView(id),
-    );
+    const newWidget = new AgentWidget(getManager()!, (id: string) => getCoordinator()?.liveView(id));
     setWidget(newWidget);
-    // Sync the widget as a config side-effect target. setDeps re-syncs showCost +
-    // all widget display settings from current config (absorbs the old
-    // newWidget.setShowCost(...) + syncWidgetSettings() calls).
+    // Sync widget as config side-effect target — setDeps re-syncs all display settings from config.
     getStore().setDeps({ widget: newWidget });
   }
 }
 
-/**
- * Scan agent files from user and project directories, merge with defaults,
- * and register into the type registry.
- */
 export async function scanAndRegisterAgents(ctx: ExtensionContext): Promise<void> {
-  const homeDir = process.env.HOME || "";
-  const configuredAgentDir = process.env.PI_CODING_AGENT_DIR;
-  const userAgentDir = configuredAgentDir
-    ? path.join(configuredAgentDir, "agents")
-    : path.join(homeDir, ".pi", "agent", "agents");
-  const projectAgentDir = path.join(ctx.cwd, ".pi", "agents");
+  const agentDir = getAgentDir();
+  const userAgentDir = path.join(agentDir, "agents");
+  const projectTrusted = ctx.isProjectTrusted();
+  const sharedAgentDir = projectTrusted ? path.join(ctx.cwd, ".agents", "agents") : "";
+  const projectAgentDir = projectTrusted ? path.join(ctx.cwd, ".pi", "agents") : "";
 
   // Store scan dirs for on-demand discovery (agents added during the session)
-  setAgentScanDirs(userAgentDir, projectAgentDir);
+  setAgentScanDirs(userAgentDir, projectAgentDir, sharedAgentDir);
 
   const disableDefaults = getStore().agent.disableDefaultAgents;
 
-  const [userAgents, projectAgents] = await Promise.all([
-    scanAgentFilesInDir(userAgentDir, "user"),
-    scanAgentFilesInDir(projectAgentDir, "project"),
-  ]);
+  const merged = await scanAndMerge({ disableDefaultAgents: disableDefaults });
 
-  // Merge with defaults (skip defaults when disableDefaultAgents is on)
-  const defaults = disableDefaults ? new Map() : DEFAULT_AGENTS;
-  const merged = mergeAgents(defaults, userAgents, projectAgents);
-
-  // Register into the type registry (skip re-adding defaults)
   registerAgents(merged, { disableDefaultAgents: disableDefaults });
 }
 
 export async function loadConfigAndRegisterAgents(ctx: ExtensionContext): Promise<void> {
+  // Project config (.pi/subagents-lite.json) loads only in trusted projects,
+  // mirroring the .pi/agents scan-dir gate in scanAndRegisterAgents.
+  const projectDir = ctx.isProjectTrusted() ? path.join(ctx.cwd, ".pi") : undefined;
+  getStore().setProjectDir(projectDir);
   // ConfigStore is authoritative for config + session overrides + widget/manager
   // side effects.
   getStore().reload();
@@ -135,71 +94,146 @@ export async function loadConfigAndRegisterAgents(ctx: ExtensionContext): Promis
   await scanAndRegisterAgents(ctx);
 }
 
-// ============================================================================
-// Event listener setup
-// ============================================================================
+// --- Event listener setup ---
 
-/** Register all pi.on() event listeners. */
+/** Open the viewer overlay; the viewerOpen flag prevents nav deactivation while open. */
+async function openViewer(ctx: ExtensionContext, record: AgentRecord | null): Promise<void> {
+  if (!record) return;
+  if (!record.execution?.session) return;
+  const widget = getWidget();
+  if (!widget) return;
+  const manager = getManager();
+
+  try {
+    widget.setViewerOpen(true);
+
+    await ctx.ui.custom<void>((tui, theme, kb, done) => {
+      const viewer = new ConversationViewer(
+        tui,
+        record.execution.session!,
+        record,
+        theme,
+        done,
+        () => manager?.abort(record.id, "user"),
+        kb,
+        (msg: string) => manager?.steer(record.id, msg),
+      );
+      viewer.setModelDisplayStyle(getStore().agent.modelDisplayStyle);
+      return viewer;
+    });
+  } finally {
+    widget.setViewerOpen(false);
+  }
+}
+
+type InputListenerResult = { consume: true } | undefined;
+
+/** Exposed for tests to drive the real handler with a stubbed ctx. */
+export function createNavInputHandler(ctx: ExtensionContext): (data: string) => InputListenerResult {
+  return (data: string) => {
+    const widget = getWidget();
+
+    // Only fire on key press (not release).
+    if (isKeyRelease(data)) return undefined;
+
+    // Viewer overlay open — don't consume, don't deactivate.
+    if (widget?.isViewerOpen()) {
+      return undefined;
+    }
+
+    // Editor lost focus (dialog, menu, etc.) — deactivate.
+    if (widget && !widget.isEditorFocused()) {
+      if (widget.isNavActive()) widget.navDeactivate();
+      return undefined;
+    }
+
+    if (widget) {
+      if (!widget.isNavActive()) {
+        // ↓ + empty editor + visible agents exist → activate
+        const editorEmpty = (ctx.ui as any).getEditorText?.() === "";
+        if (matchesKey(data, "down") && widget.hasVisibleAgents() && editorEmpty) {
+          widget.navActivate();
+          return { consume: true };
+        }
+      } else {
+        if (matchesKey(data, "down")) {
+          widget.navDown();
+          return { consume: true };
+        }
+        if (matchesKey(data, "up")) {
+          widget.navUp();
+          return { consume: true };
+        }
+        if (matchesKey(data, "escape")) {
+          widget.navDeactivate();
+          return { consume: true };
+        }
+        if (matchesKey(data, "enter")) {
+          const record = widget.navSelect();
+          openViewer(ctx, record).catch((err) => {
+            ctx.ui.notify(`Failed to open agent viewer: ${String(err)}`, "error");
+          });
+          return { consume: true };
+        }
+        // Any other key → deactivate, pass through.
+        widget.navDeactivate();
+      }
+    }
+
+    // ctrl+o toggles tool expansion — sync compact mode with the new state.
+    // Not consumed: pi's built-in handler owns the actual toggle.
+    if (matchesKey(data, "ctrl+o")) {
+      // Read state after a tick so the built-in handler applies the toggle first.
+      setTimeout(() => {
+        const ui = ctx.ui as unknown as { getToolsExpanded?: () => boolean };
+        const expanded = ui.getToolsExpanded?.();
+        if (expanded !== undefined) {
+          getStore().notifyToolsExpanded(expanded);
+        }
+      }, 0);
+    }
+
+    return undefined; // Don't consume the input
+  };
+}
+
 export function setupEventListeners(pi: ExtensionAPI): void {
   pi.on("tool_call", toolCallListener);
 
-  pi.on("tool_execution_start", async (_event, ctx) => {
-    // Set UI context on first tool execution
+  pi.on("turn_start", async (_event, ctx) => {
+    // Set UI context on first turn
     if (!getWidget()) {
       ensureManagerAndWidget();
     }
     getWidget()?.setUICtx(ctx.ui as unknown as UICtx);
-    getWidget()?.onTurnStart();
   });
 
-
-  // session_start — load config, scan agents, register into registry,
-  // then re-register Agent tool with dynamic agent type enum
-  // Listen for ctrl+o keypress to sync compact mode (push-based, no polling)
   let unregisterTerminalInput: (() => void) | undefined;
 
   pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
-    sweepSubagentSessions();
     setSessionCtx(ctx);
     await loadConfigAndRegisterAgents(ctx);
     // Re-register with updated agent type list (now includes user/project agents)
-    // and the live model registry, so the model param advertises valid keys.
-    registerAgentTool(pi, ctx);
-    // Register ctrl+o listener
+    registerAgentTool(pi);
+    // ctrl+o syncs compact mode with tool expansion (push-based, no polling)
     if (ctx.hasUI && !unregisterTerminalInput) {
-      unregisterTerminalInput = ctx.ui.onTerminalInput((data: string) => {
-        // ctrl+o = 0x0F (15) — toggles tool expansion
-        if (data === "\u000f") {
-          // Read state after a tick to let the built-in handler process it first
-          setTimeout(() => {
-            const ui = ctx.ui as unknown as { getToolsExpanded?: () => boolean };
-            const expanded = ui.getToolsExpanded?.();
-            if (expanded !== undefined) {
-              // Widget render hint (tool row state), then config-gated compact toggle.
-              getWidget()?.notifyToolsExpansionChanged(expanded);
-              getStore().notifyToolsExpanded(expanded);
-            }
-          }, 0);
-        }
-        return undefined; // Don't consume the input
-      });
+      unregisterTerminalInput = ctx.ui.onTerminalInput(createNavInputHandler(ctx));
     }
     // Sync compact mode with initial tool expansion state
     getStore().notifyToolsExpanded(false);
   });
 
-  // session_shutdown — abort all, dispose manager
   pi.on("session_shutdown", async (_event: unknown, ctx: ExtensionContext) => {
-    // Warn if agents were killed
     const currentManager = getManager();
     if (currentManager) {
       const records = currentManager.listAgents();
-      const active = records.filter(r => r.lifecycle.status === "running" || r.lifecycle.status === "queued");
+      const active = records.filter((r) => r.lifecycle.status === "running" || r.lifecycle.status === "queued");
       if (active.length > 0 && ctx.hasUI) {
         ctx.ui.notify(`${active.length} agent(s) killed by reload`, "warning");
       }
     }
     // Dispose coordinator, store, widget, then manager
+    cleanupInvalidations();
     getCoordinator()?.dispose();
     setCoordinator(null);
     getStore().dispose();

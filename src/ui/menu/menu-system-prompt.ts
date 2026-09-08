@@ -2,11 +2,9 @@
  * menu-system-prompt.ts — System prompt settings menu concern.
  *
  * Uses SettingsList from @earendil-works/pi-tui via ctx.ui.custom.
- * SettingsList maintains internal cursor state, fixing the cursor-position
- * reset bug that occurred with ctx.ui.select.
  *
  * Exports:
- *   - showSystemPromptMenu: system prompt mode, create prompt file, include AGENTS.md
+ *   - showSystemPromptMenu: system prompt mode, AGENTS.md, skills, extensions, strict schema
  */
 
 import fs from "node:fs";
@@ -70,6 +68,7 @@ export async function showSystemPromptMenu(ctx: ExtensionCommandContext): Promis
 
     return items;
   };
+
   let items = buildItems();
   let rebuild: ((newItems: SettingItem[]) => void) | null = null;
 
@@ -85,7 +84,11 @@ export async function showSystemPromptMenu(ctx: ExtensionCommandContext): Promis
       case "createPromptFile":
         try {
           fs.mkdirSync(path.dirname(CUSTOM_PROMPT_PATH), { recursive: true });
-          fs.writeFileSync(CUSTOM_PROMPT_PATH, "You are a Pi, an expert coding sub-agent.\nYou have been invoked to handle a specific task autonomously", "utf-8");
+          fs.writeFileSync(
+            CUSTOM_PROMPT_PATH,
+            "You are a Pi, an expert coding sub-agent.\nYou have been invoked to handle a specific task autonomously",
+            "utf-8",
+          );
           ctx.ui.notify(`Created prompt file: ${CUSTOM_PROMPT_PATH}`, "info");
         } catch (err: any) {
           ctx.ui.notify(`Failed to create prompt file: ${err.message}`, "error");
@@ -108,6 +111,13 @@ export async function showSystemPromptMenu(ctx: ExtensionCommandContext): Promis
 
   await ctx.ui.custom((_tui, theme, _kb, done) => {
     const settingsList = new SettingsList(items, 10, buildSettingsListTheme(theme), onChange, () => done(undefined));
-    return new SettingsListWrapper(settingsList, { title: "System Prompt", theme, onCancel: () => done(undefined), onRebuild: (r) => { rebuild = r; } });
+    return new SettingsListWrapper(settingsList, {
+      title: "System Prompt",
+      theme,
+      onCancel: () => done(undefined),
+      onRebuild: (r) => {
+        rebuild = r;
+      },
+    });
   });
 }

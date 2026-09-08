@@ -1,0 +1,125 @@
+/**
+ * usage.test.ts — Tests for usage tracking utilities.
+ */
+
+import { describe, it, expect } from "vitest";
+import { type LifetimeUsage, addUsage, getLifetimeTotal, formatTokens, formatCost } from "../../src/agents/usage.js";
+
+/* ------------------------------------------------------------------ */
+/*  addUsage — cost accumulation                                       */
+/* ------------------------------------------------------------------ */
+
+describe("addUsage", () => {
+  it("accumulates cost into target", () => {
+    const target: LifetimeUsage = { input: 100, output: 50, cacheWrite: 10, cost: 5 };
+    addUsage(target, { input: 10, output: 5, cacheWrite: 1, cost: 2 });
+    expect(target).toEqual({ input: 110, output: 55, cacheWrite: 11, cost: 7 });
+  });
+
+  it("handles zero cost delta", () => {
+    const target: LifetimeUsage = { input: 100, output: 50, cacheWrite: 10, cost: 5 };
+    addUsage(target, { input: 10, output: 5, cacheWrite: 1, cost: 0 });
+    expect(target.cost).toBe(5);
+  });
+
+  it("accumulates multiple deltas", () => {
+    const target: LifetimeUsage = { input: 0, output: 0, cacheWrite: 0, cost: 0 };
+    addUsage(target, { input: 100, output: 50, cacheWrite: 10, cost: 2.5 });
+    addUsage(target, { input: 200, output: 100, cacheWrite: 20, cost: 5.0 });
+    addUsage(target, { input: 50, output: 25, cacheWrite: 5, cost: 1.25 });
+    expect(target).toEqual({ input: 350, output: 175, cacheWrite: 35, cost: 8.75 });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  getLifetimeTotal — returns input + output only                        */
+/* ------------------------------------------------------------------ */
+
+describe("getLifetimeTotal", () => {
+  it("returns sum of input + output only (no cacheWrite, no cost)", () => {
+    const u: LifetimeUsage = { input: 100, output: 50, cacheWrite: 10, cost: 5 };
+    // 100 + 50 = 150
+    expect(getLifetimeTotal(u)).toBe(150);
+  });
+
+  it("returns 0 for undefined", () => {
+    expect(getLifetimeTotal(undefined)).toBe(0);
+  });
+
+  it("returns 0 when input and output are 0", () => {
+    const u: LifetimeUsage = { input: 0, output: 0, cacheWrite: 99, cost: 99 };
+    expect(getLifetimeTotal(u)).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  formatTokens — compact token formatting                            */
+/* ------------------------------------------------------------------ */
+
+describe("formatTokens", () => {
+  it("formats values below 1000 as raw number", () => {
+    expect(formatTokens(0)).toBe("0");
+    expect(formatTokens(500)).toBe("500");
+    expect(formatTokens(999)).toBe("999");
+  });
+
+  it("formats values >= 1000 with k suffix (1 decimal)", () => {
+    expect(formatTokens(1000)).toBe("1.0k");
+    expect(formatTokens(12300)).toBe("12.3k");
+    expect(formatTokens(100500)).toBe("100.5k");
+  });
+
+  it("formats values >= 1000000 with M suffix (1 decimal)", () => {
+    expect(formatTokens(1_000_000)).toBe("1.0M");
+    expect(formatTokens(1_200_000)).toBe("1.2M");
+    expect(formatTokens(12_345_678)).toBe("12.3M");
+  });
+
+  it("rounds down (no decimal rounding issues)", () => {
+    // 1234 → 1.234 → 1.2k
+    expect(formatTokens(1234)).toBe("1.2k");
+  });
+  it("compact mode rounds thousands to whole k", () => {
+    expect(formatTokens(999, true)).toBe("999");
+    expect(formatTokens(12300, true)).toBe("12k");
+    expect(formatTokens(12500, true)).toBe("13k");
+  });
+
+  it("compact mode leaves the M range at 1 decimal", () => {
+    expect(formatTokens(1_200_000, true)).toBe("1.2M");
+  });
+
+  it("handles exactly 1 million", () => {
+    expect(formatTokens(1_000_000)).toBe("1.0M");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  formatCost — dollar formatting                                   */
+/* ------------------------------------------------------------------ */
+
+describe("formatCost", () => {
+  it("formats zero as $0.00", () => {
+    expect(formatCost(0)).toBe("$0.00");
+  });
+
+  it("formats small cost with 2 decimal places", () => {
+    expect(formatCost(0.008)).toBe("$0.01");
+  });
+
+  it("formats $1.23", () => {
+    expect(formatCost(1.23)).toBe("$1.23");
+  });
+
+  it("formats $0.01", () => {
+    expect(formatCost(0.01)).toBe("$0.01");
+  });
+
+  it("formats $12.34", () => {
+    expect(formatCost(12.345)).toBe("$12.35");
+  });
+
+  it("formats very small cost as $0.00", () => {
+    expect(formatCost(0.001)).toBe("$0.00");
+  });
+});

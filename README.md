@@ -1,291 +1,190 @@
-# pi-subagents-lite-don
+# pi-subagents-lite
 
-BLUF: A Don-owned vendored fork of `pi-subagents-lite@1.4.6`. The original
-change: each subagent runs on a **persisted** session (with parent lineage)
-instead of an in-memory one, so usage/session scrapers can see and classify
-subagent runs. Later fork extensions (session_key executors, one-shot
-foreground enforcement, provider-follow model map) are listed under
-"Fork extensions" below.
+[![npm version](https://img.shields.io/npm/v/pi-subagents-lite)](https://www.npmjs.com/package/pi-subagents-lite)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- Provenance: forked from `pi-subagents-lite` version **1.4.6**
-  (`git+https://github.com/AlexParamonov/pi-subagents-lite.git`, MIT).
-- Source copied from `~/.pi/agent/npm/node_modules/pi-subagents-lite/` on
-  2026-07-12.
-- Rationale, cited APIs, and options analysis:
-  `~/puppy_workspace/projects/llm-usage-tracker/docs/subagent-persistence-findings.md`
-  (this fork implements that doc's Option A + the "Shared core edit").
+Sub-agents for [pi](https://pi.dev). Schema-first, minimal token overhead.
 
-## The one behavioral change
+Spawn custom agents in isolated session with own tools, extensions and model. Three tools, no descriptions, minimal token overhead. Names like `Agent`, `run_in_background`, and `worktree_path` are the schema.
 
-File: `src/agents/agent-runner.ts`, function `initSession()`.
+Foreground and background agents with detailed model configuration, concurrency, custom agent types, steering and continuation, cross-repo worktree support, configurable system prompt modes, a live widget and conversation viewer with cost tracking, and a watchdog for stuck agents.
 
-Upstream created every subagent session in memory, so nothing was ever written
-to disk:
+## Install
 
-```ts
-sessionManager: SessionManager.inMemory(cwd),
+Requires Node.js >= 18 and pi >= 0.82.0.
+
+```bash
+pi install npm:pi-subagents-lite
+pi install -l npm:pi-subagents-lite   # project-local
+pi -e npm:pi-subagents-lite           # try without installing
 ```
 
-This fork persists the subagent session under a dedicated subdir, tagged with
-the parent session for lineage, and falls back to the old in-memory behavior
-when there is no parent session (for example `pi -p --no-session`):
+## Usage
 
-```ts
-const parent = ctx.sessionManager.getSessionFile();
-const subagentDir = path.join(agentDir, "sessions-subagents");
-const sessionManager = parent
-  ? SessionManager.create(cwd, subagentDir, { parentSession: parent })
-  : SessionManager.inMemory(cwd);
+The LLM calls `Agent` like any other tool. Foreground agents return inline with stats. Background agents acknowledge immediately and auto-deliver on completion.
+
+```
+◈ Agents
+  ⠧ builder  Bump all gpu_inference_proxy deps to latest  6⟳ ·↑7k↓2k 2%·$0.00·54s
+  │ MiMo V2.5 • high
+  └ running command…
+  ⠧ scout  Explore keepalive events config  25⟳ ·↑79k↓5k 8%·$0.01·2m 39s
+  │ MiMo V2.5 • high
+  └ Now I have enough information to provide a comprehensive answer.
 ```
 
-The full diff is `patch/persist.diff`. No imports were added (`path`,
-`getAgentDir`, and `SessionManager` were already imported). The existing
-`session.setSessionName(...)` call is unchanged; once the manager persists, that
-call emits a `session_info` entry naming the session after the agent
-(for example `qa#a1b2c3d4`).
+The widget shows running and recently finished agents above the editor. `↓`/`↑` highlights an agent, `Enter` opens the conversation viewer, `Esc` closes navigation. The viewer streams the live transcript: thinking blocks, tool calls, compaction summaries, and results.
 
-Result per subagent run (when the parent session is persisted): one `.jsonl`
-under `<agent-dir>/sessions-subagents/` whose header carries
-`parentSession = <parent .jsonl path>`, a `session_info` name entry, and
-assistant messages carrying per-turn `usage` (tokens/cost).
+The `/agents` menu covers running agents (view, steer, continue settled agents, stop, clear), manual spawns without an LLM round-trip, model settings, concurrency, and widget layout.
 
-Note on style: the patch reuses the `agentDir` local already computed two lines
-above (`const agentDir = getAgentDir();`) rather than calling `getAgentDir()`
-again. This is semantically identical to the findings-doc snippet and matches
-the surrounding code, which already uses `agentDir`.
+### Agent tools
 
-## Fork extensions beyond the persistence change
+- `Agent` spawns a sub-agent (see [Agent options](#agent-options) for parameters).
+- `StopAgent` stops a running or queued agent by ID. IDs come from the spawn result, the stop error, or `/agents`.
+- `AgentStatus` lists all agents with type, short ID, and status.
 
-Added after the original fork (see git log for details):
+Foreground agents dont lock the session and can be stopped by parent's interrupt. Background agents are fully autonomous.
 
-- **`session_key`** on the Agent tool: named, persistent, per-project executor
-  sessions that survive across parent sessions (the two-tier architecture's
-  Terra executor). Migration/default behavior: agents without lifecycle
-  metadata default to stateless. If a stateless call supplies a non-empty
-  `session_key`, the tool strips the key, records a normalization warning, and
-  dispatches the agent once as a stateless one-shot. Empty/whitespace
-  `session_key` values are also stripped with a warning. Agents that need keyed
-  reuse must opt in with `session_lifecycle: persistent`; existing agent files
-  that already use the legacy `persistent_session: true` alias continue to opt
-  in, but new files should prefer `session_lifecycle`. Persistent keyed calls
-  cannot be combined with a non-empty `worktree_path`; that is a hard
-  non-retryable validation error because the tool will not silently alter
-  persistent worktree intent.
-- **Forced foreground in one-shot mode**: `run_in_background` is ignored when
-  there is no UI (`pi -p` / `--mode json`) — the process exits at turn end, so
-  a background child could never deliver its result.
-- **`dispose()` aborts running children** so a SIGTERMed parent doesn't leave
-  orphans burning provider quota.
-- **Exact-parent model map** (`modelAgents`) and **provider-follow model map** (`providerAgents`) — below.
+### Steering and continuation
 
-### Exact-parent and provider-follow model maps
+Steer a running agent mid-task to redirect it: `Enter` in the conversation viewer, or `Steer` in the `/agents` menu. Settled agents (completed, errored, stopped, turn-limited) can be continued manually from the conversation viewer.
 
-Problem: agent frontmatter pins concrete models (`model: openai-codex/gpt-5.6-terra`),
-so switching the orchestrator to another provider (quota exhausted, trying a
-new model) leaves every subagent behind on the old provider.
+## Built-in agents
 
-`subagents-lite.json` may carry two maps. `modelAgents` is keyed by the full
-**orchestrator `provider/model` ID**; it supports a per-agent-type entry and a
-`"default"` fallback. `providerAgents` remains keyed by provider and is checked
-only after an exact model route. An entry is a model key or
-`{ "model": ..., "thinking": ... }`:
+- `general-purpose` does general task execution using the configured session tools.
+- `Explore` does read-only codebase exploration.
 
-```json
-{
-  "modelAgents": {
-    "walmart-puppy/gpt-5.6-sol": {
-      "executor": { "model": "walmart-puppy/gpt-5.6-terra", "thinking": "medium" }
-    }
-  },
-  "providerAgents": {
-    "github-copilot": {
-      "default": "github-copilot/gpt-5.2"
-    }
-  }
-}
+Built-ins can be overridden by custom agents or disabled from `/agents`. Disabling takes effect immediately for future `Agent` calls. Running and queued agents continue with the policy captured at spawn.
+
+## Custom agents
+
+Drop a `.md` file into `.pi/agents/` (project), `.agents/agents/` (shared), or `~/.pi/agent/agents/` (global). Frontmatter configures the agent, the body is its system prompt. The name auto-populates the `agent` parameter's enum, so nothing needs registering. On name clash, project > shared > user > built-in. Type names resolve case-insensitively.
+
+```markdown
+---
+name: security-review
+description: Review code for security issues
+tools: [read, bash, grep]
+extensions: false
+skills: false
+model: zai/glm-5.2
+thinking: high
+max_turns: 80
+---
+
+You are a security review specialist. Analyze code for vulnerabilities,
+focusing on injection flaws, auth bypasses, and insecure defaults.
 ```
 
-This permits exact parent-model routes while retaining provider-wide fallback
-behavior. Unmapped exact IDs proceed to `providerAgents`, then frontmatter.
+A minimal agent with just `name` and `description` gets everything, same as `general-purpose`. Set restrictions only when you want them.
 
-Model precedence (`src/models/model-precedence.ts`): session override →
-`subagents-lite.json` pin → explicit per-call `model` param → `modelAgents`
-exact map → `providerAgents` map → frontmatter → parent model. The per-call
-param slot is also a fork change: upstream clobbered it; it now wins over both
-maps and frontmatter while still losing to user-set pins. A model that is not
-in the registry fails the Agent call instead of silently falling back to the
-parent model.
+### Frontmatter reference
 
-### Tolerant model specs (`src/models/model-spec.ts`)
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | — | Agent type name. Must be unique; a file without it is skipped. |
+| `display_name` | string | `name` | Label in the UI. |
+| `color` | string | none | Agent color for icon tinting. Named colors: `red`, `blue`, `green`, `yellow`, `purple`, `orange`, `pink`, `cyan`. Palette aliases: `amber`, `teal`, `indigo`, `gold`, `violet`, `rose`, `lime`, `gray`, `slate`, `navy`, etc. Also accepts `#RRGGBB` hex. |
+| `description` | string | `""` | One-sentence description. |
+| `tools` | `true` \| `string[]` \| `false` | `true` | Tool whitelist. Mutually exclusive with `exclude_tools`. |
+| `exclude_tools` | `string[]` | none | Tool blacklist. Mutually exclusive with `tools`. |
+| `extensions` | `true` \| `string[]` \| `false` | `true` | Which extensions load (hooks and commands). Does not control tool visibility. |
+| `exclude_extensions` | `string[]` | none | Extension blacklist. |
+| `skills` | `true` \| `string[]` \| `false` | `true` | Skill whitelist (metadata-only in system prompt). |
+| `preload_skills` | `string[]` \| `false` | `false` | Dump full SKILL.md content into the system prompt. Expensive. |
+| `model` | string | inherit parent | `"provider/model-id"`. See [Model resolution](#model-resolution). |
+| `thinking` | string | inherit parent | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |
+| `max_turns` | number | unlimited | Soft turn limit, then grace turns before hard abort. |
+| `max_tokens` | number | unlimited | Max output tokens per LLM response. |
+| `hidden` | boolean | `false` | Hide from the enum. Still callable by name. |
+| `output_transcript` | boolean | inherit global | Write streaming transcript to `/tmp/pi-agent-outputs/<agentId>.log` (frontmatter overrides). |
+| `include_context_files` | boolean | inherit global | Include AGENTS.md files as `<project_context>` in the system prompt. `true` = load, `false` = none, unset = global "Include AGENTS.md" setting. |
+| `include_system_prompt` | boolean | inherit global | Include the parent's system prompt for this agent. `true` = inherit parent, `false` = replace mode, unset = global mode. When the global mode is `custom`, the custom prompt wins over `true`. |
 
-Problem: the per-call `model` param accepted only a canonical
-`provider/model-id` key, and every other spelling produced a non-retryable
-"Model not found in registry" error with no format hint and no candidate list.
-An orchestrator then burned one turn per guess (`terra`, `gpt-5.4`,
-`claude-opus-5`, `default`) before a heavy agent finally ran, often on a weaker
-model than intended.
+Tool and extension lists accept built-in names (`read`, `bash`, `edit`, `write`, `grep`), extension tool names (`web_search`), and `ext/*` globs (`tavily/*`). `exclude_tools: [tavily/*]` hides the tools but the extension still loads. Use `exclude_extensions: [tavily]` to prevent loading.
 
-`resolveModelSpec` now accepts, in order:
+`loadSkillsImplicitly` and `loadExtensionsImplicitly` (config, default ON) decide what an agent gets when frontmatter omits `skills` or `extensions`. Turn them OFF to default new agents to nothing and opt in explicitly.
 
-1. `provider/model-id`, with an optional `:thinking` suffix
-2. inherit keywords: `default`, `parent`, `inherit`, `host`, `same`, `auto`, `any`
-3. `modelAliases` from `subagents-lite.json` (separator and case insensitive)
-4. aliased providers: `copilot/gpt-5.5`, `wm/gpt-5.6-terra`, `claude/claude-opus-5`
-5. `provider model-id` with a space: `awb claude-opus-5`
-6. a bare model id: `gpt-5.4`, `Opus 5`
-7. a unique fragment: `terra`, `luna`
+## Agent options
 
-A trailing effort word sets thinking (`terra high`, `opus 5 medium`). An
-ambiguous fragment fails with every candidate listed, and an unknown spec fails
-with the format, the close matches, and the available keys, so the next call is
-exact instead of another guess. The Agent tool schema also publishes the format
-and the live registry keys in the `model` param description.
+`Agent` accepts:
 
-User aliases live in `subagents-lite.json`:
+- `prompt` (required) is the task text.
+- `description` is a short label for the widget; defaults to the first line of the prompt.
+- `agent` is the agent type; defaults to `general-purpose`.
+- `run_in_background` makes the agent return immediately and notify the parent when complete.
+- `worktree_path` is any git repository on disk: a worktree of the parent's repo, its main checkout, or a different repo entirely. See [Worktree paths and trust](#worktree-paths-and-trust).
 
-```json
-{
-  "modelAliases": {
-    "terra-high": "walmart-puppy/gpt-5.6-terra:high",
-    "opus-5-medium": "awb/claude-opus-5:medium"
-  }
-}
+`model`, `thinking`, `max_turns`, and `max_tokens` are injected from config and frontmatter, never passed by the LLM. Set them once and forget.
+
+Subagents cannot spawn further subagents.
+
+### Worktree paths and trust
+
+`worktree_path` accepts a path inside any git repository on disk: a linked worktree of the parent's repo, its main checkout, or a different repo entirely. The subagent runs with that directory as its working directory. A path outside any git repo is rejected.
+
+Cross-repo targets are gated by pi's existing trust framework. The target's saved trust decision (nearest ancestor wins) applies, and an undecided target falls back to the global `defaultProjectTrust` setting. Anything other than "always" means untrusted. An untrusted target still spawns, but its project resources (`.pi/` settings, extensions, skills, prompts, themes, system prompt files, `.agents/skills`) are ignored, its `.pi/agents` types are not discovered, the extension's project config (`.pi/subagents-lite.json`) is not loaded, and pi surfaces a warning. Same-repo paths are never gated. The `/agents` spawn wizard still lists same-repo worktrees only.
+
+## Model resolution
+
+Precedence, highest first:
+
+1. Session per-type override (`/agents` > Model settings)
+2. Session global default
+3. Config per-type override (`~/.pi/agent/subagents-lite.json`)
+4. Config global default
+5. Agent frontmatter `model`
+6. Parent model
+
+## Concurrency
+
+`concurrency` caps parallel agents. A per-model limit overrides a per-provider limit, which overrides the `default` per-model limit. Excess spawns queue until a slot frees.
+
+## Settings
+
+Global settings live in `~/.pi/agent/subagents-lite.json`, managed via `/agents` or edited directly. 
+
+`/agents` covers model settings per-type overrides, concurrency, widget, spawn defaults (thinking, max turns, force-background), system prompt mode, watchdog timeouts.
+
+```
+Settings
+
+→ Model                           Set global default and per-type model overrides
+  Concurrency                     Set per-model slot limits
+  Agent                           Agent limit, colors, output, thinking
+  System prompt                   Prompt mode, AGENTS.md, skills, extensions
+  Widget                          Configure widget display options
 ```
 
-Agent frontmatter goes through the same resolver, and a frontmatter model that
-is no longer in the registry now warns before the parent-model fallback,
-instead of silently downgrading a heavy agent to the orchestrator's cheap
-model.
+Widget is higly customizable as the rest of the extension
 
-### Model resolution moved into `execute()`
+### Project-level config
 
-Model precedence used to be applied only by the `tool_call` listener, which
-rewrote `input.model` before the tool ran. That listener does not fire in
-one-shot (`pi -p`) runs, and one-shot runs are how two-context delegations
-spawn children. Result: every frontmatter pin was ignored headless, so
-`lmd-science` (pinned to `awb/claude-opus-5:high`) ran on the orchestrator's
-`walmart-puppy/gpt-5.6-sol`. Verified in `~/.pi-lite/agent/sessions-subagents`:
-the child's `model_change` record showed the parent model before the fix and
-`awb/claude-opus-5` after it.
+A project can commit its own defaults as `.pi/subagents-lite.json` (same file name as the global one). This is an override layer, not a full config. It may contain only model and concurrency settings (`agent.default`, per-type model overrides, `concurrency`), and each key it sets overrides the global file's value. Every other setting (widget, watchdog, spawn defaults) always comes from the global file. The effective value of each key resolves as: session override > project file > global file > built-in default.
 
-`executeAgentTool` now resolves the whole chain itself (`spawnFor` when the
-caller passes no `model`), and the listener only canonicalizes what the caller
-typed, for display. A stale config or frontmatter pin warns and falls back to
-the parent model; a caller-typed spec that fails still errors.
+### System prompt mode
 
-`thinking` travels with the model: a map entry's thinking applies only when
-that entry supplied the resolved model (never leaking onto a model chosen by
-a session override or per-call param), and always loses to an explicit
-per-call `thinking` param.
+`systemPromptMode` (default `replace`):
 
-When `PI_CODING_AGENT_DIR` is set, configuration and the custom-prompt path
-are read and saved beneath that directory. For pi-lite this is
-`~/.pi-lite/agent/subagents-lite.json`, which prevents shared regular-Pi
-configuration. Without that environment variable, the legacy location remains
-`~/.pi/agent/subagents-lite.json`. Config edits apply at the next session
-start (`/agents` session overrides cover mid-session changes).
+- `replace` uses a minimal generic prompt plus the agent's instructions. Lowest cost and most isolated.
+- `inherit` uses the parent's system prompt plus the agent's instructions.
+- `custom` uses `~/.pi/agent/subagents-lite-prompt.md` plus the agent's instructions.
 
-## How pi loads this fork (no build step)
+When `includeContextFiles` is `true` (default), AGENTS.md files load as shared context before agent instructions, which improves KV cache prefix hits.
 
-Pi consumes the package's TypeScript `src/` directly (via its bundled bun
-runtime). The package manifest declares the entry in `package.json`:
+### Watchdog
 
-```json
-"pi": { "extensions": ["./src/index.ts"] }
-```
+The watchdog stops agents that hang. Two independent checks, both default 45 minutes, `0` disables:
 
-There is no `dist/`, no compile, and no `npm install`:
+- `toolTimeoutMinutes`: a single tool call running longer than this stops the agent.
+- `idleTimeoutMinutes`: no activity (tool events or streamed response text) for this long stops the agent.
 
-- The `@earendil-works/*` imports are pi core packages (peer dependencies) that
-  pi provides to every extension.
-- The only third-party import is `@sinclair/typebox` (in
-  `src/registration.ts`). Pi bundles it at
-  `.../pi-coding-agent/node_modules/typebox` and injects it for extensions, so
-  it resolves even for a package loaded from an arbitrary local path. Verified
-  empirically (see "Verification").
+The watchdog notifies the main session on a kill so it can act accordingly.
 
-To activate the fork, point pi at this directory with an absolute local path in
-`settings.json` `packages` (replacing `"npm:pi-subagents-lite"`). Exact,
-reversible steps are in `docs/CUTOVER.md`. This fork is a true drop-in: it reads
-the same `~/.pi/agent/subagents-lite.json` config and registers the same
-`/agents` command, so all existing agent definitions and settings carry over.
+### Output transcripts
 
-## Verification
-
-Two levels; see `docs/CUTOVER.md` for how they fit the cutover.
-
-1. Deterministic, no-LLM mechanism proof (safe to run anytime):
-
-   ```bash
-   ./bin/verify-mechanism.sh
-   ```
-
-   Drives pi's real `SessionManager` exactly as the patched `initSession()`
-   does, in a throwaway temp dir, and asserts the persisted `.jsonl` has
-   `parentSession` in the header plus a `session_info` name entry, and that the
-   no-parent branch stays in-memory. No pi process, no LLM, no `~/.pi` writes.
-
-2. End-to-end integration proof (needs a provisioned throwaway agent dir):
-
-   ```bash
-   ./bin/verify.sh --agent-dir /path/to/throwaway-agent-dir
-   ```
-
-   Launches one isolated `pi -p` subagent run against a throwaway agent dir that
-   loads this fork, then asserts a new `.jsonl` under `sessions-subagents/`.
-   Refuses to run against the live `~/.pi/agent`.
-
-## Re-syncing with upstream later
-
-Upstream is a single-file change, so re-sync is cheap.
-
-1. Note the upstream version you are moving to and refresh the source:
-
-   ```bash
-   # Upstream pristine agent-runner.ts sha256 this fork was cut from (1.4.6):
-   #   4c312cb77c919f3d185094bb516316ac554b2fd7c5f9e73e91f55bc3b4c9cb6b
-   UP=~/.pi/agent/npm/node_modules/pi-subagents-lite   # or a fresh npm/git checkout
-   shasum -a 256 "$UP/src/agents/agent-runner.ts"      # compare to the hash above
-   rsync -a --delete "$UP/src/" src/                   # bring in the new upstream src
-   cp "$UP/README.md" UPSTREAM_README.md
-   ```
-
-2. Re-apply the one change:
-
-   ```bash
-   git apply patch/persist.diff        # clean re-apply if initSession() is unchanged
-   ```
-
-   If upstream refactored `initSession()` and the patch does not apply, redo the
-   edit by hand: replace `sessionManager: SessionManager.inMemory(cwd)` in
-   `initSession()` with the parent-aware block shown above, then regenerate the
-   patch:
-
-   ```bash
-   diff -u --label a/src/agents/agent-runner.ts --label b/src/agents/agent-runner.ts \
-     "$UP/src/agents/agent-runner.ts" src/agents/agent-runner.ts > patch/persist.diff
-   ```
-
-3. Re-verify and commit:
-
-   ```bash
-   ./bin/verify-mechanism.sh
-   git add src patch/persist.diff UPSTREAM_README.md
-   git commit -m "resync: pi-subagents-lite <old> -> <new>, reapply persist change"
-   ```
-
-## Layout
-
-| Path | Purpose |
-|---|---|
-| `src/` | Vendored upstream source with the one change applied |
-| `patch/persist.diff` | The applied change, for reference and re-apply |
-| `docs/CUTOVER.md` | Exact reversible load / verify / rollback steps |
-| `bin/verify-mechanism.sh` + `.mjs` | Deterministic no-LLM persistence proof |
-| `bin/verify.sh` | End-to-end isolated subagent run + assertions |
-| `UPSTREAM_README.md` | Upstream README, verbatim, for provenance |
-| `LICENSE` | Upstream MIT license, retained |
+Output transcripts are disabled by default. Enable them globally via the `outputTranscript` config option or per-agent via the `output_transcript` frontmatter field. When enabled, the transcript streams to `/tmp/pi-agent-outputs/<agentId>.log` (append-only, `tail -f` friendly) and the widget shows the `tail -f` line. Logs and completed results survive on disk even if a session reload (`/reload`, extension reload) kills running agents.
 
 ## License
 
-MIT, inherited from upstream (`LICENSE`).
+MIT

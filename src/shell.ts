@@ -1,13 +1,9 @@
 /**
  * shell.ts — Composition root shell.
  *
- * Per ADR 0004, the Shell is the single mutable container for all per-session
- * state. Created at session_start, disposed at session_shutdown. Handler
- * modules read from shell via the getter functions — no module-level mutable
- * globals.
- *
- * index.ts populates the shell at session_start; handler modules import
- * getManager() / getWidget() / etc.
+ * Per ADR 0004, the single mutable container for all per-session state,
+ * created at session_start, disposed at session_shutdown. Handler modules
+ * read via getter functions — no module-level mutable globals.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,9 +12,7 @@ import type { AgentWidget } from "./ui/agent-widget.js";
 import type { SpawnCoordinator } from "./spawn/spawn-coordinator.js";
 import { ConfigStore } from "./config/config-store.js";
 
-// ============================================================================
-// Shell type
-// ============================================================================
+// --- Shell type ---
 
 interface Shell {
   pi: ExtensionAPI;
@@ -29,9 +23,7 @@ interface Shell {
   coordinator: SpawnCoordinator | null;
 }
 
-// ============================================================================
-// Mutable module-level shell (populated by index.ts at session_start)
-// ============================================================================
+// --- Mutable module-level shell (populated by index.ts at session_start) ---
 
 const shell: Shell = {
   pi: null!,
@@ -42,84 +34,89 @@ const shell: Shell = {
   coordinator: null,
 };
 
-// ============================================================================
-// Getter functions (read current state at call time)
-// ============================================================================
+// --- Getter functions (read current state at call time) ---
 
-/** The PI extension API instance. Set at init time. */
+/** Set at init time. */
 export function getPiInstance(): ExtensionAPI {
   return shell.pi;
 }
 
-/** The current session context. Set at session_start. */
+/** Set at session_start. */
 export function getSessionCtx(): ExtensionContext {
   return shell.sessionCtx;
 }
 
-/** The current AgentManager, or null if not yet created. */
+/** Null until created at session_start. */
 export function getManager(): AgentManager | null {
   return shell.manager;
 }
 
-/** The current AgentWidget, or null if not yet created. */
+/** Null until created at session_start. */
 export function getWidget(): AgentWidget | null {
   return shell.widget;
 }
 
-/** The ConfigStore (lives for the lifetime of the extension). */
+/** Lives for the lifetime of the extension. */
 export function getStore(): ConfigStore {
   return shell.store;
 }
 
+/** Don fork: the narrow session-routing surface published on globalThis. */
+export interface SessionBridge {
+  setAmbient(type: string, spec: string): void;
+  setOverride(type: string, spec: string): void;
+  clearOverride(type: string): void;
+  /** Drop the ambient route only, keeping hard /agents pins intact. */
+  clearAmbient(): void;
+  clearAll(): void;
+  list(): Record<string, string>;
+}
+
+/** The globalThis key the bridge is published under. */
+export const SESSION_BRIDGE_KEY = "__piSubagentsLiteSession";
+
 /**
- * Publish a narrow session-override bridge on globalThis.
+ * Don fork: publish a narrow session-override bridge on globalThis.
  *
- * The store is module-private, so a sibling extension (for example the /pool
- * command) has no way to scope subagent routing to one session. Without this,
+ * The store is module-private, so a sibling extension (the /pool command, for
+ * example) has no way to scope subagent routing to one session. Without this
  * every pool switch is global: it rewrites config for all runtimes and every
- * future session, which is wrong when Don only wants this session on another
- * pool. Only session overrides are exposed, never persisted config, so a
- * caller cannot use the bridge to write to disk.
+ * future session, which is wrong when only this session should move pools.
+ *
+ * Only session-scoped setters are exposed, never persisted config, so a caller
+ * cannot use the bridge to write to disk.
  */
 export function publishSessionBridge(): void {
-  (globalThis as any).__piSubagentsLiteSession = {
-    /**
-     * Ambient route for this session, used by /pool. `spec` may include
-     * ":thinking". Sits below an explicit per-call model, so a deliberate
-     * escalation still wins.
-     */
-    setAmbient: (type: string, spec: string): void => {
-      shell.store.mutate.session.setAmbient(type, spec);
-    },
-    /** Hard per-session pin, as set by the /agents menu. Outranks everything. */
-    setOverride: (type: string, spec: string): void => {
-      shell.store.mutate.session.setOverride(type, spec);
-    },
-    clearOverride: (type: string): void => {
-      shell.store.mutate.session.clearOverride(type);
-    },
-    clearAll: (): void => {
-      shell.store.mutate.session.clearAll();
-    },
-    /** Read back what is active, so /pool status can show session scope. */
-    list: (): Record<string, string | null> => {
-      const out: Record<string, string | null> = {};
-      for (const snap of [shell.store.ambientOverrideSnapshot(), shell.store.sessionOverrideSnapshot()]) {
-        for (const [k, v] of Object.entries(snap)) if (v) out[k] = v;
+  const bridge: SessionBridge = {
+    // `spec` may carry ":thinking". Sits below an explicit per-call model, so a
+    // deliberate escalation still wins.
+    setAmbient: (type, spec) => shell.store.mutate.session.setAmbient(type, spec),
+    // Hard per-session pin, as set by the /agents menu. Outranks everything.
+    setOverride: (type, spec) => shell.store.mutate.session.setOverride(type, spec),
+    clearOverride: (type) => shell.store.mutate.session.clearOverride(type),
+    // `/pool reset` drops session scope. Without this it would have to call
+    // clearAll(), which also destroys deliberate per-agent pins from /agents.
+    clearAmbient: () => shell.store.mutate.session.clearAmbient(),
+    clearAll: () => shell.store.mutate.session.clearAll(),
+    // Read back what is active, so /pool status can show session scope. A hard
+    // pin is listed after the ambient route, so it wins on the same key.
+    list: () => {
+      const out: Record<string, string> = {};
+      for (const snapshot of [shell.store.ambientOverrideSnapshot(), shell.store.sessionOverrideSnapshot()]) {
+        for (const [type, model] of Object.entries(snapshot)) if (model) out[type] = model;
       }
       return out;
     },
   };
+  (globalThis as Record<string, unknown>)[SESSION_BRIDGE_KEY] = bridge;
 }
 
-/** The current SpawnCoordinator, or null if not yet created. */
+/** Null until created at session_start. */
 export function getCoordinator(): SpawnCoordinator | null {
   return shell.coordinator;
 }
 
-// ============================================================================
-// Setter functions (called by index.ts to populate the shell)
-// ============================================================================
+// --- Setter functions (called by index.ts to populate the shell) ---
 
 export function setPiInstance(pi: ExtensionAPI): void {
   shell.pi = pi;
@@ -141,18 +138,12 @@ export function setCoordinator(c: SpawnCoordinator | null): void {
   shell.coordinator = c;
 }
 
-// ============================================================================
-// Subagent spawn context
-// ============================================================================
+// --- Subagent spawn context ---
 
 /**
- * Nesting depth of in-flight subagent spawns.
- *
- * Subagents are created via runAgent(), which re-loads this extension fresh
- * (new runtime, new pi/ctx). Without protection those re-loads clobber the
- * parent-owned shell singletons below, so the nudge would later route to a
- * dead subagent session instead of the parent. The factory checks this flag
- * and stays inert while a subagent is spawning.
+ * Nesting depth of in-flight subagent spawns. Subagent re-loads of this
+ * extension would clobber parent-owned shell singletons; the factory checks
+ * this flag and stays inert while a subagent is spawning.
  */
 let subagentSpawnDepth = 0;
 

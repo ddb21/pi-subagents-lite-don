@@ -18,24 +18,87 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { getAgentConfig, getConfig, getToolNamesForType, resolveVisibleTools } from "./agent-types.js";
+import {
+  getAgentConfig,
+  getConfig,
+  getToolNamesForType,
+  resolveSessionAllowedTools,
+  resolveVisibleTools,
+} from "./agent-types.js";
 import { extractText } from "../prompt/context.js";
+import { readDefaultTools } from "../pi-settings.js";
 import type { AgentUsage } from "./usage.js";
 import { findModelInRegistry, GIT_EXEC_TIMEOUT_MS } from "../utils.js";
-import { resolveModelSpec } from "../models/model-spec.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { buildAgentPrompt, type PromptExtras } from "../prompt/prompts.js";
-import { preloadSkills, loadSkillMeta, type SkillMeta } from "../prompt/skill-loader.js";
-import { type EnvInfo, type RunCallbacks, type RunTunables, type ThinkingLevel, SHORT_ID_LENGTH } from "../types.js";
+import { preloadSkills, loadSkillMeta } from "../prompt/skill-loader.js";
+import { type EnvInfo, type RunCallbacks, type RunTunables, SHORT_ID_LENGTH } from "../types.js";
 import type { SubagentType, SystemPromptMode } from "./types.js";
 import { getStore, enterSubagentSpawn, exitSubagentSpawn } from "../shell.js";
 import { DEFAULT_GRACE_TURNS, CUSTOM_PROMPT_PATH } from "../config/config-io.js";
-import {
-  getSubagentSessionDir,
-  recordSessionKey,
-  sanitizeDanglingToolCalls,
-  type PersistentSessionLease,
-} from "./persistent-executor.js";
+import { patchRetryClassifier } from "./stream-retry.js";
+import { getSubagentSessionDir, recordSessionKey, sanitizeDanglingToolCalls } from "./persistent-executor.js";
+import { applyOutputLimit, resolveOutputLimit } from "./max-tokens-field.js";
+
+// Cache: extension path → unscoped package name (lowercased), or undefined if not found
+const packageNameCache = new Map<string, string | undefined>();
+
+function extensionPackageName(extPath: string): string | undefined {
+  // Presence check distinguishes a cached undefined (not-found) from a miss,
+  // so each path's package.json is read at most once per process.
+  if (packageNameCache.has(extPath)) return packageNameCache.get(extPath);
+  const result = resolvePackageShortName(extPath);
+  packageNameCache.set(extPath, result);
+  return result;
+}
+
+/**
+ * The unscoped, lowercased npm short name of the pi package that declares
+ * `extPath` as an extension entry — or undefined if the entry doesn't belong
+ * to such a package.
+ *
+ * Climbs from the entry's directory looking for package.json, stopping at
+ * node_modules boundaries. The name is taken only when that package's
+ * `pi.extensions` manifest actually lists this entry. Returns at the first
+ * package.json (whether or not it declares the entry) so a loose extension
+ * is never misattributed to a co-located project's name.
+ */
+function resolvePackageShortName(extPath: string): string | undefined {
+  const entry = path.resolve(extPath);
+  let dir = path.dirname(entry);
+
+  for (;;) {
+    // Climbing into node_modules means we've left the owning package's tree.
+    if (path.basename(dir) === "node_modules") return undefined;
+
+    let pkg: { name?: unknown; pi?: { extensions?: unknown } };
+    try {
+      pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf-8"));
+    } catch {
+      const parent = path.dirname(dir);
+      if (parent === dir) return undefined; // walked to the filesystem root
+      dir = parent;
+      continue;
+    }
+
+    // First package.json found — it's the package root; decide here.
+    const entries = pkg.pi?.extensions;
+    if (
+      typeof pkg.name === "string" &&
+      Array.isArray(entries) &&
+      entries.some((e) => typeof e === "string" && path.resolve(dir, e) === entry)
+    ) {
+      const short = pkg.name.startsWith("@") ? pkg.name.slice(pkg.name.indexOf("/") + 1) : pkg.name;
+      return short.toLowerCase();
+    }
+    return undefined;
+  }
+}
+
+/** Clear the package name cache. Exposed for test isolation. */
+export function resetPackageNameCache() {
+  packageNameCache.clear();
+}
 
 /** Normalize max turns. undefined or 0 = unlimited, otherwise minimum 1. */
 function normalizeMaxTurns(n: number | undefined): number | undefined {
@@ -43,53 +106,70 @@ function normalizeMaxTurns(n: number | undefined): number | undefined {
   return Math.max(1, n);
 }
 
-/** Info about a tool event in the subagent. */
 interface RunOptions extends RunTunables, RunCallbacks {
   /** ExtensionAPI instance — used for pi.exec() for git detection. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
-  /** Override working directory (resolved worktree path). */
   cwd?: string;
+  /**
+   * Trust state for the target project. False = ignore the target's project
+   * resources (untrusted cross-repo target). Absent/true = load them.
+   */
+  projectTrusted?: boolean;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
-  /** Don fork: parent session captured when the Agent tool was invoked. */
+  /** Don fork: parent session captured when the Agent tool was invoked, for lineage. */
   parentSessionFile?: string;
-  /** Don fork: optional named persistent executor session. */
+  /** Don fork: named persistent session. */
   sessionKey?: string;
-  /** Parent cwd component used to scope sessionKey. */
+  /** Don fork: parent cwd component used to scope sessionKey. */
   sessionKeyCwd?: string;
-  /** Canonical resolved agent type required when sessionKey is set. */
+  /** Don fork: canonical resolved agent type, required whenever sessionKey is set. */
   sessionKeyAgentType?: string;
   /** Don fork: existing keyed session file to reopen. */
   resumeSessionFile?: string;
-  /** Cross-process lease already acquired before mapping resolution. */
-  persistentSessionLease?: PersistentSessionLease;
 }
 
-interface RunResult {
+export interface RunResult {
   responseText: string;
   session: AgentSession;
-  /** Non-fatal setup warnings that must be included in the parent result. */
-  warnings: string[];
+  /**
+   * Don fork: non-fatal setup warnings raised during this run. Upstream flushed
+   * these to the UI only, so a background or headless caller never saw them.
+   * A continuation carries none of its own, hence the optional field.
+   */
+  warnings?: string[];
   /** True if the agent was hard-aborted (max_turns + grace exceeded). */
   aborted: boolean;
   /** True if the agent hit the soft turn limit and wrapped up within grace turns. */
   turnLimited: boolean;
+  /**
+   * Provider error message when the run ended in a model error: the final
+   * assistant message has stopReason "error". Absent for normal, aborted,
+   * and turn-limited runs, and for transient errors superseded by a later turn.
+   */
+  modelError?: string;
 }
 
 /**
- * Subscribe to a session and collect the last assistant message text.
- * Returns an object with a `getText()` getter and an `unsubscribe` function.
+ * Options for prompting a session, whether first run or continuation.
+ * Carries the callbacks the manager wires for record tracking and live-view
+ * updates; the session itself is reused by continuations.
  */
-function collectResponseText(
-  session: AgentSession,
-  onTextDelta?: (delta: string, fullText: string) => void,
-) {
+export interface SessionPromptOptions extends RunCallbacks {
+  maxTurns?: number;
+  graceTurns?: number;
+  /** Abort signal forwarded to session.abort() while the prompt runs. */
+  signal?: AbortSignal;
+}
+
+function collectResponseText(session: AgentSession, onTextDelta?: (delta: string, fullText: string) => void) {
   let text = "";
-  // Last finalized assistant text seen during THIS run. Event-scoped, so it
-  // survives a compaction that replaces session.messages with a shorter array,
-  // and it can never carry text from an earlier run of a resumed session.
+  // Don fork: the last finalized assistant text seen during THIS run. It is
+  // event-scoped, so it survives a compaction that replaces session.messages
+  // with a shorter array, and it can never carry text from an earlier run of a
+  // resumed session.
   let finalText = "";
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "message_start") {
@@ -100,21 +180,13 @@ function collectResponseText(
       onTextDelta?.(event.assistantMessageEvent.delta, text);
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
-      const finalized = extractText((event.message.content ?? []) as unknown[]).trim();
+      const finalized = extractText(event.message.content).trim();
       if (finalized) finalText = finalized;
     }
   });
   return { getText: () => text, getFinalText: () => finalText, unsubscribe };
 }
 
-/**
- * Get the last assistant text produced at or after `fromIndex`.
- *
- * `fromIndex` is the message count captured before this run's prompt. Messages
- * below it belong to earlier runs on a resumed persistent session, so the
- * fallback must never surface their text: doing so resurrects a prior run's
- * result when this run produces nothing (abort or model error).
- */
 function lastAssistantTextFrom(messages: AgentSession["messages"], fromIndex: number): string {
   for (let i = messages.length - 1; i >= fromIndex; i--) {
     const msg = messages[i];
@@ -126,12 +198,15 @@ function lastAssistantTextFrom(messages: AgentSession["messages"], fromIndex: nu
 }
 
 /**
- * Resolve a run's result text from the three sources, in priority order.
+ * Don fork: resolve a run's result text from the three sources, in priority
+ * order.
  *
- * 1. `streamedText` — deltas from the in-flight assistant message.
- * 2. `finalText` — the last finalized assistant text from THIS run's
+ * 1. `streamedText` - deltas from the in-flight assistant message.
+ * 2. `finalText` - the last finalized assistant text from THIS run's
  *    `message_end` events. Needed when the provider returns no deltas, and
- *    when a compaction shortened `messages` below `fromIndex`.
+ *    when a threshold auto-compaction inside `session.prompt()` shortened
+ *    `messages` below `fromIndex`, which makes the scan below run zero times
+ *    and drop a legitimate current-run result.
  * 3. The message array, scanned no lower than `fromIndex`, so an earlier run's
  *    text can never surface as this run's result.
  */
@@ -148,12 +223,30 @@ function resolveRunResult(
 export const __test__ = { lastAssistantTextFrom, collectResponseText, resolveRunResult };
 
 /**
- * Wire an AbortSignal to abort a session.
- * Returns a cleanup function to remove the listener.
+ * The provider error message when the run ended in a model error: the final
+ * assistant message has stopReason "error". Returns undefined when the final
+ * assistant message ended normally (or was aborted), so a transient error
+ * followed by a successful turn never fails the run.
  */
+function getFinalModelError(session: AgentSession): string | undefined {
+  for (let i = session.messages.length - 1; i >= 0; i--) {
+    const msg = session.messages[i];
+    if (msg.role !== "assistant") continue;
+    if (msg.stopReason !== "error") return undefined;
+    return msg.errorMessage && msg.errorMessage.trim() ? msg.errorMessage : undefined;
+  }
+  return undefined;
+}
+
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
-  const onAbort = () => session.abort();
+  // abort() returns a promise and this fires from an event listener, so a
+  // rejection escapes the run rather than failing it. Node re-throws a
+  // listener's returned rejected promise as an uncaught exception, and the
+  // parent is already going down when this runs.
+  const onAbort = () => {
+    void session.abort().catch(() => {});
+  };
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -176,23 +269,19 @@ function usageFromAssistantMessage(msg: Record<string, unknown>): AgentUsage | u
   };
 }
 
-/**
- * Subscribe to shared session events (tool activity, usage, compaction)
- * used by runAgent. Returns an unsubscribe function.
- */
 export function subscribeToSessionEvents(
   session: AgentSession,
-  options: Pick<RunOptions, "onToolActivity" | "onAssistantUsage" | "onCompaction">,
+  options: Pick<RunCallbacks, "onToolActivity" | "onAssistantUsage" | "onCompaction">,
 ): () => void {
   if (!options.onToolActivity && !options.onAssistantUsage && !options.onCompaction) {
     return () => {};
   }
   return session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "tool_execution_start") {
-      options.onToolActivity?.({ type: "start", toolName: event.toolName });
+      options.onToolActivity?.({ type: "start", toolName: event.toolName, toolCallId: event.toolCallId });
     }
     if (event.type === "tool_execution_end") {
-      options.onToolActivity?.({ type: "end", toolName: event.toolName });
+      options.onToolActivity?.({ type: "end", toolName: event.toolName, toolCallId: event.toolCallId });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
       const msg = event.message as unknown as Record<string, unknown>;
@@ -207,19 +296,8 @@ export function subscribeToSessionEvents(
   });
 }
 
-/**
- * Extract the extension name from an extension's file path.
- *
- * Handles all distribution methods:
- *  - git packages: `.../git/github.com/<user>/<pkg>/...` → "<pkg>"
- *  - npm packages: `.../node_modules/[...]pkg/...` → "pkg"
- *  - local extensions: `~/.pi/agent/extensions/<name>/...` → "<name>"
- *  - direct files: `extensions/<name>.ts` → "<name>"
- *
- * Does NOT depend on internal directory structure (dist/, lib/, src/, etc).
- * Only cares about the package root, which is determined by distribution method.
- */
-export function extractExtensionName(extPath: string): string {
+/** Extension name from its install path (git/npm/local/direct); independent of dist/lib/src internals. */
+function extractExtensionName(extPath: string): string {
   const parts = extPath.split(path.sep);
 
   // 1. Git package: .../git/github.com/<user>/<pkg>/...
@@ -256,7 +334,6 @@ export function extractExtensionName(extPath: string): string {
   return path.basename(path.dirname(extPath));
 }
 
-/** Run a git command via pi.exec, returning stdout on success or null on failure. */
 async function execGit(pi: ExtensionAPI, args: string[], cwd: string): Promise<string | null> {
   try {
     const result = await pi.exec("git", args, { cwd, timeout: GIT_EXEC_TIMEOUT_MS });
@@ -266,14 +343,11 @@ async function execGit(pi: ExtensionAPI, args: string[], cwd: string): Promise<s
   }
 }
 
-/**
- * Detect environment info using pi.exec() for git detection.
- * Inline replacement for upstream's detectEnv from env.ts.
- */
+/** Inline replacement for upstream's detectEnv — uses pi.exec for git detection. */
 async function detectEnv(pi: ExtensionAPI, cwd: string): Promise<EnvInfo> {
   const gitRoot = await execGit(pi, ["rev-parse", "--is-inside-work-tree"], cwd);
   const isGitRepo = gitRoot === "true";
-  const branch = isGitRepo ? (await execGit(pi, ["branch", "--show-current"], cwd)) : null;
+  const branch = isGitRepo ? await execGit(pi, ["branch", "--show-current"], cwd) : null;
 
   return {
     isGitRepo,
@@ -285,19 +359,37 @@ async function detectEnv(pi: ExtensionAPI, cwd: string): Promise<EnvInfo> {
 // ── runAgent phases ────────────────────────────────────────────────
 
 /**
- * Resolve system prompt mode, fetch the appropriate source prompt, and
- * load project context files. Returns everything buildPrompt needs.
+ * Effective system prompt mode for an agent: the global mode overridden by
+ * the agent's include_system_prompt frontmatter field.
+ *
+ * - false → replace (never inherit or custom)
+ * - true → inherit, except when the global mode is custom (custom wins)
+ * - undefined → global mode
  */
+export function resolveEffectiveSystemPromptMode(
+  globalMode: SystemPromptMode,
+  includeSystemPrompt: boolean | undefined,
+): SystemPromptMode {
+  if (includeSystemPrompt === false) return "replace";
+  if (includeSystemPrompt === true && globalMode !== "custom") return "inherit";
+  return globalMode;
+}
+
 function resolveSystemPromptSources(
   ctx: ExtensionContext,
   cwd: string,
   notify: (msg: string) => void,
-): { mode: SystemPromptMode; extras: Pick<PromptExtras, "parentSystemPrompt" | "customSystemPrompt" | "contextFiles"> } {
+  agentConfig: ReturnType<typeof getAgentConfig>,
+): {
+  mode: SystemPromptMode;
+  extras: Pick<PromptExtras, "parentSystemPrompt" | "customSystemPrompt" | "contextFiles">;
+} {
   const store = getStore();
-  const mode = store.agent.systemPromptMode;
+  // Per-agent frontmatter overrides win; unset fields follow the global config.
+  const mode = resolveEffectiveSystemPromptMode(store.agent.systemPromptMode, agentConfig?.includeSystemPrompt);
+  const includeContextFiles = agentConfig?.includeContextFiles ?? store.agent.includeContextFiles;
   const extras: Pick<PromptExtras, "parentSystemPrompt" | "customSystemPrompt" | "contextFiles"> = {};
 
-  // Fetch parent system prompt for inherit mode
   if (mode === "inherit") {
     try {
       extras.parentSystemPrompt = ctx.getSystemPrompt();
@@ -306,7 +398,6 @@ function resolveSystemPromptSources(
     }
   }
 
-  // Read custom prompt file for custom mode
   if (mode === "custom") {
     try {
       const content = fs.readFileSync(CUSTOM_PROMPT_PATH, "utf-8").trim();
@@ -324,8 +415,7 @@ function resolveSystemPromptSources(
     }
   }
 
-  // Load AGENTS.md context files when the setting is enabled
-  if (store.agent.includeContextFiles) {
+  if (includeContextFiles) {
     try {
       extras.contextFiles = loadProjectContextFiles({ cwd, agentDir: getAgentDir() });
     } catch {
@@ -336,11 +426,6 @@ function resolveSystemPromptSources(
   return { mode, extras };
 }
 
-/**
- * Phase 1: Resolve system prompt from agent config, skills, and env info.
- *
- * @param resolverExtras  Partial extras from resolveSystemPromptSources (mode-specific prompts + context files).
- */
 function buildPrompt(
   type: SubagentType,
   agentConfig: ReturnType<typeof getAgentConfig>,
@@ -365,7 +450,6 @@ function buildPrompt(
   return buildAgentPrompt({ ...fallback, name: type }, cwd, env, extras, systemPromptMode);
 }
 
-/** Build extension name → tool names map from loaded extensions. */
 function buildExtToolMap(extensions: Array<{ path: string; tools: Map<string, unknown> }>) {
   const map = new Map<string, string[]>();
   for (const ext of extensions) {
@@ -376,67 +460,86 @@ function buildExtToolMap(extensions: Array<{ path: string; tools: Map<string, un
   return map;
 }
 
-/** Build extension override for whitelist or blacklist filtering. */
-function buildExtOverride(
+/** Filter extensions by name; invert=true removes matches (blacklist), false keeps them (whitelist). */
+function filterExtensions(
+  extensions: Array<{ path: string }>,
+  names: Set<string>,
+  invert: boolean,
+): { filtered: Array<{ path: string }>; matched: Set<string> } {
+  const matched = new Set<string>();
+  const filtered = extensions.filter((ext) => {
+    const pathName = extractExtensionName(ext.path).toLowerCase();
+    const pkgName = extensionPackageName(ext.path);
+    const hit = names.has(pathName) || (pkgName !== undefined && names.has(pkgName));
+    if (hit) {
+      matched.add(pathName);
+      if (pkgName) matched.add(pkgName);
+    }
+    return hit !== invert;
+  });
+  return { filtered, matched };
+}
+
+/** Extension filter override; warns for requested names that matched nothing. */
+function filterOverride(names: Set<string>, invert: boolean, notify?: (msg: string) => void) {
+  return (result: any) => {
+    const { filtered, matched } = filterExtensions(result.extensions, names, invert);
+    for (const name of names) {
+      if (!matched.has(name)) {
+        notify?.(`extension "${name}" not found in loaded extensions`);
+      }
+    }
+    return { ...result, extensions: filtered };
+  };
+}
+
+export function buildExtOverride(
   extensions: true | string[] | false | undefined,
   excludeExtensions?: string[],
+  notify?: (msg: string) => void,
 ) {
   if (Array.isArray(extensions)) {
-    const allowedNames = new Set(extensions.map(ext => {
-      const slashIdx = ext.indexOf("/");
-      return slashIdx !== -1 ? ext.slice(0, slashIdx) : ext;
-    }));
-    return (result: any) => ({
-      ...result,
-      extensions: result.extensions.filter((ext: { path: string }) =>
-        allowedNames.has(extractExtensionName(ext.path)),
-      ),
-    });
+    // Whitelist entries may carry a /tool suffix; match on the extension name only.
+    const allowedNames = new Set(
+      extensions.map((ext) => {
+        const slashIdx = ext.indexOf("/");
+        return (slashIdx !== -1 ? ext.slice(0, slashIdx) : ext).toLowerCase();
+      }),
+    );
+    return filterOverride(allowedNames, false, notify);
   }
+
   if (excludeExtensions) {
-    const excludeSet = new Set(excludeExtensions);
-    return (result: any) => ({
-      ...result,
-      extensions: result.extensions.filter((ext: { path: string }) =>
-        !excludeSet.has(extractExtensionName(ext.path)),
-      ),
-    });
+    const excludeSet = new Set(excludeExtensions.map((n) => n.toLowerCase()));
+    return filterOverride(excludeSet, true, notify);
   }
+
   return undefined;
 }
 
-/** Warn for every declared extension that exact package-path matching cannot find. */
-export function findMissingDeclaredExtensions(
-  declared: true | string[] | false | undefined,
-  loaded: Array<{ path: string }>,
-): string[] {
-  if (!Array.isArray(declared)) return [];
-  const loadedNames = new Set(loaded.map((ext) => extractExtensionName(ext.path)));
-  return declared.filter((name) => !loadedNames.has(name));
-}
-
-/**
- * Phase 2: Build DefaultResourceLoader with extension filtering.
- * Returns the loader and a function that reloads it and builds the ext→tool map.
- */
 function createResourceLoader(
   config: ReturnType<typeof getConfig>,
   agentConfig: ReturnType<typeof getAgentConfig>,
   cwd: string,
   systemPrompt: string,
+  settingsManager: SettingsManager,
+  notify?: (msg: string) => void,
 ) {
   const extensions = config.extensions;
-  const noSkills = config.skills === false
-    || Array.isArray(config.skills)
-    || Array.isArray(agentConfig?.preloadSkills);
+  const noSkills = config.skills === false || Array.isArray(config.skills) || Array.isArray(agentConfig?.preloadSkills);
   const agentDir = getAgentDir();
   const loaderOpts: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
-    cwd, agentDir,
-    noExtensions: extensions === false, noSkills,
-    noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    cwd,
+    agentDir,
+    settingsManager,
+    noExtensions: extensions === false,
+    noSkills,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
     systemPromptOverride: () => systemPrompt,
     appendSystemPromptOverride: () => [],
-    extensionsOverride: buildExtOverride(extensions, agentConfig?.excludeExtensions),
+    extensionsOverride: buildExtOverride(extensions, agentConfig?.excludeExtensions, notify),
   };
   const loader = new DefaultResourceLoader(loaderOpts);
   return {
@@ -449,7 +552,55 @@ function createResourceLoader(
   };
 }
 
-/** Create an agent session with the resolved model and thinking level. */
+/**
+ * Don fork: choose the SessionManager for this spawn.
+ *
+ * Upstream always uses an in-memory manager, so a subagent leaves no transcript
+ * and cannot be resumed. The fork persists each subagent session into a
+ * dedicated subdir (with parent lineage) so usage scrapers can classify
+ * subagent runs, and so a named key can resume one.
+ *
+ * - resumeSessionFile: reopen that JSONL. pi loads and indexes existing entries
+ *   but does not repair unfinished tool calls, so dangling tool calls are
+ *   closed first or the provider rejects the next turn.
+ * - a parent session, or any sessionKey: create a persisted session. A key
+ *   forces persistence even when an in-memory parent has no lineage to pass on.
+ * - otherwise: in-memory, preserving upstream behavior exactly.
+ */
+function resolveSessionManager(
+  ctx: ExtensionContext,
+  options: RunOptions,
+  cwd: string,
+  agentDir: string,
+): SessionManager {
+  const subagentDir = getSubagentSessionDir(agentDir);
+
+  if (options.resumeSessionFile) {
+    const sessionManager = SessionManager.open(options.resumeSessionFile, subagentDir);
+    sanitizeDanglingToolCalls(sessionManager);
+    return sessionManager;
+  }
+
+  const parent = options.parentSessionFile ?? ctx.sessionManager?.getSessionFile?.();
+  if (!parent && !options.sessionKey) return SessionManager.inMemory(cwd);
+
+  const sessionManager = SessionManager.create(cwd, subagentDir, parent ? { parentSession: parent } : undefined);
+  if (options.sessionKey) {
+    const sessionFile = sessionManager.getSessionFile();
+    if (!sessionFile) throw new Error("persistent session has no session file");
+    // The SessionManager target is known before its first lazy file write, so
+    // the index entry lands even if the run dies mid-turn.
+    recordSessionKey(
+      agentDir,
+      options.sessionKeyCwd ?? cwd,
+      options.sessionKeyAgentType!,
+      options.sessionKey,
+      sessionFile,
+    );
+  }
+  return sessionManager;
+}
+
 async function initSession(
   ctx: ExtensionContext,
   options: RunOptions,
@@ -457,83 +608,60 @@ async function initSession(
   type: SubagentType,
   cwd: string,
   loader: DefaultResourceLoader,
-) {
-  // Don fork: resolve the frontmatter spelling tolerantly, then fall back to
-  // the parent model. A frontmatter model that no longer exists in the
-  // registry used to fall back silently, so a heavy agent (for example
-  // lmd-science) quietly ran on the orchestrator's cheap model. Warn loudly.
-  let resolvedConfigModel: string | undefined;
-  let configThinking: ThinkingLevel | undefined;
-  if (!options.model && agentConfig?.model) {
-    const resolution = resolveModelSpec(agentConfig.model, ctx.modelRegistry, {
-      parentProvider: ctx.model?.provider,
-      providerPreference: getStore().providerPreference,
-    });
-    if (resolution.kind === "resolved") {
-      resolvedConfigModel = resolution.key;
-      configThinking = resolution.thinking;
-    } else if (resolution.kind === "error") {
-      console.warn(
-        `[pi-subagents-lite] agent '${type}' declares model '${agentConfig.model}', which is not in the registry. `
-        + `Falling back to the parent model. ${resolution.message}`,
-      );
-    }
-  }
-  const model = options.model ?? findModelInRegistry(
-    resolvedConfigModel ?? agentConfig?.model, ctx.modelRegistry, ctx.model,
-  );
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel ?? configThinking;
+  extToolMap: Map<string, string[]>,
+  settingsManager: SettingsManager,
+  defaultTools: string[] | undefined,
+): Promise<AgentSession> {
+  const model = options.model ?? findModelInRegistry(agentConfig?.model, ctx.modelRegistry, ctx.model);
+  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel;
   const agentDir = getAgentDir();
-  // Don fork: persist each subagent's session (with parent lineage) into a
-  // dedicated subdir so usage/session scrapers can classify subagent runs.
-  // Falls back to in-memory when there is no parent session (e.g. `pi -p`),
-  // preserving upstream behavior. See docs/CUTOVER.md and patch/persist.diff.
-  const parent = options.parentSessionFile ?? ctx.sessionManager.getSessionFile();
-  const subagentDir = getSubagentSessionDir(agentDir);
-  // Don fork: a key forces persistence even when an in-memory parent has no lineage.
-  const sessionManager = options.resumeSessionFile
-    ? SessionManager.open(options.resumeSessionFile, subagentDir)
-    : (parent || options.sessionKey)
-      ? SessionManager.create(cwd, subagentDir, parent ? { parentSession: parent } : undefined)
-      : SessionManager.inMemory(cwd);
-  if (options.resumeSessionFile) {
-    // Don fork: pi loads/indexes existing entries but does not repair unfinished tool calls.
-    sanitizeDanglingToolCalls(sessionManager);
-  } else if (options.sessionKey) {
-    const sessionFile = sessionManager.getSessionFile();
-    if (!sessionFile) throw new Error("persistent executor session has no session file");
-    // Don fork: the SessionManager target is known before its first lazy file write.
-    recordSessionKey(agentDir, options.sessionKeyCwd ?? cwd, options.sessionKeyAgentType!, options.sessionKey, sessionFile);
-  }
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
-    cwd, agentDir,
-    sessionManager,
-    settingsManager: SettingsManager.create(cwd, agentDir),
+    cwd,
+    agentDir,
+    sessionManager: resolveSessionManager(ctx, options, cwd, agentDir),
+    settingsManager,
     model,
-    tools: getToolNamesForType(type), resourceLoader: loader,
+    tools: resolveSessionAllowedTools({
+      registeredTools: getToolNamesForType(type, defaultTools),
+      tools: agentConfig?.tools,
+      extToolMap,
+    }),
+    resourceLoader: loader,
   };
   if (thinkingLevel) sessionOpts.thinkingLevel = thinkingLevel;
   const result = await createAgentSession(sessionOpts);
+  const session = result.session;
+  patchRetryClassifier(session);
 
-  // Inject max_tokens into provider request payloads.
-  // Spawn-time value wins over agent config (frontmatter).
+  // Inject the output-limit field into provider payloads; spawn-time value wins
+  // over agent config. Location per request, per pi's per-API algorithm:
+  // openai-completions follows the compat chain (explicit
+  // model.compat.maxTokensField, else provider/URL detection, else
+  // max_completion_tokens); the OpenAI Responses family uses max_output_tokens
+  // clamped to pi's minimum of 16 (openai-responses only when the model
+  // hasn't disabled compat.supportsMaxOutputTokens); anthropic uses
+  // top-level max_tokens; bedrock nests the cap at inferenceConfig.maxTokens;
+  // both google APIs nest it at config.maxOutputTokens; mistral uses
+  // top-level maxTokens; pi-messages nests it at options.maxTokens.
   const maxTokens = options.maxTokens ?? agentConfig?.maxTokens;
   if (maxTokens != null && maxTokens > 0 && model) {
-    const field = (model.compat as any)?.maxTokensField ?? "max_tokens";
-    const origOnPayload = result.session.agent.onPayload;
-    result.session.agent.onPayload = async (payload, m) => {
-      const applied = origOnPayload ? (await origOnPayload(payload, m)) ?? payload : payload;
-      const obj = typeof applied === "object" && applied && !Array.isArray(applied) ? applied : {};
-      return { ...obj, [field]: maxTokens };
+    const origOnPayload = session.agent.onPayload;
+    session.agent.onPayload = async (payload, m) => {
+      const applied = origOnPayload ? ((await origOnPayload(payload, m)) ?? payload) : payload;
+      // Resolved per request so a mid-run setModel stays in sync with pi
+      // instead of desyncing on a captured field. Undefined means pi sends
+      // no output-limit field for this model; the hook must not inject one.
+      // Post-build overwrite by design (as in the prior fix): pi's context
+      // clamp and thinking-budget adjust already ran on the model default.
+      const limit = resolveOutputLimit(m, maxTokens);
+      if (!limit) return applied;
+      return applyOutputLimit(applied, limit);
     };
   }
 
-  return result;
+  return session;
 }
 
-/**
- * Phase 3: Create session, bind extensions, filter tools.
- */
 async function createAndConfigureSession(
   ctx: ExtensionContext,
   options: RunOptions,
@@ -541,39 +669,44 @@ async function createAndConfigureSession(
   type: SubagentType,
   cwd: string,
   loader: DefaultResourceLoader,
-  extResult: { extensions: Array<{ path: string; tools: Map<string, unknown> }> },
+  extToolMap: Map<string, string[]>,
+  settingsManager: SettingsManager,
+  defaultTools: string[] | undefined,
   notify: (msg: string) => void,
 ): Promise<AgentSession> {
-  const { session } = await initSession(ctx, options, agentConfig, type, cwd, loader);
-  const baseName = agentConfig?.name ?? type;
-  session.setSessionName(
-    options.agentId ? `${baseName}#${options.agentId.slice(0, SHORT_ID_LENGTH)}` : baseName,
+  const session = await initSession(
+    ctx,
+    options,
+    agentConfig,
+    type,
+    cwd,
+    loader,
+    extToolMap,
+    settingsManager,
+    defaultTools,
   );
+  const baseName = agentConfig?.name ?? type;
+  session.setSessionName(options.agentId ? `${baseName}#${options.agentId.slice(0, SHORT_ID_LENGTH)}` : baseName);
   await session.bindExtensions({
-    onError: (err) => options.onToolActivity?.({
-      type: "end", toolName: `extension-error:${err.extensionPath}`,
-    }),
+    onError: (err) =>
+      options.onToolActivity?.({
+        type: "end",
+        toolName: `extension-error:${err.extensionPath}`,
+      }),
   });
+
   const filteredTools = resolveVisibleTools({
     activeTools: session.getActiveToolNames(),
     tools: agentConfig?.tools,
     excludeTools: agentConfig?.excludeTools,
-    extToolMap: buildExtToolMap(extResult.extensions),
+    extToolMap,
     notify,
   });
   if (filteredTools) session.setActiveToolsByName(filteredTools);
   options.onSessionCreated?.(session);
   return session;
 }
-
-/**
- * Phase 4: Subscribe to turn_end events for graceful max_turns enforcement.
- * Returns an unsubscribe function and state getters.
- */
-function wireTurnTracking(
-  session: AgentSession,
-  options: Pick<RunOptions, "maxTurns" | "graceTurns" | "onTurnEnd">,
-) {
+function wireTurnTracking(session: AgentSession, options: Pick<RunOptions, "maxTurns" | "graceTurns" | "onTurnEnd">) {
   let turnCount = 0;
   const maxTurns = normalizeMaxTurns(options.maxTurns);
   let softLimitReached = false;
@@ -587,30 +720,35 @@ function wireTurnTracking(
     if (maxTurns == null) return;
     if (!softLimitReached && turnCount >= maxTurns) {
       softLimitReached = true;
-      session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+      // steer() returns a promise and fires from a subscribe callback: a
+      // rejection would escape the run. It only costs the graceful wrap-up;
+      // the hard abort below still fires.
+      void session
+        .steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.")
+        .catch(() => {});
     } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
       aborted = true;
-      session.abort();
+      // `aborted` is already set, so a rejected abort() cannot change the
+      // reported outcome — only swallow the rejection.
+      void session.abort().catch(() => {});
     }
   });
 
   return { unsubscribe, getAborted: () => aborted, getTurnLimited: () => softLimitReached };
 }
 
-/**
- * Phase 5: Execute the prompt turn loop with event wiring and cleanup.
- */
 async function runTurnLoop(
   session: AgentSession,
   prompt: string,
-  options: RunOptions,
+  options: { signal?: AbortSignal } & RunCallbacks,
   unsubTurns: () => void,
 ) {
   const unsubEvents = subscribeToSessionEvents(session, options);
   const collector = collectResponseText(session, options.onTextDelta);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
-  // Messages already present belong to earlier runs of a resumed persistent
-  // session. Record the boundary so the fallback cannot return their text.
+  // Messages already in the session before this prompt belong to earlier runs;
+  // the fallback must not surface their text when this run fails (model error
+  // or abort with no output) — that would resurrect a prior run's result.
   const messageStart = session.messages.length;
   try {
     await session.prompt(prompt);
@@ -620,12 +758,47 @@ async function runTurnLoop(
     collector.unsubscribe();
     cleanupAbort();
   }
-  return resolveRunResult(
-    collector.getText(),
-    collector.getFinalText(),
-    session.messages,
-    messageStart,
-  );
+  return resolveRunResult(collector.getText(), collector.getFinalText(), session.messages, messageStart);
+}
+
+/**
+ * Run a single prompt against a session: wire turn tracking, event
+ * subscription, response collection, and abort forwarding, prompt, then
+ * assemble the RunResult. Shared by the first run (runAgentImpl) and
+ * continuations (continueAgentSession) so the two paths cannot drift.
+ */
+async function runSessionPrompt(
+  session: AgentSession,
+  prompt: string,
+  options: SessionPromptOptions,
+): Promise<RunResult> {
+  const { unsubscribe: unsubTurns, getAborted, getTurnLimited } = wireTurnTracking(session, options);
+  const responseText = await runTurnLoop(session, prompt, options, unsubTurns);
+  return {
+    responseText,
+    session,
+    aborted: getAborted(),
+    turnLimited: getTurnLimited(),
+    modelError: getFinalModelError(session),
+  };
+}
+
+/**
+ * Prompt an existing session after its original run settled (the fork's
+ * continueAgentSession() shape).
+ *
+ * Unlike runAgent, the session already exists: onSessionCreated is never
+ * called, and there is no session setup (model resolution, resource loader,
+ * tool filtering). The result keeps the runAgent shape (including
+ * modelError) so the manager classifies the continuation exactly like the
+ * first run.
+ */
+export async function continueAgentSession(
+  session: AgentSession,
+  prompt: string,
+  options: SessionPromptOptions = {},
+): Promise<RunResult> {
+  return runSessionPrompt(session, prompt, options);
 }
 
 // ── main entry ─────────────────────────────────────────────────────
@@ -653,14 +826,31 @@ async function runAgentImpl(
   options: RunOptions,
 ): Promise<RunResult> {
   const store = getStore();
-  const config = getConfig(type, store.agent.loadSkillsImplicitly, store.agent.loadExtensionsImplicitly);
+  const effectiveCwd = options.cwd ?? ctx.cwd;
+
+  // One SettingsManager for the whole spawn: its trust state gates both the
+  // resource loader (project extensions/skills/prompts/themes/system prompt
+  // files) and the session context (ctx.isProjectTrusted). Created before
+  // getConfig so its defaultTools setting can feed the resolved config and
+  // the session tool gate from the same instance.
+  const settingsManager = SettingsManager.create(effectiveCwd, getAgentDir(), {
+    projectTrusted: options.projectTrusted !== false,
+  });
+
+  // Read once per spawn: getConfig and getToolNamesForType share this value,
+  // so their fallbacks cannot diverge. undefined = setting unconfigured.
+  const defaultTools = readDefaultTools(settingsManager);
+
+  const config = getConfig(type, store.agent.loadSkillsImplicitly, store.agent.loadExtensionsImplicitly, defaultTools);
   const agentConfig = getAgentConfig(type);
 
   // Buffer warnings during setup to avoid inserting custom_message entries
   // between tool_use and tool_result in the session tree (causes Anthropic 400).
   // Flushed after runTurnLoop completes.
   const warnings: string[] = [];
-  const bufferNotify = (msg: string) => { warnings.push(msg); };
+  const bufferNotify = (msg: string) => {
+    warnings.push(msg);
+  };
   if (agentConfig?.excludeTools && Array.isArray(agentConfig.tools)) {
     bufferNotify(`agent "${type}": both tools and exclude_tools set — tools (whitelist) wins`);
   }
@@ -668,32 +858,36 @@ async function runAgentImpl(
     bufferNotify(`agent "${type}": both extensions and exclude_extensions set — extensions (whitelist) wins`);
   }
 
-  const effectiveCwd = options.cwd ?? ctx.cwd;
   const env = await detectEnv(options.pi, effectiveCwd);
 
-  // Resolve system prompt mode + source prompts + context files
-  const { mode, extras: promptExtras } = resolveSystemPromptSources(ctx, effectiveCwd, bufferNotify);
+  const { mode, extras: promptExtras } = resolveSystemPromptSources(ctx, effectiveCwd, bufferNotify, agentConfig);
 
-  const systemPrompt = buildPrompt(
-    type, agentConfig, config, effectiveCwd, env,
-    mode, promptExtras,
+  const systemPrompt = buildPrompt(type, agentConfig, config, effectiveCwd, env, mode, promptExtras);
+  const { loader, reloadAndMap } = createResourceLoader(
+    config,
+    agentConfig,
+    effectiveCwd,
+    systemPrompt,
+    settingsManager,
+    bufferNotify,
   );
-  const { loader, reloadAndMap } = createResourceLoader(config, agentConfig, effectiveCwd, systemPrompt);
-  const { extResult } = await reloadAndMap();
-  for (const extension of findMissingDeclaredExtensions(agentConfig?.extensions, extResult.extensions)) {
-    bufferNotify(
-      `agent "${type}" declares extension "${extension}", but no loaded extension has that exact package name`,
-    );
-  }
+  const { extToolMap } = await reloadAndMap();
   const session = await createAndConfigureSession(
-    ctx, options, agentConfig, type, effectiveCwd, loader, extResult, bufferNotify,
+    ctx,
+    options,
+    agentConfig,
+    type,
+    effectiveCwd,
+    loader,
+    extToolMap,
+    settingsManager,
+    defaultTools,
+    bufferNotify,
   );
-  const { unsubscribe: unsubTurns, getAborted, getTurnLimited } = wireTurnTracking(session, {
+  const result = await runSessionPrompt(session, prompt, {
     ...options,
     maxTurns: options.maxTurns ?? agentConfig?.maxTurns,
   });
-
-  const responseText = await runTurnLoop(session, prompt, options, unsubTurns);
 
   // Flush buffered warnings now that tool_result is in the session tree.
   for (const msg of warnings) {
@@ -701,5 +895,7 @@ async function runAgentImpl(
     else console.warn(`[pi-subagents-lite] ${msg}`);
   }
 
-  return { responseText, session, warnings, aborted: getAborted(), turnLimited: getTurnLimited() };
+  // Don fork: also hand them back, so the parent's tool result carries them.
+  // The UI flush above is not enough for a background or headless caller.
+  return warnings.length > 0 ? { ...result, warnings } : result;
 }

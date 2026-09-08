@@ -1,20 +1,22 @@
-/**
- * Type definitions for the subagent system.
- */
-
 import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentOutputLog } from "./agents/output-file.js";
 import type { LifetimeUsage, AgentUsage } from "./agents/usage.js";
 import type { SubagentType, AgentInvocation } from "./agents/types.js";
 
-/** Thinking level for agent models (sourced from @earendil-works/pi-ai). */
 export type ThinkingLevel = ModelThinkingLevel;
 
-/** Tool activity event: start/end of a tool invocation. */
 export interface ToolActivity {
   type: "start" | "end";
   toolName: string;
+  /** SDK tool call id; absent on synthetic events (e.g. extension-error end). */
+  toolCallId?: string;
+}
+
+/** Widget live-view state: per-agent transient display data, fed by tool/stream callbacks. */
+export interface LiveView {
+  activeTools: Map<string, string>; // keyed by toolName_timestamp
+  responseText: string;
 }
 
 /**
@@ -34,15 +36,11 @@ export interface AgentRecord {
   id: string;
   result?: string;
   error?: string;
-  /** Non-fatal spawn/setup warnings included in the parent tool result. */
+  /** Don fork: non-fatal setup warnings included in the parent tool result. */
   warnings?: string[];
-  /** Lifecycle state: status, timestamps. */
   lifecycle: AgentLifecycle;
-  /** Display-oriented info: type, description, output file, invocation. */
   display: AgentDisplayInfo;
-  /** Execution internals: session, abort controller, pending steers. */
   execution: AgentExecutionState;
-  /** Accumulated statistics: usage, tool uses, turns. */
   stats: AgentAccumulatedStats;
 }
 
@@ -75,30 +73,46 @@ export interface SpawnConfig extends RunTunables {
   modelKey?: string;
   worktreePath?: string;
   worktreeLabel?: string;
+  /**
+   * Whether the subagent session treats the target project as trusted.
+   * Absent/true = load project resources; false = ignore them (untrusted
+   * cross-repo target, resolved by the trust gate).
+   */
+  projectTrusted?: boolean;
   invocation?: AgentInvocation;
+  /**
+   * Don fork: named persistent session. A spawn carrying a key resumes the
+   * session that key last wrote, instead of starting a fresh in-memory one.
+   */
+  sessionKey?: string;
+  /** Don fork: parent cwd component used to scope sessionKey. */
+  sessionKeyCwd?: string;
+  /** Don fork: canonical resolved agent type, required whenever sessionKey is set. */
+  sessionKeyAgentType?: string;
+  /** Don fork: parent session file captured when the Agent tool was invoked, for lineage. */
+  parentSessionFile?: string;
 }
 
 /** How many characters of agent ID to show in display. */
 export const SHORT_ID_LENGTH = 8;
 
-/** Reason for a context compaction event. */
 export type CompactionReason = "manual" | "threshold" | "overflow";
 
-/** Info payload emitted when a session compacts successfully. */
 export interface CompactionInfo {
   reason: CompactionReason;
   tokensBefore: number;
 }
 
-// ---------------------------------------------------------------------------
-// Sub-object interfaces for decomposed AgentRecord
-// ---------------------------------------------------------------------------
+// --- Sub-object interfaces for decomposed AgentRecord ---
 
-/** Possible agent lifecycle statuses. */
 export type AgentStatus = "queued" | "running" | "completed" | "turn_limited" | "aborted" | "stopped" | "error";
 
-/** Who initiated an agent stop: "user" via UI menu, or "agent" via StopAgent tool. */
-export type StopInitiator = "user" | "agent";
+/** Who initiated an agent stop: "user" via UI menu, "agent" via StopAgent tool, or "watchdog" (stuck-agent detection). */
+export type StopInitiator = "user" | "agent" | "watchdog";
+
+/** Structured reason for a watchdog stop: which check fired, and the offending tool for tool kills. */
+export type WatchdogStopDetail =
+  { kind: "tool"; toolName: string; elapsedMs: number } | { kind: "idle"; elapsedMs: number };
 
 /**
  * Lifecycle state: when the agent started, completed, and its current status.
@@ -109,12 +123,14 @@ export interface AgentLifecycle {
   startedAt: number;
   completedAt?: number;
   stoppedBy?: StopInitiator;
+  /** Reason detail for watchdog stops (tool name + elapsed). Absent for user/agent stops. */
+  stopDetail?: WatchdogStopDetail;
   /**
-   * Whether the result has been read by the LLM (foreground return or background nudge).
-   * cleanup() preserves terminal records until this is set, so a completed background
-   * agent whose nudge hasn't fired yet isn't evicted before the LLM reads the result.
+   * Whether the agent ever started running. Set false at spawn, flipped true
+   * synchronously in startAgent before the run — distinguishes never-started
+   * stops from ran-then-stopped ones so the status note is accurate.
    */
-  resultConsumed?: boolean;
+  started: boolean;
 }
 
 /**
@@ -130,7 +146,6 @@ export interface AgentDisplayInfo {
   invocation?: AgentInvocation;
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
-  /** Resolved absolute path of the worktree this agent is running in. */
   worktreePath?: string;
   /** Short display label for the worktree (e.g., "feature" or "feature/packages/web"). */
   worktreeLabel?: string;
@@ -142,16 +157,68 @@ export interface AgentDisplayInfo {
  */
 export interface AgentExecutionState {
   session?: AgentSession;
-  /** Don fork: resolved persistent executor session file, when known. */
-  sessionFile?: string;
-  /** Don fork: scoped session key reserved by this live record. */
-  sessionKey?: string;
   abortController?: AbortController;
+  /**
+   * Completion gate, created at spawn, opened exactly once at the terminal
+   * transition; never the run's own promise.
+   */
   promise?: Promise<string>;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Lifecycle wrapper for the output file stream. */
   outputLog?: AgentOutputLog;
+  /**
+   * Model key the spawn reserved a concurrency slot for. Set at spawn; used
+   * to re-reserve the slot when a settled agent is continued. Undefined when
+   * the spawn had no model key (re-reservation is skipped entirely).
+   */
+  modelKey?: string;
+  /**
+   * Whether the run promise chain has fully settled (its .finally ran).
+   * False at spawn and while a continuation is running; true after every
+   * settlement. Guards continuation against racing settlement cleanup.
+   */
+  settled: boolean;
+  /**
+   * Don fork: scoped session-key identity (cwd|type|key) this record reserved.
+   * Set at spawn even before the session file exists, so a second spawn on the
+   * same key is rejected while this one is queued.
+   */
+  sessionKey?: string;
+  /** Don fork: session JSONL this record reads and appends to, when keyed or resumed. */
+  sessionFile?: string;
+  /**
+   * Number of settlements so far (first run = 1, each continuation run
+   * increments). Written at the top of the shared settlement chain's
+   * .finally, before the completion callback fires, so the coordinator can
+   * tell a continuation settlement from the first one. Never-started stops
+   * (queued stop, already-aborted spawn) never increment it.
+   */
+  settlementCount: number;
+  /**
+   * Spawning-session ExtensionContext, attached by the coordinator at spawn
+   * for every spawn. Kept for the record's lifetime so the UI-notify
+   * fallback can reach a live context on any later nudge (continuations of
+   * foreground agents included). Dies with the record at Clear/dispose.
+   */
+  spawnCtx?: ExtensionContext;
+  /**
+   * Lifetime cost already added to the session total (tallyCompletion
+   * baseline). Undefined until the first settlement; continuations add only
+   * the delta since the last tally.
+   */
+  talliedCost?: number;
+  /**
+   * Widget live-view state, attached by the coordinator at spawn. Retained
+   * across settlement so a continuation keeps feeding the same view.
+   */
+  liveView?: LiveView;
+  /**
+   * Coordinator-supplied live-view bridge (tool activity + streamed text),
+   * captured at spawn and re-wired on continuation. Without it the widget
+   * would show a static "thinking…" while a continued agent runs.
+   */
+  liveViewCallbacks?: Pick<RunCallbacks, "onToolActivity" | "onTextDelta">;
 }
 
 /**
@@ -161,8 +228,8 @@ export interface AgentExecutionState {
 export interface AgentAccumulatedStats {
   /**
    * Lifetime usage breakdown, accumulated via `message_end` events. Survives
-   * compaction. Total = input + output + cacheWrite + cost (cacheRead deliberately
-   * excluded — see issue #38). Initialized to zeros at spawn.
+   * compaction. Total = input + output (see getLifetimeTotal; cacheRead/cacheWrite
+   * and cost deliberately excluded — see issue #38). Initialized to zeros at spawn.
    */
   lifetimeUsage: LifetimeUsage;
   toolUses: number;
@@ -172,9 +239,6 @@ export interface AgentAccumulatedStats {
   maxTurns?: number;
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
-  /** Previous input token count for delta estimation (vLLM doesn't report cache hits). */
-  prevInputTokens?: number;
   /** Last-known context usage percentage (0–100), captured at completion. */
   contextPercent?: number | null;
 }
-

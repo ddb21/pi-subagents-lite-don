@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents-lite",
-  "version": "1.4.10",
+  "version": "1.13.1",
   "description": "Lightweight sub-agents for pi — spawn specialized agents with isolated sessions, tools, and models.",
   "keywords": [
     "pi-package",
@@ -14,11 +14,6 @@
   ],
   "author": "AlexParamonov",
   "license": "MIT",
-  "packageManager": "bun@1",
-  "engines": {
-    "bun": ">=1.0.0",
-    "node": ">=18"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AlexParamonov/pi-subagents-lite.git"
@@ -28,13 +23,10 @@
     "url": "https://github.com/AlexParamonov/pi-subagents-lite/issues"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.80.10",
-    "@earendil-works/pi-coding-agent": "^0.80.10",
-    "@earendil-works/pi-tui": "^0.80.10"
-  },
-  "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.80.10",
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-ai": ">=0.82.0",
+    "@earendil-works/pi-coding-agent": ">=0.82.0",
+    "@earendil-works/pi-tui": ">=0.82.0",
+    "typebox": ">=1.3.7"
   },
   "files": [
     "src/",
@@ -42,9 +34,11 @@
     "LICENSE"
   ],
   "scripts": {
+    "format": "prettier --write src/ test/",
+    "format:check": "prettier --check src/ test/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:any-gate": "bash scripts/test-any-gate.sh"
   },
   "pi": {
     "extensions": [
@@ -52,7 +46,8 @@
     ]
   },
   "devDependencies": {
-    "typescript": "^6.0.3",
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.7"
   }
 }

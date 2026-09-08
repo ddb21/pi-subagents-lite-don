@@ -1,12 +1,15 @@
 import type { ThinkingLevel } from "../types.js";
 
-/** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
 
 /** How the subagent system prompt is constructed. */
 export type SystemPromptMode = "replace" | "inherit" | "custom";
 
-/** Agent session lifecycle policy. Keyed calls persist; unkeyed calls remain one-shot. */
+/**
+ * Don fork: agent session lifecycle policy. Only a "persistent" agent may be
+ * addressed by a named session_key; a stateless agent stays one-shot even when
+ * a caller sends a key.
+ */
 export type SessionLifecycle = "persistent" | "stateless";
 
 /** Unified agent configuration — used for both default and user-defined agents. */
@@ -33,10 +36,11 @@ export interface AgentConfig {
   skills?: true | string[] | false;
   /** Skills to preload with full content into system prompt. string[] = listed, false/undefined = none */
   preloadSkills?: string[] | false;
-  /** Whether keyed multi-round sessions are supported. Defaults to stateless. */
+  /** Don fork: whether keyed multi-round sessions are supported. Default stateless. */
   sessionLifecycle?: SessionLifecycle;
-  /** Compatibility alias for sessionLifecycle: persistent. */
+  /** Don fork: compatibility alias for sessionLifecycle === "persistent". */
   persistentSession?: boolean;
+  color?: string;
   model?: string;
   thinkingLevel?: ThinkingLevel;
   maxTurns?: number;
@@ -46,6 +50,12 @@ export interface AgentConfig {
 
   /** true = this is an embedded default agent (informational) */
   isDefault?: boolean;
+  /** Whether to write a streaming transcript to the output file. Undefined = use global config. */
+  outputTranscript?: boolean;
+  /** Include AGENTS.md context files in this agent's system prompt. Undefined = use global config. */
+  includeContextFiles?: boolean;
+  /** Whether to inherit the parent's system prompt. Undefined = use global systemPromptMode. */
+  includeSystemPrompt?: boolean;
   /** true = agent is hidden from the schema enum but can still be called by name. */
   hidden?: boolean;
   /** Where this agent was loaded from */

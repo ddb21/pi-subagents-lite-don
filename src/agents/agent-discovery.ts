@@ -2,24 +2,22 @@
  * agent-discovery.ts — Agent file discovery, parsing, and config merging.
  *
  * Scans:
- *   ~/.pi/agent/agents/*.md   (user agents)
- *   <project>/.pi/agents/*.md (project agents)
+ *   ~/.pi/agent/agents/*.md     (user agents)
+ *   <project>/.agents/agents/*.md (shared workspace agents)
+ *   <project>/.pi/agents/*.md   (project agents)
  *
  * Parses YAML frontmatter, extracts all fields, produces AgentConfig objects.
- * Merges with per-field precedence: default < user < project.
+ * Merges with per-field precedence: default < user < shared < project.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentConfig } from "./types.js";
+import type { AgentConfig, SessionLifecycle } from "./types.js";
 import type { ThinkingLevel } from "../types.js";
 import { parseThinkingLevel } from "../utils.js";
 
-/* ------------------------------------------------------------------ */
-/*  Types                                                             */
-/* ------------------------------------------------------------------ */
+// --- Types ---
 
-/** Raw agent config as parsed from .md frontmatter. */
 export interface AgentConfigFromMd {
   name?: string;
   display_name?: string;
@@ -30,20 +28,25 @@ export interface AgentConfigFromMd {
   exclude_extensions?: string[];
   skills?: boolean | string[];
   preload_skills?: string[] | false;
-  session_lifecycle?: "persistent" | "stateless";
+  /** Don fork: "persistent" opts the agent into keyed multi-round sessions. */
+  session_lifecycle?: SessionLifecycle;
+  /** Don fork: legacy boolean spelling of session_lifecycle. */
   persistent_session?: boolean;
+  color?: string;
   model?: string;
   thinking?: ThinkingLevel;
   max_turns?: number;
   max_tokens?: number;
   hidden?: boolean;
-  systemPrompt: string;
+  output_transcript?: boolean;
+  include_context_files?: boolean;
+  include_system_prompt?: boolean;
+  /** Absent = no override; mergeAgents' compactDefined skips it. */
+  systemPrompt?: string;
   source: "user" | "project";
 }
 
-/* ------------------------------------------------------------------ */
-/*  Simple frontmatter parser                                          */
-/* ------------------------------------------------------------------ */
+// --- Simple frontmatter parser ---
 
 /**
  * Naive YAML frontmatter splitter.
@@ -54,26 +57,32 @@ export interface AgentConfigFromMd {
  *
  * Returns { frontmatter: Record<string, unknown>, body: string }.
  */
-function parseFrontmatter(
-  content: string,
-): { frontmatter: Record<string, unknown>; body: string } {
+function parseFrontmatter(content: string): { frontmatter: Record<string, unknown>; body: string } {
   if (!content) {
     return { frontmatter: {}, body: "" };
   }
 
-  // Check for triple-dash delimited frontmatter
   if (!content.startsWith("---\n") && !content.startsWith("---\r\n")) {
     return { frontmatter: {}, body: content };
   }
 
-  // Find closing ---
-  const endIdx = content.indexOf("\n---\n", 4);
-  if (endIdx === -1) {
+  // Find closing --- (handle both LF and CRLF line endings)
+  const lfEnd = content.indexOf("\n---\n", 4);
+  const crlfEnd = content.indexOf("\r\n---\r\n", 4);
+  let endIdx: number;
+  let closingLen: number;
+  if (lfEnd !== -1 && (crlfEnd === -1 || lfEnd < crlfEnd)) {
+    endIdx = lfEnd;
+    closingLen = 5; // \n---\n
+  } else if (crlfEnd !== -1) {
+    endIdx = crlfEnd;
+    closingLen = 7; // \r\n---\r\n
+  } else {
     return { frontmatter: {}, body: content };
   }
 
   const fmRaw = content.slice(4, endIdx);
-  const body = content.slice(endIdx + 5).trim();
+  const body = content.slice(endIdx + closingLen).trim();
 
   const frontmatter: Record<string, unknown> = {};
   let currentKey: string | null = null;
@@ -82,7 +91,6 @@ function parseFrontmatter(
   for (const line of fmRaw.split("\n")) {
     const trimmed = line.trim();
 
-    // Skip empty lines
     if (!trimmed) continue;
 
     // Array item (continuation of previous key)
@@ -116,7 +124,7 @@ function parseFrontmatter(
     }
 
     // Strip surrounding quotes if present (YAML convention)
-    frontmatter[currentKey] = rawValue.replace(/^['"]|['"]$/g, '');
+    frontmatter[currentKey] = rawValue.replace(/^['"]|['"]$/g, "");
     currentValues = null;
   }
 
@@ -128,15 +136,17 @@ function parseFrontmatter(
   return { frontmatter, body };
 }
 
-/* ------------------------------------------------------------------ */
-/*  parseExtensions                                                    */
-/* ------------------------------------------------------------------ */
+// --- parseExtensions ---
 
-/** Split comma-separated string, trim whitespace, strip brackets, and remove empty entries. */
 function splitCommaList(value: string): string[] {
   return value
     .split(",")
-    .map((s) => s.trim().replace(/^\[|\]$/g, "").trim())
+    .map((s) =>
+      s
+        .trim()
+        .replace(/^\[|\]$/g, "")
+        .trim(),
+    )
     .filter((s) => s.length > 0);
 }
 
@@ -148,9 +158,7 @@ function splitCommaList(value: string): string[] {
  * - Comma-separated string → string[]
  * - undefined → undefined
  */
-export function parseExtensions(
-  raw: unknown,
-): boolean | string[] | undefined {
+export function parseExtensions(raw: unknown): boolean | string[] | undefined {
   if (raw === false || raw === "false" || raw === "none") {
     return false;
   }
@@ -171,9 +179,7 @@ export function parseExtensions(
  * Unlike parseExtensions, does NOT accept true/"true"/"all" —
  * preload requires an explicit list of skill names.
  */
-export function parsePreloadSkills(
-  raw: unknown,
-): string[] | false | undefined {
+export function parsePreloadSkills(raw: unknown): string[] | false | undefined {
   if (raw === false || raw === "false" || raw === "none") {
     return false;
   }
@@ -183,27 +189,17 @@ export function parsePreloadSkills(
   if (Array.isArray(raw)) {
     return raw.map(String);
   }
-  return undefined; // true/"true"/"all" not supported
+  return undefined;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Frontmatter value helpers                                          */
-/* ------------------------------------------------------------------ */
+// --- Frontmatter value helpers ---
 
-/** Extract a non-empty string value from frontmatter. */
-function parseString(
-  frontmatter: Record<string, unknown>,
-  key: string,
-): string | undefined {
+function parseString(frontmatter: Record<string, unknown>, key: string): string | undefined {
   const v = frontmatter[key];
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
-/** Extract a string array from frontmatter (array or comma-separated string). */
-function parseStringArray(
-  frontmatter: Record<string, unknown>,
-  key: string,
-): string[] | undefined {
+function parseStringArray(frontmatter: Record<string, unknown>, key: string): string[] | undefined {
   const v = frontmatter[key];
   if (Array.isArray(v)) {
     return v.map(String);
@@ -214,27 +210,23 @@ function parseStringArray(
   return undefined;
 }
 
-/** Extract a boolean from frontmatter (true/false or "true"/"false"). */
-function parseBoolean(
-  frontmatter: Record<string, unknown>,
-  key: string,
-): boolean | undefined {
+function parseBoolean(frontmatter: Record<string, unknown>, key: string): boolean | undefined {
   const v = frontmatter[key];
   if (v === true || v === "true") return true;
   if (v === false || v === "false") return false;
   return undefined;
 }
 
-/** Parse and validate session lifecycle metadata. */
-function parseSessionLifecycle(raw: unknown): "persistent" | "stateless" | undefined {
+/**
+ * Don fork: parse session lifecycle metadata. An unrecognized value is dropped
+ * rather than thrown, so a future spelling degrades to the stateless default
+ * instead of making the whole agent file unloadable.
+ */
+function parseSessionLifecycle(raw: unknown): SessionLifecycle | undefined {
   return raw === "persistent" || raw === "stateless" ? raw : undefined;
 }
 
-/** Extract a number from frontmatter (number or numeric string). */
-function parseNumber(
-  frontmatter: Record<string, unknown>,
-  key: string,
-): number | undefined {
+function parseNumber(frontmatter: Record<string, unknown>, key: string): number | undefined {
   const v = frontmatter[key];
   if (typeof v === "number") return v;
   if (typeof v === "string" && v.length > 0) {
@@ -244,28 +236,13 @@ function parseNumber(
   return undefined;
 }
 
-/**
- * Build an object containing only the entries whose value is not undefined.
- * Used to transform AgentConfigFromMd fields into a Partial<AgentConfig>
- * without 14 repetitive `if (x !== undefined)` blocks.
- */
 function compactDefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
-  return Object.fromEntries(
-    Object.entries(obj).filter(([_, v]) => v !== undefined),
-  ) as Partial<T>;
+  return Object.fromEntries(Object.entries(obj).filter(([_, v]) => v !== undefined)) as Partial<T>;
 }
 
-/* ------------------------------------------------------------------ */
-/*  parseAgentFile                                                     */
-/* ------------------------------------------------------------------ */
+// --- parseAgentFile ---
 
-/**
- * Parse a single agent .md file into AgentConfigFromMd.
- */
-export function parseAgentFile(
-  content: string,
-  source: "user" | "project",
-): AgentConfigFromMd {
+export function parseAgentFile(content: string, source: "user" | "project"): AgentConfigFromMd {
   const { frontmatter, body } = parseFrontmatter(content);
 
   return {
@@ -280,24 +257,23 @@ export function parseAgentFile(
     preload_skills: parsePreloadSkills(frontmatter.preload_skills),
     session_lifecycle: parseSessionLifecycle(frontmatter.session_lifecycle),
     persistent_session: parseBoolean(frontmatter, "persistent_session"),
+    color: parseString(frontmatter, "color"),
     model: parseString(frontmatter, "model"),
     thinking: parseThinkingLevel(parseString(frontmatter, "thinking")),
     max_turns: parseNumber(frontmatter, "max_turns"),
     max_tokens: parseNumber(frontmatter, "max_tokens"),
     hidden: parseBoolean(frontmatter, "hidden"),
+    output_transcript: parseBoolean(frontmatter, "output_transcript"),
+    include_context_files: parseBoolean(frontmatter, "include_context_files"),
+    include_system_prompt: parseBoolean(frontmatter, "include_system_prompt"),
     systemPrompt: body,
     source: source,
   };
 }
 
-/* ------------------------------------------------------------------ */
-/*  scanAgentFilesInDir                                                */
-/* ------------------------------------------------------------------ */
+// --- scanAgentFilesInDir ---
 
-/**
- * Scan a directory for .md files and parse them into AgentConfigFromMd[].
- * Returns empty array if directory doesn't exist.
- */
+/** Scan a directory for .md agent files; empty array when the directory doesn't exist. */
 export async function scanAgentFilesInDir(
   dirPath: string,
   source: "user" | "project" = "user",
@@ -309,13 +285,9 @@ export async function scanAgentFilesInDir(
   }
 
   const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
-  const mdFiles = entries.filter(
-    // Agent definitions are commonly deployed as symlinks so updates to the
-    // source repository take effect without copying files. Dirent#isFile()
-    // is false for symlinks, but readFile below safely follows valid links and
-    // already skips broken or unreadable entries.
-    (e) => (e.isFile() || e.isSymbolicLink()) && e.name.endsWith(".md"),
-  );
+  // Don fork: follow symlinks so an agent file can be deployed with `ln -s`.
+  // A broken or directory symlink still fails its read below and is skipped.
+  const mdFiles = entries.filter((e) => (e.isFile() || e.isSymbolicLink()) && e.name.endsWith(".md"));
 
   const agents: AgentConfigFromMd[] = [];
   for (const entry of mdFiles) {
@@ -333,53 +305,47 @@ export async function scanAgentFilesInDir(
   return agents;
 }
 
-/* ------------------------------------------------------------------ */
-/*  mergeAgents                                                        */
-/* ------------------------------------------------------------------ */
+// --- mergeAgents ---
 
 /**
- * Merge default agents with user and project overrides.
+ * Merge default agents with user, shared, and project overrides.
  *
  * Per-field merge precedence (highest to lowest):
- *   1. project agents
- *   2. user agents
- *   3. default agents
+ *   1. project agents (.pi/agents/)
+ *   2. shared agents (.agents/agents/)
+ *   3. user agents (~/.pi/agent/agents/)
+ *   4. default agents
  *
  * For each field, if a higher-precedence layer sets the field (not undefined),
  * it wins. Otherwise, the lower layer's value is preserved.
  *
  * @param defaults - Map of default agent configs
  * @param userAgents - User-defined agent configs
- * @param projectAgents - Project-specific agent configs
+ * @param sharedAgents - Shared workspace agent configs (.agents/agents/)
+ * @param projectAgents - Project-specific agent configs (.pi/agents/)
  * @returns Merged Map<string, AgentConfig> keyed by agent name
  */
 export function mergeAgents(
   defaults: Map<string, AgentConfig>,
   userAgents: AgentConfigFromMd[],
+  sharedAgents: AgentConfigFromMd[],
   projectAgents: AgentConfigFromMd[],
 ): Map<string, AgentConfig> {
   const result = new Map<string, AgentConfig>();
 
-  // Start with defaults
   for (const [name, config] of defaults) {
     result.set(name, { ...config });
   }
 
-  // Apply user overrides (middle priority), then project (highest priority)
   mergeAgentOverrides(result, userAgents);
+  mergeAgentOverrides(result, sharedAgents);
   mergeAgentOverrides(result, projectAgents);
 
   return result;
 }
 
-/**
- * Apply a list of agent configs onto the result map.
- * Existing agents are merged per-field; new agents are built from scratch.
- */
-function mergeAgentOverrides(
-  result: Map<string, AgentConfig>,
-  agents: AgentConfigFromMd[],
-): void {
+/** Merge configs onto the map; new agents are built from BASE_DEFAULTS. */
+function mergeAgentOverrides(result: Map<string, AgentConfig>, agents: AgentConfigFromMd[]): void {
   for (const md of agents) {
     if (!md.name) continue;
     const existing = result.get(md.name);
@@ -400,14 +366,18 @@ function mergeAgentOverrides(
  * fields fall through to the existing values.
  */
 function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
-  const lifecycle = md.session_lifecycle;
-  const legacyLifecycle = md.persistent_session === undefined
-    ? undefined
-    : md.persistent_session ? "persistent" : "stateless";
-  const resolvedLifecycle = lifecycle ?? legacyLifecycle;
-  if (lifecycle && legacyLifecycle && lifecycle !== legacyLifecycle) {
-    throw new Error(`Agent '${md.name ?? "unknown"}' has conflicting session_lifecycle and persistent_session metadata`);
+  // Don fork: session_lifecycle is authoritative; persistent_session is the
+  // legacy boolean spelling. A file that sets both to opposite meanings is a
+  // config bug that must not resolve silently to one of the two.
+  const legacyLifecycle: SessionLifecycle | undefined =
+    md.persistent_session === undefined ? undefined : md.persistent_session ? "persistent" : "stateless";
+  if (md.session_lifecycle && legacyLifecycle && md.session_lifecycle !== legacyLifecycle) {
+    throw new Error(
+      `Agent '${md.name ?? "unknown"}' has conflicting session_lifecycle and persistent_session metadata`,
+    );
   }
+  const sessionLifecycle = md.session_lifecycle ?? legacyLifecycle;
+
   const obj: Record<string, unknown> = {
     name: md.name,
     displayName: md.display_name,
@@ -419,13 +389,17 @@ function fromMd(md: AgentConfigFromMd): Partial<AgentConfig> {
     excludeExtensions: md.exclude_extensions,
     skills: md.skills,
     preloadSkills: md.preload_skills,
-    sessionLifecycle: resolvedLifecycle,
-    persistentSession: resolvedLifecycle === undefined ? undefined : resolvedLifecycle === "persistent",
+    sessionLifecycle,
+    persistentSession: sessionLifecycle === undefined ? undefined : sessionLifecycle === "persistent",
+    color: md.color,
     model: md.model,
     thinkingLevel: md.thinking,
     maxTurns: md.max_turns,
     maxTokens: md.max_tokens,
     hidden: md.hidden,
+    outputTranscript: md.output_transcript,
+    includeContextFiles: md.include_context_files,
+    includeSystemPrompt: md.include_system_prompt,
     systemPrompt: md.systemPrompt,
     source: md.source === "project" ? "project" : "global",
   };

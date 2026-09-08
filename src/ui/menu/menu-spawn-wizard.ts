@@ -10,31 +10,23 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { SettingsList, SelectList, type SettingItem } from "@earendil-works/pi-tui";
+import { getSupportedThinkingLevels, clampThinkingLevel } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "../../types.js";
 import type { Theme } from "../types.js";
-import { getAgentConfig, getAvailableTypes, resolveType, discoverNewAgents } from "../../agents/agent-types.js";
-import { findModelInRegistry, VALID_THINKING_LEVELS } from "../../utils.js";
-import { buildSettingsListTheme, buildSelectListTheme, createSearchableSelect } from "./helpers.js";
+import { getAgentConfig, getAvailableTypes, discoverNewAgents } from "../../agents/agent-types.js";
+import { findModelInRegistry } from "../../utils.js";
+import { agentBulletPrefix } from "../format.js";
+import { SEPARATOR_ID, buildSettingsListTheme, buildSelectListTheme, createSearchableSelect } from "./helpers.js";
 import { DEFAULT_GRACE_TURNS } from "../../config/config-io.js";
 import { createModelSelectSubmenu } from "./submenus/model-select.js";
 import { createNumericSubmenu, createInputSubmenu } from "./submenus/numeric-input.js";
 import { SettingsListWrapper } from "./wrappers/settings-list.js";
-import {
-  getPiInstance,
-  getSessionCtx,
-  getWidget,
-  getStore,
-  getCoordinator,
-} from "../../shell.js";
+import { getPiInstance, getSessionCtx, getWidget, getStore, getCoordinator } from "../../shell.js";
 
-// ============================================================================
-// Worktree picker helpers
-// ============================================================================
+// --- Worktree picker helpers ---
 
-/** Timeout for git worktree list command (ms). */
 const WORKTREE_LIST_TIMEOUT_MS = 5000;
 
-/** Max display length for a worktree path before truncation. */
 const WORKTREE_PATH_TRUNCATE_LEN = 60;
 
 interface WorktreeEntry {
@@ -76,7 +68,6 @@ function parseWorktreeList(output: string): WorktreeEntry[] {
   return entries;
 }
 
-/** Truncate a path for display, keeping the tail. */
 function truncatePath(p: string): string {
   if (p.length <= WORKTREE_PATH_TRUNCATE_LEN) return p;
   return "..." + p.slice(p.length - WORKTREE_PATH_TRUNCATE_LEN + 3);
@@ -88,11 +79,10 @@ function truncatePath(p: string): string {
  */
 async function listWorktrees(cwd: string): Promise<WorktreeEntry[] | null> {
   try {
-    const result = await getPiInstance().exec(
-      "git",
-      ["worktree", "list", "--porcelain"],
-      { cwd, timeout: WORKTREE_LIST_TIMEOUT_MS },
-    );
+    const result = await getPiInstance().exec("git", ["worktree", "list", "--porcelain"], {
+      cwd,
+      timeout: WORKTREE_LIST_TIMEOUT_MS,
+    });
     if (result.code !== 0) return null;
     return parseWorktreeList(result.stdout);
   } catch {
@@ -106,21 +96,59 @@ async function listWorktrees(cwd: string): Promise<WorktreeEntry[] | null> {
  */
 async function isInGitRepo(cwd: string): Promise<boolean> {
   try {
-    const result = await getPiInstance().exec(
-      "git",
-      ["rev-parse", "--git-common-dir"],
-      { cwd, timeout: WORKTREE_LIST_TIMEOUT_MS },
-    );
+    const result = await getPiInstance().exec("git", ["rev-parse", "--git-common-dir"], {
+      cwd,
+      timeout: WORKTREE_LIST_TIMEOUT_MS,
+    });
     return result.code === 0 && result.stdout.trim() !== "";
   } catch {
     return false;
   }
 }
 
-// ============================================================================
-// Spawn agent wizard
-// ============================================================================
+// --- Spawn agent wizard ---
 
+/**
+ * Build a submenu for selecting the thinking level based on the current model.
+ * Non-reasoning models only show 'off'; reasoning models show supported levels plus 'inherit'.
+ */
+function createThinkingLevelSubmenu(
+  registry: Parameters<typeof findModelInRegistry>[1],
+  currentModelStr: string,
+  fallbackModel: Parameters<typeof findModelInRegistry>[2],
+  theme: Theme,
+  onThinkingChange: (level: ThinkingLevel | undefined) => void,
+): (_currentValue: string, done: (v?: string) => void) => any {
+  return (_currentValue, done) => {
+    const model = findModelInRegistry(currentModelStr, registry, fallbackModel);
+    if (!model) {
+      done();
+      return {} as any;
+    }
+
+    const supported = getSupportedThinkingLevels(model);
+    const isReasoning = model.reasoning;
+
+    const items: Array<{ value: string; label: string; description?: string }> = supported.map((level) => ({
+      value: level,
+      label: level === "off" ? "Off" : level.charAt(0).toUpperCase() + level.slice(1),
+      description: !isReasoning ? "(not supported by this model)" : undefined,
+    }));
+
+    if (isReasoning) {
+      items.push({ value: "inherit", label: "Inherit" });
+    }
+
+    const list = new SelectList(items, 10, buildSelectListTheme(theme));
+    list.onSelect = (item) => {
+      onThinkingChange(item.value === "inherit" ? undefined : (item.value as ThinkingLevel));
+      done(item.value);
+    };
+    list.onCancel = () => done();
+
+    return list;
+  };
+}
 
 /**
  * Show the spawn agent flow as a multi-step wizard:
@@ -128,10 +156,7 @@ async function isInGitRepo(cwd: string): Promise<boolean> {
  *   Step 2: prompt entry (Input)
  *   Step 3: options sub-menu with spawn (SettingsList with submenus)
  */
-export async function showSpawnAgentMenu(
-  ctx: ExtensionCommandContext,
-  modelOptions: string[],
-): Promise<void> {
+export async function showSpawnAgentMenu(ctx: ExtensionCommandContext, modelOptions: string[]): Promise<void> {
   // ---- Step 1: Type selection ----
   let selectedType: string;
   {
@@ -142,9 +167,9 @@ export async function showSpawnAgentMenu(
     }
 
     const result = await ctx.ui.custom<string | undefined>((_tui, theme, _kb, done) => {
-      const items: SettingItem[] = types.map(t => ({
+      const items: SettingItem[] = types.map((t) => ({
         id: t,
-        label: t,
+        label: `${agentBulletPrefix(t)}${t}`,
         currentValue: t,
         description: getAgentConfig(t)?.description ?? "Agent type",
         submenu: (_v: string, _subDone: (value?: string) => void) => {
@@ -156,7 +181,9 @@ export async function showSpawnAgentMenu(
         items,
         10,
         buildSettingsListTheme(theme),
-        (id, value) => { done(value); },
+        (_id, value) => {
+          done(value);
+        },
         () => done(undefined),
         { enableSearch: true },
       );
@@ -189,29 +216,24 @@ export async function showSpawnAgentMenu(
   const session = getSessionCtx();
   const parentCwd = session?.cwd ?? "";
   const inGitRepo = parentCwd ? await isInGitRepo(parentCwd) : false;
-  const worktrees = inGitRepo ? (await listWorktrees(parentCwd)) ?? [] : [];
+  const worktrees = inGitRepo ? ((await listWorktrees(parentCwd)) ?? []) : [];
 
   const store = getStore();
-  const parentModelId = session?.model
-    ? `${session.model.provider}/${session.model.id}`
-    : "";
-  const effectiveSpawn = store.spawnFor(selectedType, parentModelId, agentConfig);
+  const parentModelId = session?.model ? `${session.model.provider}/${session.model.id}` : "";
+  const effectiveModelStr = store.modelFor(selectedType, parentModelId, agentConfig);
 
-  let currentModelStr = effectiveSpawn.model || "";
-  // Same resolution as tool-spawned agents: settings travelling with the
-  // resolved model (follow-map entry) beat frontmatter/default thinking.
-  let currentThinking: ThinkingLevel | undefined =
-    effectiveSpawn.thinking ?? agentConfig.thinkingLevel ?? store.agent.defaultThinking;
+  let currentModelStr = effectiveModelStr || "";
+  let currentThinking: ThinkingLevel | undefined = agentConfig.thinkingLevel ?? store.agent.defaultThinking;
   let currentMaxTurns: number | undefined = agentConfig.maxTurns ?? store.agent.defaultMaxTurns;
   let currentMaxTokens: number | undefined = agentConfig.maxTokens;
   let currentGraceTurns: number = store.agent.graceTurns ?? DEFAULT_GRACE_TURNS;
-  let currentBackground: boolean = store.agent.forceBackground;
+  let currentBackground: boolean = true;
   let currentWorktreePath: string | undefined;
   let currentWorktreeLabel = "Inherits parent cwd";
   let currentDescription = prompt.length > 50 ? prompt.slice(0, 50) : prompt;
 
   const buildItems = (): SettingItem[] => {
-    const fmtNum = (v: number | undefined) => v != null ? String(v) : "(not set)";
+    const fmtNum = (v: number | undefined) => (v != null ? String(v) : "(not set)");
     const displayModel = currentModelStr || "(inherits parent)";
     const items: SettingItem[] = [
       {
@@ -220,10 +242,10 @@ export async function showSpawnAgentMenu(
         currentValue: "",
         description: "Spawn the agent with current settings",
         submenu: (_v, done) => {
-          const gtItem = items.find(i => i.id === "graceTurns");
-          const bgItem = items.find(i => i.id === "background");
-          const descItem = items.find(i => i.id === "description");
-          const promptItem = items.find(i => i.id === "prompt");
+          const gtItem = items.find((i) => i.id === "graceTurns");
+          const bgItem = items.find((i) => i.id === "background");
+          const descItem = items.find((i) => i.id === "description");
+          const promptItem = items.find((i) => i.id === "prompt");
 
           const thinking = currentThinking;
           const maxTurns = currentMaxTurns;
@@ -251,7 +273,6 @@ export async function showSpawnAgentMenu(
             if (currentWorktreePath) {
               await discoverNewAgents(`${currentWorktreePath}/.pi/agents`);
             }
-            const resolvedType = resolveType(selectedType) ?? selectedType;
 
             const widget = getWidget();
             if (widget) {
@@ -261,8 +282,8 @@ export async function showSpawnAgentMenu(
 
             const coordinator = getCoordinator()!;
             try {
-              const result = await coordinator.spawn(getPiInstance(), session!, {
-                type: resolvedType,
+              await coordinator.spawn(getPiInstance(), session!, {
+                type: selectedType,
                 prompt: spawnPrompt,
                 description,
                 model,
@@ -283,14 +304,10 @@ export async function showSpawnAgentMenu(
               });
 
               if (!background) {
-                getWidget()?.markFinished(result.agentId);
                 getWidget()?.update();
               }
             } catch (err) {
-              ctx.ui.notify(
-                `Spawn failed: ${err instanceof Error ? err.message : String(err)}`,
-                "error",
-              );
+              ctx.ui.notify(`Spawn failed: ${err instanceof Error ? err.message : String(err)}`, "error");
             }
           };
 
@@ -301,7 +318,7 @@ export async function showSpawnAgentMenu(
         },
       },
       {
-        id: "__sep__",
+        id: SEPARATOR_ID,
         label: " ",
         currentValue: "",
       },
@@ -313,9 +330,22 @@ export async function showSpawnAgentMenu(
         submenu: createModelSelectSubmenu({
           modelOptions,
           showClear: false,
+          projectOffered: store.projectTargetOffered,
           theme,
-          onSelect: (_mode, model) => {
+          onSet: (_target, model) => {
             currentModelStr = model === "(inherits parent)" || model === null ? "" : model;
+
+            // Clamp thinking level to nearest supported level for the new model
+            if (currentThinking != null && currentModelStr) {
+              const registry = session?.modelRegistry ?? ctx.modelRegistry;
+              const resolved = findModelInRegistry(currentModelStr, registry, session?.model);
+              if (resolved) {
+                const clamped = clampThinkingLevel(resolved, currentThinking);
+                currentThinking = clamped;
+              }
+            }
+            // Rebuild items so displayed thinking level reflects clamped value
+            rebuild?.(buildItems());
           },
         }),
       },
@@ -327,69 +357,97 @@ export async function showSpawnAgentMenu(
         values: ["ON", "OFF"],
       },
       ...(inGitRepo
-        ? [{
-            id: "worktree",
-            label: "Worktree",
-            currentValue: currentWorktreeLabel,
-            description: "Run in a linked git worktree instead of parent cwd",
-            submenu: (_v: string, done: (v?: string) => void) => {
-              const pickerItems = [
-                { value: "Inherits parent cwd", label: "Inherits parent cwd" },
-                ...worktrees.map(wt => {
-                  const branchLabel = wt.isDetached ? "detached" : (wt.branch ?? "detached");
-                  const truncPath = truncatePath(wt.path);
-                  return { value: wt.path, label: truncPath, provider: branchLabel };
-                }),
-              ];
-              return createSearchableSelect(
-                pickerItems,
-                {
-                  onSelect: (value) => {
-                    if (value === "Inherits parent cwd") {
-                      currentWorktreePath = undefined;
-                      done("Inherits parent cwd");
-                    } else {
-                      const wt = worktrees.find(w => w.path === value);
-                      currentWorktreePath = wt?.path;
-                      done(wt?.branch ?? "detached");
-                    }
+        ? [
+            {
+              id: "worktree",
+              label: "Worktree",
+              currentValue: currentWorktreeLabel,
+              description: "Run in a linked git worktree instead of parent cwd",
+              submenu: (_v: string, done: (v?: string) => void) => {
+                const pickerItems = [
+                  { value: "Inherits parent cwd", label: "Inherits parent cwd" },
+                  ...worktrees.map((wt) => {
+                    const branchLabel = wt.isDetached ? "detached" : (wt.branch ?? "detached");
+                    const truncPath = truncatePath(wt.path);
+                    return { value: wt.path, label: truncPath, provider: branchLabel };
+                  }),
+                ];
+                return createSearchableSelect(
+                  pickerItems,
+                  {
+                    onSelect: (value) => {
+                      if (value === "Inherits parent cwd") {
+                        currentWorktreePath = undefined;
+                        done("Inherits parent cwd");
+                      } else {
+                        const wt = worktrees.find((w) => w.path === value);
+                        currentWorktreePath = wt?.path;
+                        done(wt?.branch ?? "detached");
+                      }
+                    },
+                    onCancel: () => done(),
                   },
-                  onCancel: () => done(),
-                },
-                theme,
-              );
-            },
-          } as SettingItem]
+                  theme,
+                );
+              },
+            } as SettingItem,
+          ]
         : []),
       {
         id: "thinkingLevel",
         label: "Thinking level",
         currentValue: currentThinking ?? "inherit",
         description: "Set the reasoning effort level",
-        values: [...VALID_THINKING_LEVELS, "inherit"],
+        submenu: createThinkingLevelSubmenu(
+          session?.modelRegistry ?? ctx.modelRegistry,
+          currentModelStr,
+          session?.model,
+          theme,
+          (level) => {
+            currentThinking = level;
+          },
+        ),
       },
       {
         id: "maxTokens",
         label: "Max tokens",
         currentValue: fmtNum(currentMaxTokens),
         description: "Maximum tokens the agent can consume",
-        submenu: createNumericSubmenu(ctx, (parsed) => { currentMaxTokens = parsed; }, () => { currentMaxTokens = undefined; }),
+        submenu: createNumericSubmenu(
+          ctx,
+          (parsed) => {
+            currentMaxTokens = parsed;
+          },
+          () => {
+            currentMaxTokens = undefined;
+          },
+        ),
       },
       {
         id: "maxTurns",
         label: "Max turns",
         currentValue: fmtNum(currentMaxTurns),
         description: "Maximum conversation turns before hard stop",
-        submenu: createNumericSubmenu(ctx, (parsed) => { currentMaxTurns = parsed; }, () => { currentMaxTurns = undefined; }),
+        submenu: createNumericSubmenu(
+          ctx,
+          (parsed) => {
+            currentMaxTurns = parsed;
+          },
+          () => {
+            currentMaxTurns = undefined;
+          },
+        ),
       },
       {
         id: "graceTurns",
         label: "Grace turns",
         currentValue: String(currentGraceTurns),
         description: "Extra turns after soft limit before abort",
-        submenu: createNumericSubmenu(ctx, { min: 0, default: DEFAULT_GRACE_TURNS }, (parsed) => { currentGraceTurns = parsed; }),
+        submenu: createNumericSubmenu(ctx, { min: 0, default: DEFAULT_GRACE_TURNS }, (parsed) => {
+          currentGraceTurns = parsed;
+        }),
       },
-      { id: "__sep__", label: " ", currentValue: "" },
+      { id: SEPARATOR_ID, label: " ", currentValue: "" },
       {
         id: "description",
         label: "Description",
@@ -403,7 +461,7 @@ export async function showSpawnAgentMenu(
         currentValue: prompt,
         description: "The user message sent to the agent",
         submenu: createInputSubmenu(ctx, { required: true }),
-      }
+      },
     ];
 
     return items;
@@ -411,6 +469,7 @@ export async function showSpawnAgentMenu(
 
   let theme: Theme;
   let doneRef: () => void;
+  let rebuild: ((items: SettingItem[]) => void) | undefined;
 
   await ctx.ui.custom((_tui, t, _kb, done) => {
     theme = t;
@@ -420,17 +479,26 @@ export async function showSpawnAgentMenu(
     const onChange = (id: string, newValue: string) => {
       switch (id) {
         case "thinkingLevel":
-          currentThinking = newValue === "inherit" ? undefined : newValue as ThinkingLevel;
+          currentThinking = newValue === "inherit" ? undefined : (newValue as ThinkingLevel);
           break;
         case "background":
           currentBackground = newValue === "ON";
           break;
         case "prompt":
           prompt = newValue;
-        break;
+          break;
       }
+      // Rebuild items so displayed values stay in sync after any change
+      rebuild?.(buildItems());
     };
     const settingsList = new SettingsList(items, 15, buildSettingsListTheme(theme), onChange, doneRef);
-    return new SettingsListWrapper(settingsList, { title: "Spawn Options", theme, onCancel: () => doneRef() });
+    return new SettingsListWrapper(settingsList, {
+      title: "Spawn Options",
+      theme,
+      onCancel: () => doneRef(),
+      onRebuild: (r) => {
+        rebuild = r;
+      },
+    });
   });
 }

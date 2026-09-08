@@ -42,11 +42,38 @@ export function registerAgentTool(pi: ExtensionAPI): void {
       agent: optional(agentType),
       run_in_background: optional(Type.Boolean()),
       worktree_path: optional(Type.String()),
+      // Don fork: optional named, resumable child session. The schema rejects a
+      // whitespace-only placeholder before execution; one-shot calls omit it.
+      session_key: optional(
+        Type.String({
+          minLength: 1,
+          pattern: ".*\\S.*",
+          description:
+            "Optional persistent-session key. If unused, omit this field. Must contain a non-whitespace " +
+            "character and is mutually exclusive with a non-empty worktree_path.",
+        }),
+      ),
+      // Don fork: per-call overrides. execute() has always read these, but they
+      // were absent from the schema, so a constrained provider could never emit
+      // them and the per-call model contract was unreachable.
+      model: optional(Type.String()),
+      thinking: optional(Type.String()),
+      max_turns: optional(Type.Number()),
     },
     useConstrained
       ? {
           additionalProperties: false,
-          required: ["prompt", "description", "agent", "run_in_background", "worktree_path"],
+          required: [
+            "prompt",
+            "description",
+            "agent",
+            "run_in_background",
+            "worktree_path",
+            "session_key",
+            "model",
+            "thinking",
+            "max_turns",
+          ],
         }
       : { additionalProperties: false },
   );

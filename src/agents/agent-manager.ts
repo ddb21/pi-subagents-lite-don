@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { continueAgentSession, runAgent, type RunResult } from "./agent-runner.js";
 import { AgentOutputLog } from "./output-file.js";
 import { Watchdog } from "./watchdog.js";
@@ -17,7 +17,15 @@ import {
   type StopInitiator,
   type WatchdogStopDetail,
   type SpawnConfig,
+  SHORT_ID_LENGTH,
 } from "../types.js";
+import {
+  acquireSessionFileLease,
+  acquireSessionKeyLease,
+  getSessionKeyIndexKey,
+  resolveSessionKey,
+  type PersistentSessionLease,
+} from "./persistent-executor.js";
 import type { SubagentType } from "./types.js";
 import { getAgentConfig } from "./agent-types.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent } from "./usage.js";
@@ -80,6 +88,10 @@ export interface SpawnOptions extends SpawnConfig, RunCallbacks {
   isBackground?: boolean;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
+  /** Don fork: existing keyed session file to reopen; set by the key resolver. */
+  resumeSessionFile?: string;
+  /** Don fork: cross-process owner lease, held until the run has persisted. */
+  persistentSessionLease?: PersistentSessionLease;
 }
 
 export class AgentManager {
@@ -194,8 +206,64 @@ export class AgentManager {
     return slot;
   }
 
+  /**
+   * Don fork: resolve and reserve a keyed session before anything is queued, so
+   * two live records can never append to the same JSONL file.
+   *
+   * The lease is cross-process; the in-memory busy check covers the same
+   * process, where a queued record holds its key before any file exists. The
+   * lease is released by the caller on any throw, and at settlement otherwise.
+   */
+  private reserveKeyedSession(ctx: ExtensionContext, options: SpawnOptions): void {
+    if (options.sessionKey) {
+      const sessionKeyCwd = options.sessionKeyCwd ?? ctx.cwd;
+      const sessionKeyAgentType = options.sessionKeyAgentType;
+      if (!sessionKeyAgentType) throw new Error("session_key requires a canonical resolved agent type");
+
+      const sessionKeyId = getSessionKeyIndexKey(sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
+      const lease = acquireSessionKeyLease(getAgentDir(), sessionKeyCwd, sessionKeyAgentType, options.sessionKey);
+      try {
+        const resumeSessionFile = resolveSessionKey(
+          getAgentDir(),
+          sessionKeyCwd,
+          sessionKeyAgentType,
+          options.sessionKey,
+        );
+        const busyRecord = [...this.agents.values()].find((record) => {
+          if (record.lifecycle.status !== "queued" && record.lifecycle.status !== "running") return false;
+          return (
+            record.execution.sessionKey === sessionKeyId ||
+            (!!resumeSessionFile && record.execution.sessionFile === resumeSessionFile)
+          );
+        });
+        if (busyRecord) {
+          throw new Error(
+            `Session '${options.sessionKey}' is busy (agent ${busyRecord.id.slice(0, SHORT_ID_LENGTH)}). ` +
+              `Wait for it to finish.`,
+          );
+        }
+        options.resumeSessionFile = resumeSessionFile;
+        options.persistentSessionLease = lease;
+      } catch (error) {
+        lease.release();
+        throw error;
+      }
+    } else if (options.resumeSessionFile) {
+      // A direct resume bypasses key mapping; it still needs an owner lease.
+      options.persistentSessionLease = acquireSessionFileLease(getAgentDir(), options.resumeSessionFile);
+    }
+  }
+
+  /** Release a spawn's owner lease exactly once. */
+  private releaseLease(options: SpawnOptions): void {
+    options.persistentSessionLease?.release();
+    options.persistentSessionLease = undefined;
+  }
+
   /** Spawn an agent, returning its ID immediately; queued when the concurrency limit is reached. */
   spawn(pi: ExtensionAPI, ctx: ExtensionContext, type: SubagentType, prompt: string, options: SpawnOptions): string {
+    this.reserveKeyedSession(ctx, options);
+
     const id = randomUUID().slice(0, AGENT_ID_PREFIX_LENGTH);
     const abortController = new AbortController();
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
@@ -232,6 +300,18 @@ export class AgentManager {
         modelKey: options.modelKey,
         settled: false,
         settlementCount: 0,
+        // Don fork: reserve an uncreated key too, so a same-key spawn is
+        // rejected while this record is still queued.
+        ...(options.sessionKey
+          ? {
+              sessionKey: getSessionKeyIndexKey(
+                options.sessionKeyCwd ?? ctx.cwd,
+                options.sessionKeyAgentType!,
+                options.sessionKey,
+              ),
+              sessionFile: options.resumeSessionFile,
+            }
+          : {}),
       },
       stats: {
         lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
@@ -260,6 +340,7 @@ export class AgentManager {
     if (options.signal) {
       if (options.signal.aborted) {
         // Never-started record: no run will settle it, so stopAgent opens the gate and notifies.
+        this.releaseLease(options);
         this.stopAgent(record, "user");
         return id;
       }
@@ -277,6 +358,7 @@ export class AgentManager {
       this.detachParentBinding(record);
       this.openGate(id, "");
       this.agents.delete(id);
+      this.releaseLease(options);
       throw err;
     }
     return id;
@@ -320,12 +402,22 @@ export class AgentManager {
       graceTurns: options.graceTurns,
       projectTrusted: options.projectTrusted,
       signal: record.execution.abortController!.signal,
+      // Don fork: persistent session identity and lineage.
+      parentSessionFile: options.parentSessionFile,
+      sessionKey: options.sessionKey,
+      sessionKeyCwd: options.sessionKeyCwd,
+      sessionKeyAgentType: options.sessionKey ? options.sessionKeyAgentType! : undefined,
+      resumeSessionFile: options.resumeSessionFile,
       ...this.runTrackingCallbacks(record, options, (turnCount) => {
         record.stats.turnCount = turnCount;
         options.onTurnEnd?.(turnCount);
       }),
       onSessionCreated: (session) => {
         record.execution.session = session;
+        // Don fork: capture the real transcript path once it exists, so a
+        // second spawn on the same key sees a busy file, not just a busy key.
+        const sessionFile = session.sessionManager?.getSessionFile?.();
+        if (sessionFile) record.execution.sessionFile = sessionFile;
         // Flush any steers that arrived before the session was ready
         if (record.execution.pendingSteers?.length) {
           for (const msg of record.execution.pendingSteers) {
@@ -342,7 +434,7 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     });
-    this.attachSettlementChain(record, promise, concurrencySlot);
+    this.attachSettlementChain(record, promise, concurrencySlot, options);
   }
 
   /**
@@ -356,6 +448,8 @@ export class AgentManager {
     record: AgentRecord,
     runPromise: Promise<RunResult>,
     concurrencySlot?: ConcurrencySlot,
+    /** Don fork: the spawn options holding this run's owner lease, when keyed. */
+    leaseHolder?: SpawnOptions,
   ) {
     runPromise
       .then(({ responseText, session, aborted, turnLimited, modelError }) => {
@@ -416,6 +510,9 @@ export class AgentManager {
         // the result text is captured and the completion notify has fired.
         this.detachParentBinding(record);
         this.openGate(record.id, record.result ?? "");
+        // Don fork: the complete turn has persisted, so another process may now
+        // own this keyed session. Released last, after the gate opens.
+        if (leaseHolder) this.releaseLease(leaseHolder);
         // The run chain is fully settled: a continuation may now re-reserve
         // the slot and prompt the session again.
         record.execution.settled = true;

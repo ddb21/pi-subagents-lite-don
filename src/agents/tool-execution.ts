@@ -219,6 +219,21 @@ function resolveSpawnModel(
   };
 }
 
+/**
+ * Appended to every preflight validation error. pi does not surface tool
+ * details to the model, so the instruction has to ride in the text or an
+ * orchestrator repeats the identical failing call.
+ */
+const NON_RETRYABLE_VALIDATION_NOTE =
+  "This validation error is non-retryable; do not repeat the same Agent call unchanged.";
+
+/** True when a param carries a value a caller actually meant to set. */
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === undefined || value === null || value === false) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  return true;
+}
+
 /** Prefix a tool result text with any spawn-time normalization notes. */
 function withNotes(text: string, warnings: string[]): string {
   if (warnings.length === 0) return text;
@@ -234,8 +249,38 @@ export async function executeAgentTool(
 ): Promise<any> {
   /** Don fork: spawn-time notes surfaced to the caller alongside the result. */
   const normalizationWarnings: string[] = [];
+  // Don fork: capture lineage before a queued spawn can outlive this session.
+  const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
+
+  // Don fork: normalize the session_key placeholder before anything reads it.
+  // Models that fill every optional field send "" here; that is not a key.
+  if (params.session_key !== undefined && typeof params.session_key !== "string") {
+    throw new Error(`session_key must be a string when provided. ${NON_RETRYABLE_VALIDATION_NOTE}`);
+  }
+  const sessionKey = (params.session_key as string | undefined)?.trim() || undefined;
+  if (params.session_key !== undefined && !sessionKey) {
+    normalizationWarnings.push("empty session_key ignored; spawned without a session key");
+  }
+  if (sessionKey) {
+    // A key resumes one named session. A fork-style param asks for a copy of a
+    // different session, so the two cannot both be honoured.
+    const forkStyleParam = ["context", "fork", "fork_from", "parent_session", "parentSession"].find((name) =>
+      hasMeaningfulValue(params[name]),
+    );
+    if (forkStyleParam) {
+      throw new Error(`session_key cannot be used with ${forkStyleParam}. ${NON_RETRYABLE_VALIDATION_NOTE}`);
+    }
+  }
+
   // Validate worktree_path early — needed for on-demand agent discovery
   const rawWorktreePath = params.worktree_path as string | undefined;
+  if (sessionKey && rawWorktreePath && rawWorktreePath.trim() !== "") {
+    throw new Error(
+      `session_key cannot be used with a non-empty worktree_path; omit one of these fields. ` +
+        `worktree_path was '${rawWorktreePath}'. To reuse session_key '${sessionKey}', resend the same call ` +
+        `with worktree_path omitted. ${NON_RETRYABLE_VALIDATION_NOTE}`,
+    );
+  }
   const resolved = await resolveWorktree(ctx, rawWorktreePath);
   if (!resolved.ok) throw new Error(resolved.error);
   const validatedWorktreePath = resolved.resolvedPath;
@@ -310,6 +355,12 @@ export async function executeAgentTool(
     worktreePath: validatedWorktreePath,
     worktreeLabel,
     projectTrusted,
+    parentSessionFile,
+    // Don fork: scope a keyed session by normalized parent cwd, canonical type,
+    // and caller key, so the same key under two projects stays two sessions.
+    ...(sessionKey
+      ? { sessionKey, sessionKeyCwd: getSessionCtx()?.cwd ?? ctx.cwd, sessionKeyAgentType: resolvedType }
+      : {}),
     invocation: { modelName, thinkingLevel, maxTurns },
     runInBackground: isBackground,
     signal: isBackground ? undefined : signal,

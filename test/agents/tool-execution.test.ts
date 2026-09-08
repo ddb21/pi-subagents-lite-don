@@ -122,6 +122,11 @@ vi.mock("../../src/shell.js", () => ({
         projectTrusted: intent.projectTrusted,
         isBackground: intent.runInBackground,
         signal: intent.signal,
+        // Don fork: persistent session identity and lineage.
+        sessionKey: intent.sessionKey,
+        sessionKeyCwd: intent.sessionKeyCwd,
+        sessionKeyAgentType: intent.sessionKeyAgentType,
+        parentSessionFile: intent.parentSessionFile,
       });
       const record = mockGetRecord(id);
       if (!intent.runInBackground && record?.execution?.promise) {
@@ -860,5 +865,135 @@ describe("executeAgentTool — queued foreground spawn", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toBe("full result text");
     expect(result.content[0].text).not.toBe("");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Don fork — session_key                                            */
+/* ------------------------------------------------------------------ */
+
+describe("executeAgentTool — session_key", () => {
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    ctx = fakeCtx();
+    mockResolveSubagentTrust.mockReturnValue(true);
+    mockGetRecord.mockReturnValue({
+      id: "agent-id-123",
+      display: { type: "general-purpose", description: "Test agent" },
+      lifecycle: { status: "completed", startedAt: Date.now() },
+      execution: { promise: Promise.resolve("done") },
+      result: "done",
+      stats: {
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        toolUses: 0,
+        compactionCount: 0,
+      },
+    });
+  });
+
+  /** The options object the coordinator handed to manager.spawn. */
+  function lastSpawnOptions(): Record<string, unknown> {
+    return mockSpawn.mock.calls.at(-1)![4] as Record<string, unknown>;
+  }
+
+  it("passes the scoped session-key triple through to the spawn", async () => {
+    await executeAgentTool("tc-sk-1", makeParams({ session_key: "exec-proj" }), undefined, undefined, ctx);
+
+    const options = lastSpawnOptions();
+    expect(options.sessionKey).toBe("exec-proj");
+    expect(options.sessionKeyAgentType).toBe("general-purpose");
+    // Scoped by the parent cwd, so the same key under another project is a
+    // different session.
+    expect(options.sessionKeyCwd).toBe("/home/test/project");
+  });
+
+  it("captures the parent session file for lineage", async () => {
+    await executeAgentTool("tc-sk-lineage", makeParams({ session_key: "exec-proj" }), undefined, undefined, ctx);
+    expect(lastSpawnOptions().parentSessionFile).toBe(ctx.sessionManager.getSessionFile());
+  });
+
+  it("omits session-key fields entirely when no key is given", async () => {
+    await executeAgentTool("tc-sk-none", makeParams(), undefined, undefined, ctx);
+
+    const options = lastSpawnOptions();
+    expect(options.sessionKey).toBeUndefined();
+    expect(options.sessionKeyCwd).toBeUndefined();
+    expect(options.sessionKeyAgentType).toBeUndefined();
+  });
+
+  it("ignores a whitespace-only key with a note instead of failing the spawn", async () => {
+    // Models that fill every optional field send "" here. That is not a key,
+    // and it must not cost the caller a turn.
+    const result = await executeAgentTool(
+      "tc-sk-empty",
+      makeParams({ session_key: "   " }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(lastSpawnOptions().sessionKey).toBeUndefined();
+    expect(result.content[0].text).toContain("empty session_key ignored");
+  });
+
+  it("throws a non-retryable error for a non-string session_key", async () => {
+    await expect(
+      executeAgentTool("tc-sk-type", makeParams({ session_key: 7 }), undefined, undefined, ctx),
+    ).rejects.toThrow(/session_key must be a string when provided/);
+    await expect(
+      executeAgentTool("tc-sk-type-2", makeParams({ session_key: 7 }), undefined, undefined, ctx),
+    ).rejects.toThrow(/non-retryable/);
+  });
+
+  it("rejects session_key combined with a fork-style param", async () => {
+    // A key resumes one named session; a fork param asks for a copy of a
+    // different one. Both cannot be honoured, so fail before spawning.
+    await expect(
+      executeAgentTool(
+        "tc-sk-fork",
+        makeParams({ session_key: "exec-proj", fork_from: "/some/session.jsonl" }),
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ).rejects.toThrow(/session_key cannot be used with fork_from/);
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it("ignores a fork-style param that carries no meaningful value", async () => {
+    await executeAgentTool(
+      "tc-sk-fork-empty",
+      makeParams({ session_key: "exec-proj", fork: "", context: null, parent_session: false }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
+  });
+
+  it("rejects session_key combined with a non-empty worktree_path", async () => {
+    await expect(
+      executeAgentTool(
+        "tc-sk-wt",
+        makeParams({ session_key: "exec-proj", worktree_path: "/wt/feature" }),
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ).rejects.toThrow(/session_key cannot be used with a non-empty worktree_path/);
+    expect(mockValidateWorktreePath).not.toHaveBeenCalled();
+  });
+
+  it("allows session_key alongside an empty worktree_path placeholder", async () => {
+    await executeAgentTool(
+      "tc-sk-wt-empty",
+      makeParams({ session_key: "exec-proj", worktree_path: "  " }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(lastSpawnOptions().sessionKey).toBe("exec-proj");
   });
 });

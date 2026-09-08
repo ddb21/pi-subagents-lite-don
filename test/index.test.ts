@@ -162,6 +162,9 @@ interface SchemaJson {
   description?: unknown;
   anyOf?: SchemaJson[];
   additionalProperties?: unknown;
+  /** Don fork: session_key constrains a whitespace-only placeholder away. */
+  minLength?: unknown;
+  pattern?: unknown;
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,11 +200,35 @@ describe("Agent tool schema — stealth", () => {
 
   it("exposes exactly the documented param set, each without a description", () => {
     const props = agentTool()!.parameters.properties as Record<string, SchemaJson>;
-    expect(Object.keys(props).sort()).toEqual(["agent", "description", "prompt", "run_in_background", "worktree_path"]);
+    expect(Object.keys(props).sort()).toEqual([
+      "agent",
+      "description",
+      "max_turns",
+      "model",
+      "prompt",
+      "run_in_background",
+      "session_key",
+      "thinking",
+      "worktree_path",
+    ]);
     // Params carry no description: the model learns them from the tool name alone.
+    // Don fork additions honour the same rule; session_key keeps only the one
+    // description the schema needs to reject a whitespace placeholder.
     expect(props.prompt.description).toBeUndefined();
     expect(props.worktree_path.description).toBeUndefined();
     expect(props.worktree_path.type).toBe("string");
+    expect(props.model.description).toBeUndefined();
+    expect(props.thinking.description).toBeUndefined();
+    expect(props.max_turns.description).toBeUndefined();
+  });
+
+  it("declares session_key so a whitespace-only placeholder is rejected by the schema", () => {
+    const props = agentTool()!.parameters.properties as Record<string, SchemaJson>;
+    // execute() also normalizes an empty key, but rejecting it here costs the
+    // caller no turn at all.
+    expect(props.session_key.type).toBe("string");
+    expect(props.session_key.minLength).toBe(1);
+    expect(props.session_key.pattern).toBe(".*\\S.*");
   });
 });
 

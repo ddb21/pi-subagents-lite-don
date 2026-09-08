@@ -37,6 +37,7 @@ import type { SubagentType, SystemPromptMode } from "./types.js";
 import { getStore, enterSubagentSpawn, exitSubagentSpawn } from "../shell.js";
 import { DEFAULT_GRACE_TURNS, CUSTOM_PROMPT_PATH } from "../config/config-io.js";
 import { patchRetryClassifier } from "./stream-retry.js";
+import { getSubagentSessionDir, recordSessionKey, sanitizeDanglingToolCalls } from "./persistent-executor.js";
 import { applyOutputLimit, resolveOutputLimit } from "./max-tokens-field.js";
 
 // Cache: extension path → unscoped package name (lowercased), or undefined if not found
@@ -118,6 +119,16 @@ interface RunOptions extends RunTunables, RunCallbacks {
   projectTrusted?: boolean;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
+  /** Don fork: parent session captured when the Agent tool was invoked, for lineage. */
+  parentSessionFile?: string;
+  /** Don fork: named persistent session. */
+  sessionKey?: string;
+  /** Don fork: parent cwd component used to scope sessionKey. */
+  sessionKeyCwd?: string;
+  /** Don fork: canonical resolved agent type, required whenever sessionKey is set. */
+  sessionKeyAgentType?: string;
+  /** Don fork: existing keyed session file to reopen. */
+  resumeSessionFile?: string;
 }
 
 export interface RunResult {
@@ -501,6 +512,55 @@ function createResourceLoader(
   };
 }
 
+/**
+ * Don fork: choose the SessionManager for this spawn.
+ *
+ * Upstream always uses an in-memory manager, so a subagent leaves no transcript
+ * and cannot be resumed. The fork persists each subagent session into a
+ * dedicated subdir (with parent lineage) so usage scrapers can classify
+ * subagent runs, and so a named key can resume one.
+ *
+ * - resumeSessionFile: reopen that JSONL. pi loads and indexes existing entries
+ *   but does not repair unfinished tool calls, so dangling tool calls are
+ *   closed first or the provider rejects the next turn.
+ * - a parent session, or any sessionKey: create a persisted session. A key
+ *   forces persistence even when an in-memory parent has no lineage to pass on.
+ * - otherwise: in-memory, preserving upstream behavior exactly.
+ */
+function resolveSessionManager(
+  ctx: ExtensionContext,
+  options: RunOptions,
+  cwd: string,
+  agentDir: string,
+): SessionManager {
+  const subagentDir = getSubagentSessionDir(agentDir);
+
+  if (options.resumeSessionFile) {
+    const sessionManager = SessionManager.open(options.resumeSessionFile, subagentDir);
+    sanitizeDanglingToolCalls(sessionManager);
+    return sessionManager;
+  }
+
+  const parent = options.parentSessionFile ?? ctx.sessionManager?.getSessionFile?.();
+  if (!parent && !options.sessionKey) return SessionManager.inMemory(cwd);
+
+  const sessionManager = SessionManager.create(cwd, subagentDir, parent ? { parentSession: parent } : undefined);
+  if (options.sessionKey) {
+    const sessionFile = sessionManager.getSessionFile();
+    if (!sessionFile) throw new Error("persistent session has no session file");
+    // The SessionManager target is known before its first lazy file write, so
+    // the index entry lands even if the run dies mid-turn.
+    recordSessionKey(
+      agentDir,
+      options.sessionKeyCwd ?? cwd,
+      options.sessionKeyAgentType!,
+      options.sessionKey,
+      sessionFile,
+    );
+  }
+  return sessionManager;
+}
+
 async function initSession(
   ctx: ExtensionContext,
   options: RunOptions,
@@ -518,7 +578,7 @@ async function initSession(
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd,
     agentDir,
-    sessionManager: SessionManager.inMemory(cwd),
+    sessionManager: resolveSessionManager(ctx, options, cwd, agentDir),
     settingsManager,
     model,
     tools: resolveSessionAllowedTools({

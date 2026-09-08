@@ -174,7 +174,34 @@ vi.mock("../../src/shell.js", () => ({
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession: mockModules.mockCreateAgentSession,
   DefaultResourceLoader: mockModules.mockDefaultResourceLoader,
-  SessionManager: { inMemory: vi.fn() },
+  // Don fork: the runner now chooses between inMemory, create (persisted, with
+  // parent lineage) and open (resume a keyed session), so the stub must offer
+  // all of them. A create/open double returns a manager whose getSessionFile
+  // reports a path, because the runner records the session key from it before
+  // the first lazy file write.
+  SessionManager: {
+    inMemory: vi.fn(),
+    create: vi.fn(() => ({
+      getSessionFile: () => "/tmp/subagent-sessions/created.jsonl",
+      getBranch: () => [],
+      appendMessage: vi.fn(),
+    })),
+    open: vi.fn(() => ({
+      getSessionFile: () => "/tmp/subagent-sessions/opened.jsonl",
+      getBranch: () => [],
+      appendMessage: vi.fn(),
+    })),
+    forkFrom: vi.fn(() => ({
+      getSessionFile: () => "/tmp/subagent-sessions/forked.jsonl",
+      getBranch: () => [],
+      appendMessage: vi.fn(),
+    })),
+    continueRecent: vi.fn(() => ({
+      getSessionFile: () => "/tmp/subagent-sessions/recent.jsonl",
+      getBranch: () => [],
+      appendMessage: vi.fn(),
+    })),
+  },
   SettingsManager: { create: mockModules.mockSettingsManagerCreate },
   getAgentDir: mockModules.mockGetAgentDir,
   loadProjectContextFiles: mockModules.mockLoadProjectContextFiles,

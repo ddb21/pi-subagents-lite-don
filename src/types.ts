@@ -78,6 +78,17 @@ export interface SpawnConfig extends RunTunables {
    */
   projectTrusted?: boolean;
   invocation?: AgentInvocation;
+  /**
+   * Don fork: named persistent session. A spawn carrying a key resumes the
+   * session that key last wrote, instead of starting a fresh in-memory one.
+   */
+  sessionKey?: string;
+  /** Don fork: parent cwd component used to scope sessionKey. */
+  sessionKeyCwd?: string;
+  /** Don fork: canonical resolved agent type, required whenever sessionKey is set. */
+  sessionKeyAgentType?: string;
+  /** Don fork: parent session file captured when the Agent tool was invoked, for lineage. */
+  parentSessionFile?: string;
 }
 
 /** How many characters of agent ID to show in display. */
@@ -166,6 +177,14 @@ export interface AgentExecutionState {
    * settlement. Guards continuation against racing settlement cleanup.
    */
   settled: boolean;
+  /**
+   * Don fork: scoped session-key identity (cwd|type|key) this record reserved.
+   * Set at spawn even before the session file exists, so a second spawn on the
+   * same key is rejected while this one is queued.
+   */
+  sessionKey?: string;
+  /** Don fork: session JSONL this record reads and appends to, when keyed or resumed. */
+  sessionFile?: string;
   /**
    * Number of settlements so far (first run = 1, each continuation run
    * increments). Written at the top of the shared settlement chain's

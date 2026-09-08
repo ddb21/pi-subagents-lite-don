@@ -12,6 +12,7 @@
  */
 
 import { getAgentConfig } from "../agents/agent-types.js";
+import { agentLogHint } from "./log-link.js";
 import { agentColorAnsi } from "../agent-color.js";
 import { getStore } from "../shell.js";
 import type { SubagentType, AgentInvocation } from "../agents/types.js";
@@ -330,7 +331,8 @@ export function buildMetadataLineParts(
 
   if (a.display.worktreeLabel) parts.push(`@${a.display.worktreeLabel}`);
 
-  if (a.display.outputFile) parts.push(`tail -f ${a.display.outputFile}`);
+  const logHint = agentLogHint(a.display.outputFile);
+  if (logHint) parts.push(logHint);
 
   return parts;
 }

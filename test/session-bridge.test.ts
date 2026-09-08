@@ -12,6 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getStore, publishSessionBridge, SESSION_BRIDGE_KEY, type SessionBridge } from "../src/shell.js";
+import { shellMock } from "./fixtures.js";
 
 const bridge = () => (globalThis as Record<string, unknown>)[SESSION_BRIDGE_KEY] as SessionBridge;
 
@@ -30,11 +31,31 @@ describe("publishSessionBridge", () => {
     // A caller must not be able to reach persisted config through the bridge.
     expect(Object.keys(bridge()).sort()).toEqual([
       "clearAll",
+      "clearAmbient",
       "clearOverride",
       "list",
       "setAmbient",
       "setOverride",
     ]);
+  });
+
+  it("keeps the shell mock's copy of the bridge key in step with the real one", () => {
+    // fixtures.ts cannot import this constant: it is pulled into hoisted
+    // vi.mock factories and the import deadlocks the hoist. So it holds a
+    // literal, and this assertion is what stops the two from drifting.
+    expect(shellMock().SESSION_BRIDGE_KEY).toBe(SESSION_BRIDGE_KEY);
+  });
+
+  it("clearAmbient drops session scope without destroying hard pins", () => {
+    // `/pool reset` needs this. With only clearAll() available it would also
+    // wipe a deliberate per-agent pin set through /agents, with no warning.
+    bridge().setAmbient("default", "p/pool");
+    bridge().setOverride("reviewer-adversarial", "p/opus");
+
+    bridge().clearAmbient();
+
+    expect(getStore().ambientOverrideSnapshot().default).toBeNull();
+    expect(getStore().sessionOverrideSnapshot()["reviewer-adversarial"]).toBe("p/opus");
   });
 
   it("setAmbient records an ambient route on the live store", () => {

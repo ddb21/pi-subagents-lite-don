@@ -29,6 +29,7 @@ const {
   mockResolveType,
   mockStoreState,
   mockAgentConfigState,
+  mockRefreshIfChanged,
 } = vi.hoisted(() => ({
   mockValidateWorktreePath: vi.fn(),
   mockSpawn: vi.fn().mockReturnValue("agent-id-123"),
@@ -36,7 +37,9 @@ const {
   mockDiscoverNewAgents: vi.fn(),
   mockResolveSubagentTrust: vi.fn(),
   mockResolveType: vi.fn<(type: string) => TypeResolution>((type) => ({ kind: "resolved", key: type })),
-  mockStoreState: { forceBackground: false },
+  mockStoreState: { forceBackground: false, agentReadAfterRefresh: false },
+  /** Don fork: records the mid-session config refresh so a test can assert it. */
+  mockRefreshIfChanged: vi.fn(() => false),
   // Don fork: the session-key gate reads agent frontmatter, so the config the
   // resolver returns has to be settable per test.
   mockAgentConfigState: {
@@ -103,7 +106,12 @@ vi.mock("../../src/utils.js", () => ({
 
 vi.mock("../../src/shell.js", () => ({
   getStore: () => ({
+    refreshIfChanged: mockRefreshIfChanged,
     get agent() {
+      // Don fork: reading this AFTER refreshIfChanged is the contract. If the
+      // refresh moved below any store read, one spawn would mix two config
+      // generations: a new model with an old defaultMaxTurns.
+      mockStoreState.agentReadAfterRefresh = mockRefreshIfChanged.mock.calls.length > 0;
       return { graceTurns: 5, forceBackground: mockStoreState.forceBackground };
     },
     modelFor(type: string, parentModelId: string, agentConfig?: { model?: string }) {
@@ -844,6 +852,42 @@ describe("executeAgentTool — parent signal forwarding", () => {
     const spawnOptions = mockSpawn.mock.calls[0][4];
     expect(spawnOptions.isBackground).toBe(true);
     expect(spawnOptions.signal).toBeUndefined();
+  });
+});
+
+describe("executeAgentTool — mid-session config refresh", () => {
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStoreState.forceBackground = false;
+    mockStoreState.agentReadAfterRefresh = false;
+    ctx = fakeCtx();
+    mockResolveSubagentTrust.mockReturnValue(true);
+    mockGetRecord.mockReturnValue({
+      id: "agent-id-refresh",
+      result: "done",
+      display: { type: "general-purpose", description: "Test agent" },
+      lifecycle: { status: "completed", startedAt: Date.now() - 10, completedAt: Date.now() },
+      execution: { promise: Promise.resolve("done") },
+      stats: {
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
+        toolUses: 0,
+        compactionCount: 0,
+      },
+    });
+  });
+
+  it("refreshes config before any store read, so one spawn sees one config", async () => {
+    // Without this the tool reads defaultMaxTurns from the pre-refresh config
+    // and the model from the post-refresh config, so a pool switch that also
+    // changes the turn cap applies the new model with the old cap for exactly
+    // one spawn. The call must also be unconditional: guarding it with `?.`
+    // would let a store double silently skip it and pass anyway.
+    await executeAgentTool("tc-refresh", makeParams(), undefined, undefined, ctx);
+
+    expect(mockRefreshIfChanged).toHaveBeenCalled();
+    expect(mockStoreState.agentReadAfterRefresh).toBe(true);
   });
 });
 

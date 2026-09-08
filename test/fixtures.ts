@@ -47,6 +47,11 @@ export interface MockShellStore {
     agentConfig?: { model?: string },
     explicitModel?: string,
   ) => { model: string; thinking?: string };
+  /**
+   * Don fork: mid-session config refresh. Doubles may omit it; withSpawnFor
+   * installs a counting stub so a test can assert the call happened.
+   */
+  refreshIfChanged?: () => boolean;
   modelAliases?: Record<string, string>;
   providerPreference?: string[];
 }
@@ -56,6 +61,13 @@ export interface MockShellStore {
  * The store gained the method; the doubles must not have to restate it.
  */
 export function withSpawnFor(store: MockShellStore): MockShellStore {
+  // refreshIfChanged is required on the real ConfigStore and is called before
+  // any other store read in executeAgentTool. A double that omits it would
+  // throw, so supply a counting default here rather than guarding the call
+  // site with `?.`, which would hide a missing call from every test.
+  if (!store.refreshIfChanged) {
+    store.refreshIfChanged = vi.fn(() => false);
+  }
   if (store.spawnFor) return store;
   return Object.create(store, {
     spawnFor: {
@@ -143,12 +155,17 @@ export function shellMock(fns: ShellMockFns = {}) {
     setPiInstance: (pi: Partial<ExtensionAPI>) => {
       state.pi = pi;
     },
-    // Don fork: the /pool session bridge. Records the publish and exposes the
-    // published object, so a test can assert on it without a real globalThis.
+    // Don fork: the /pool session bridge. Counts publishes so a test can assert
+    // the extension published exactly once, without touching a real globalThis.
+    // The key is a literal, not an import: fixtures.ts is pulled into hoisted
+    // vi.mock factories, and importing src/shell.js here deadlocks that hoist.
+    // test/session-bridge.test.ts asserts this literal matches the real export,
+    // so the two cannot drift silently.
     SESSION_BRIDGE_KEY: "__piSubagentsLiteSession",
     publishSessionBridge: () => {
       state.sessionBridgePublishCount++;
     },
+    getSessionBridgePublishCount: () => state.sessionBridgePublishCount,
     setSessionCtx: (ctx: Partial<ExtensionContext>) => {
       state.sessionCtx = ctx;
     },

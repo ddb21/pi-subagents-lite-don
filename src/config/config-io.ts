@@ -123,10 +123,12 @@ export interface ConfigIO {
   saveProject(config: RawConfig): void;
   /**
    * Don fork: a change stamp over both config layers, for mid-session
-   * external-edit detection. 0 means neither file exists. Optional so an
-   * in-memory test adapter can omit it.
+   * external-edit detection. An empty string means neither file exists.
+   * Compared only for equality, never ordered, so a clock that moves backwards
+   * still registers as a change. Optional so an in-memory test adapter can
+   * omit it.
    */
-  changeStamp?(): number;
+  changeStamp?(): string;
 }
 
 /** Agent keys a project file may set: the model family plus per-type overrides. */
@@ -147,14 +149,23 @@ type ProjectRead = { raw: RawConfig; unknownKeys: string[] } | "malformed" | nul
  * without a project dir the project layer is untrusted and unavailable.
  */
 /**
- * Don fork: modification time of a config file, or 0 when it is absent or
+ * Don fork: change stamp for a config file, or 0 when it is absent or
  * unreadable. Used to notice an external edit without restarting pi.
+ *
+ * Size and inode join the mtime because mtime alone is not enough. APFS keeps
+ * sub-millisecond mtimes, but a 1-second-granularity mount (HFS+, an SMB or
+ * NFS home) gives two writes inside the same second an identical mtime, and
+ * the second edit would never be seen. Size catches a content-length change
+ * and inode catches an atomic replace, both of which a rewrite in place moves.
  */
-export function configMtimeMs(filePath: string): number {
+export function configMtimeMs(filePath: string): string {
   try {
-    return fs.statSync(filePath).mtimeMs;
+    const st = fs.statSync(filePath);
+    // A string, not a number: mtimeMs is about 1.7e12, so packing three fields
+    // into one float would pass Number.MAX_SAFE_INTEGER and silently round.
+    return `${st.mtimeMs}:${st.size}:${st.ino}`;
   } catch {
-    return 0;
+    return "";
   }
 }
 
@@ -201,9 +212,10 @@ export function createConfigIO(projectDir?: string): ConfigIO {
       }
       writeJsonAtomic(projectPath, config);
     },
-    // Don fork: sum both layers so an edit to either is noticed. Summing is
-    // enough because any write moves at least one mtime forward.
-    changeStamp: () => configMtimeMs(CONFIG_PATH) + (projectPath ? configMtimeMs(projectPath) : 0),
+    // Don fork: join both layers so an edit to either is noticed. Joining, not
+    // summing: two numeric stamps can sum to the same total from different
+    // pairs, and a join cannot.
+    changeStamp: () => `${configMtimeMs(CONFIG_PATH)}|${projectPath ? configMtimeMs(projectPath) : ""}`,
   };
 }
 

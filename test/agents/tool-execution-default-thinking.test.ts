@@ -73,6 +73,9 @@ vi.mock("../../src/utils.js", () => ({
 
 vi.mock("../../src/shell.js", () => ({
   getStore: () => ({
+    // Don fork: executeAgentTool refreshes config before any store read, so a
+    // double must carry this. The call site is deliberately unguarded.
+    refreshIfChanged: vi.fn(() => false),
     get agent() {
       return {
         graceTurns: 5,

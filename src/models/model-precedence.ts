@@ -251,13 +251,33 @@ export function resolveSpawn(options: ResolveModelOptions): ResolvedSpawn {
 
   // Cast agent values: index signature includes number (graceTurns), but models are always strings
   const candidates: Array<{ source: ModelSource; model: string | null | undefined; thinking?: ThinkingLevel }> = [
+    // Order IS the routing contract. Three requirements meet here, and taken
+    // literally they form a cycle, so read the resolution before reordering:
+    //
+    //   a. A config per-type pin beats an explicit per-call model. Deliberate
+    //      per-agent routing outranks a caller's argument.
+    //   b. An explicit per-call model beats the ambient session route, so an
+    //      escalation still wins after a /pool switch.
+    //   c. The ambient route must beat the config DEFAULT. Otherwise setting a
+    //      default once through the /agents menu writes agent.default and turns
+    //      every later session-scoped /pool switch into a silent no-op, while
+    //      the bridge still reports the pool model as active.
+    //
+    // a + b + c cannot all hold if config is one tier, so config is split. The
+    // per-type pin keeps its authority above explicit; the generic default
+    // drops below the ambient route.
+    //
+    // KNOWN LIMIT: a config per-type pin still outranks the ambient route, so a
+    // /pool switch does not move an agent that carries its own per-type pin.
+    // That is the cost of requirement (a). It is visible in /agents, unlike the
+    // default case, which was invisible.
     { source: "session-per-type", model: sessionOverrides?.[subagentType] },
     { source: "session-default", model: sessionOverrides?.["default"] },
     { source: "config-per-type", model: config.agent[subagentType] as string | null | undefined },
-    { source: "config-default", model: config.agent["default"] },
     { source: "explicit", model: explicitModel },
     { source: "ambient-per-type", model: ambientOverrides?.[subagentType] },
     { source: "ambient-default", model: ambientOverrides?.["default"] },
+    { source: "config-default", model: config.agent["default"] },
     { source: "model-map-per-type", model: exactTypedEntry?.model, thinking: exactTypedEntry?.thinking },
     { source: "model-map-default", model: exactDefaultEntry?.model, thinking: exactDefaultEntry?.thinking },
     { source: "provider-map-per-type", model: providerTypedEntry?.model, thinking: providerTypedEntry?.thinking },

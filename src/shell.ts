@@ -66,6 +66,8 @@ export interface SessionBridge {
   setAmbient(type: string, spec: string): void;
   setOverride(type: string, spec: string): void;
   clearOverride(type: string): void;
+  /** Drop the ambient route only, keeping hard /agents pins intact. */
+  clearAmbient(): void;
   clearAll(): void;
   list(): Record<string, string>;
 }
@@ -92,6 +94,9 @@ export function publishSessionBridge(): void {
     // Hard per-session pin, as set by the /agents menu. Outranks everything.
     setOverride: (type, spec) => shell.store.mutate.session.setOverride(type, spec),
     clearOverride: (type) => shell.store.mutate.session.clearOverride(type),
+    // `/pool reset` drops session scope. Without this it would have to call
+    // clearAll(), which also destroys deliberate per-agent pins from /agents.
+    clearAmbient: () => shell.store.mutate.session.clearAmbient(),
     clearAll: () => shell.store.mutate.session.clearAll(),
     // Read back what is active, so /pool status can show session scope. A hard
     // pin is listed after the ambient route, so it wins on the same key.

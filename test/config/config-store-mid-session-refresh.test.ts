@@ -18,7 +18,7 @@ function stampedIO(initial: RawConfig = {}): {
   bump(): void;
   loadCount(): number;
 } {
-  const state = { global: initial, stamp: 1, loads: 0 };
+  const state = { global: initial, stamp: "s1", loads: 0, tick: 1 };
   return {
     io: {
       load: () => {
@@ -34,7 +34,7 @@ function stampedIO(initial: RawConfig = {}): {
       changeStamp: () => state.stamp,
     },
     setGlobal: (raw) => void (state.global = raw),
-    bump: () => void (state.stamp++),
+    bump: () => void (state.stamp = `s${++state.tick}`),
     loadCount: () => state.loads,
   };
 }
@@ -74,14 +74,14 @@ describe("ConfigStore.refreshIfChanged", () => {
     expect(loadCount()).toBe(loads);
   });
 
-  it("treats a zero stamp as absent and never refreshes", () => {
+  it("treats an empty stamp as absent and never refreshes", () => {
     // Neither config file exists. There is nothing to pick up, and refreshing
     // would throw away the in-memory defaults for no reason.
     const io: ConfigIO = {
       load: () => ({ global: { agent: { default: "p/x" } }, project: null, projectStatus: "untrusted" }),
       saveGlobal: () => {},
       saveProject: () => {},
-      changeStamp: () => 0,
+      changeStamp: () => "",
     };
     expect(new ConfigStore(io).refreshIfChanged()).toBe(false);
   });
@@ -110,16 +110,65 @@ describe("ConfigStore.refreshIfChanged", () => {
     expect(store.modelFor("executor", "p/parent")).toBe("p/pinned");
   });
 
-  it("keeps an ambient route across an external edit", () => {
+  it("keeps an ambient route EFFECTIVE across an external edit", () => {
+    // Asserting the snapshot alone is not enough: a stored route that no longer
+    // routes still passes that check. Edit the one key that collides, the
+    // config default model, and assert resolution.
     const { io, setGlobal, bump } = stampedIO({});
     const store = new ConfigStore(io);
     store.mutate.session.setAmbient("default", "p/ambient");
 
-    setGlobal({ agent: { defaultMaxTurns: 7 } });
+    setGlobal({ agent: { default: "p/new" } });
     bump();
     store.refreshIfChanged();
 
     expect(store.ambientOverrideSnapshot().default).toBe("p/ambient");
+    expect(store.modelFor("executor", "p/parent")).toBe("p/ambient");
+  });
+
+  it("does not commit the stamp when the file is being rewritten", () => {
+    // A writer that truncates before writing moves mtime at truncate time, so a
+    // stat in that window reads an empty file and the loader returns {}. If the
+    // stamp were committed first, that empty config would stick for the whole
+    // session. Simulate it: the stamp moves again between the load and the
+    // post-load re-stat.
+    const state = { stamp: "s1", loads: 0, global: {} as RawConfig, tearNext: false };
+    const io: ConfigIO = {
+      load: () => {
+        state.loads++;
+        if (state.tearNext) {
+          // The writer finishes mid-read: mtime moves again, and what we just
+          // read was the truncated file, which the loader turns into {}.
+          state.tearNext = false;
+          state.stamp = "s3";
+          return { global: {}, project: null, projectStatus: "untrusted" as ProjectLayerStatus };
+        }
+        return {
+          global: structuredClone(state.global),
+          project: null,
+          projectStatus: "untrusted" as ProjectLayerStatus,
+        };
+      },
+      saveGlobal: () => {},
+      saveProject: () => {},
+      changeStamp: () => state.stamp,
+    };
+    const store = new ConfigStore(io);
+
+    // A pool switch truncates the file. mtime moves before the content lands.
+    state.stamp = "s2";
+    state.tearNext = true;
+
+    // The torn read is refused and the stamp is NOT committed.
+    expect(store.refreshIfChanged()).toBe(false);
+    expect(state.loads).toBe(2);
+
+    // The writer has finished. The next call retries and applies the real file,
+    // which is the whole point of not committing the stamp early.
+    state.global = { agent: { default: "p/new" } };
+    expect(store.refreshIfChanged()).toBe(true);
+    expect(state.loads).toBe(3);
+    expect(store.modelFor("executor", "p/parent")).toBe("p/new");
   });
 
   it("re-syncs dependents so a widget sees the new config", () => {
@@ -144,6 +193,58 @@ describe("ConfigStore ambient overrides", () => {
     const s = store();
     s.mutate.session.setAmbient("default", "p/pool");
     expect(s.modelFor("executor", "p/parent")).toBe("p/pool");
+  });
+
+  it("beats a config default model", () => {
+    // The property that makes /pool session scope work at all. Once any model
+    // is set through the /agents menu, agent.default is written to the global
+    // config file. If config outranked ambient, every session-scoped pool
+    // switch would become a silent no-op from that moment on.
+    const s = new ConfigStore(stampedIO({ agent: { default: "p/config" } }).io);
+    s.mutate.session.setAmbient("default", "p/pool");
+    expect(s.modelFor("executor", "p/parent")).toBe("p/pool");
+  });
+
+  it("LOSES to a config per-type pin, the documented limit", () => {
+    // Not the same as the default case. A per-type pin is a deliberate, visible
+    // per-agent choice and it also outranks an explicit per-call model, so it
+    // cannot sit below the ambient route without breaking escalation. A /pool
+    // switch therefore does not move an agent that carries its own pin.
+    const s = new ConfigStore(stampedIO({ agent: { executor: "p/config-exec" } }).io);
+    s.mutate.session.setAmbient("default", "p/pool");
+    expect(s.modelFor("executor", "p/parent")).toBe("p/config-exec");
+    // An agent without a pin still moves with the pool.
+    expect(s.modelFor("writer", "p/parent")).toBe("p/pool");
+  });
+
+  it("loses to an explicit model even when config also sets one", () => {
+    const s = new ConfigStore(stampedIO({ agent: { default: "p/config" } }).io);
+    s.mutate.session.setAmbient("default", "p/pool");
+    expect(s.spawnFor("executor", "p/parent", undefined, "p/escalated").model).toBe("p/escalated");
+  });
+
+  it("reports the ambient route as session-layer state", () => {
+    // The /agents menu reads these. If they ignored ambient, a user could clear
+    // "all session overrides", see an empty session layer, and still be routed
+    // by the pool with nothing on screen explaining it.
+    const s = store();
+    s.mutate.session.setAmbient("executor", "p/pool-exec");
+    expect(s.hasSessionModelSettings).toBe(true);
+    expect(s.sessionModelOverride("executor")).toBe("p/pool-exec");
+  });
+
+  it("clearModelOverride drops the ambient route for that type", () => {
+    const s = store();
+    s.mutate.session.setAmbient("executor", "p/pool-exec");
+    s.mutate.agent.clearModelOverride("executor", "session");
+    expect(s.modelFor("executor", "p/parent")).toBe("p/parent");
+  });
+
+  it("clearAllModelOverrides drops ambient routes too", () => {
+    const s = store();
+    s.mutate.session.setAmbient("default", "p/pool");
+    s.mutate.agent.clearAllModelOverrides("session");
+    expect(s.modelFor("executor", "p/parent")).toBe("p/parent");
   });
 
   it("prefers a per-type ambient route over the ambient default", () => {

@@ -158,7 +158,7 @@ export class ConfigStore {
    */
   private ambientOverrides: SessionModelOverrides = { default: null };
   /** Don fork: last seen config change stamp, for external-edit detection. */
-  private lastChangeStamp = 0;
+  private lastChangeStamp = "";
   private sessionConcurrencyLayer: RawConcurrency = {};
   private sessionShowCost: boolean | undefined;
   private widget?: AgentWidget;
@@ -173,7 +173,7 @@ export class ConfigStore {
     this.projectRaw = loaded.project;
     this.projectStatus = loaded.projectStatus;
     this.config = mergeDefaults(mergeLayers(this.globalRaw, this.projectRaw));
-    this.lastChangeStamp = this.io.changeStamp?.() ?? 0;
+    this.lastChangeStamp = this.io.changeStamp?.() ?? "";
   }
 
   /**
@@ -192,10 +192,18 @@ export class ConfigStore {
    * @returns true when the config was re-read.
    */
   refreshIfChanged(): boolean {
-    const stamp = this.io.changeStamp?.() ?? 0;
-    if (stamp === 0 || stamp === this.lastChangeStamp) return false;
-    this.lastChangeStamp = stamp;
+    const stamp = this.io.changeStamp?.() ?? "";
+    if (stamp === "" || stamp === this.lastChangeStamp) return false;
     const loaded = this.io.load();
+    // Do NOT commit the stamp before the load. A writer that truncates before
+    // it writes (cp.write_text in pi-pool.py does exactly this) moves mtime at
+    // truncate time, so a stat landing in that window reads an empty file. The
+    // loader swallows parse errors and returns {}, so committing the stamp
+    // first would apply that empty config and never re-read it for the rest of
+    // the session. Re-stat instead: a moved stamp means the write is still in
+    // flight, so drop this read and retry on the next call.
+    if ((this.io.changeStamp?.() ?? "") !== stamp) return false;
+    this.lastChangeStamp = stamp;
     this.globalRaw = loaded.global;
     this.projectRaw = loaded.project;
     this.projectStatus = loaded.projectStatus;
@@ -292,7 +300,10 @@ export class ConfigStore {
   }
 
   sessionModelOverride(type: string): string | null {
-    return this.sessionOverrides[type] ?? null;
+    // Fold in the ambient route. A /pool session scope is session-layer state,
+    // so the /agents menu must show it; otherwise a user clears "all session
+    // overrides", sees an empty session layer, and still gets pool routing.
+    return this.sessionOverrides[type] ?? this.ambientOverrides[type] ?? null;
   }
 
   /** Whether the global agent layer carries this key (provenance from layer membership). */
@@ -307,7 +318,10 @@ export class ConfigStore {
 
   /** Whether the session layer carries a default model or any per-type override. */
   get hasSessionModelSettings(): boolean {
-    return sessionOverridesHasModelSettings(this.sessionOverrides);
+    return (
+      sessionOverridesHasModelSettings(this.sessionOverrides) ||
+      sessionOverridesHasModelSettings(this.ambientOverrides)
+    );
   }
 
   /** Whether the global agent layer carries a model setting (model family or per-type key). */
@@ -428,6 +442,9 @@ export class ConfigStore {
           target,
           () => {
             delete this.sessionOverrides[type];
+            // The ambient route is session-layer state too. Leaving it behind
+            // would keep routing this type after the user cleared the session.
+            delete this.ambientOverrides[type];
           },
           (layer) => {
             if (layer.agent) delete layer.agent[type];
@@ -440,6 +457,7 @@ export class ConfigStore {
           target,
           () => {
             this.sessionOverrides = { default: null };
+            this.ambientOverrides = { default: null };
           },
           (layer) => this.clearAgentModelKeys(layer),
         );

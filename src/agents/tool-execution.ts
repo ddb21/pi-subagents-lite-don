@@ -273,6 +273,15 @@ export async function executeAgentTool(
   _onUpdate: ((update: any) => void) | undefined,
   ctx: ExtensionContext,
 ): Promise<any> {
+  // Don fork: pick up an external config edit (a pool-profile switch) before
+  // ANY store read, so a switch made mid-session routes the very next
+  // delegation instead of waiting for the next session_start. This must be the
+  // first store touch in the function: reading defaultMaxTurns before the
+  // refresh and the model after it would mix two config generations in one
+  // spawn. The method is synchronous and Node is single-threaded, so no read
+  // below can tear against it.
+  getStore().refreshIfChanged();
+
   /** Don fork: spawn-time notes surfaced to the caller alongside the result. */
   const normalizationWarnings: string[] = [];
   // Don fork: capture lineage before a queued spawn can outlive this session.
@@ -373,10 +382,6 @@ export async function executeAgentTool(
     getAgentConfig(resolvedType)?.maxTurns ??
     getStore().agent.defaultMaxTurns;
 
-  // Don fork: pick up an external config edit (a pool-profile switch) before
-  // resolving the model, so a switch made mid-session routes the very next
-  // delegation instead of waiting for the next session_start.
-  getStore().refreshIfChanged?.();
   const modelStr = params.model as string | undefined;
   // Don fork: resolve the full precedence chain here rather than trusting the
   // tool_call listener. The listener does not fire in one-shot (`pi -p`) runs,

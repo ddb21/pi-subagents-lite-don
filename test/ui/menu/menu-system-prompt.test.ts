@@ -2,11 +2,32 @@
  * menu-system-prompt.test.ts — Tests for showSystemPromptMenu.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import type { Component, SettingItem, SettingsListTheme } from "@earendil-works/pi-tui";
 import { mockModules, resetConfig } from "../../menu-mock-setup.js";
-import { createMockCtx } from "../../menu-test-helpers.js";
+import { createMockCtx as createBaseMockCtx, type ComponentFactory } from "../../menu-test-helpers.js";
+
+function createMockCtx() {
+  return createBaseMockCtx([], [], [], {
+    ui: {
+      custom: vi.fn(async (factory: ComponentFactory) => {
+        let closed = false;
+        const component = await factory(
+          { terminal: { rows: 40 } },
+          { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+          null,
+          () => { closed = true; },
+        );
+        // Close the menu through its real cancellation callback.
+        void component;
+        settingsListCalls.at(-1)?.onCancel();
+        expect(closed).toBe(true);
+        return undefined;
+      }),
+    },
+  });
+}
 
 // Capture SettingsList constructor calls from pi-tui
 let settingsListCalls: Array<{
@@ -79,6 +100,12 @@ vi.mock("@earendil-works/pi-tui", async () => {
     },
   };
 });
+
+let showSystemPromptMenu: typeof import("../../../src/ui/menu/menu-system-prompt.js").showSystemPromptMenu;
+
+beforeAll(async () => {
+  ({ showSystemPromptMenu } = await import("../../../src/ui/menu/menu-system-prompt.js"));
+}, 60_000);
 
 beforeEach(() => {
   settingsListCalls = [];

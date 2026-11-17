@@ -193,7 +193,8 @@ MIT
 
 Each subagent run emits `session_shutdown` with `reason: "quit"` before it disposes its session.
 This includes completion, failure, stop, and parent shutdown. Teardown runs once per session.
-A 1-second timeout prevents a stalled extension handler from blocking completion.
+Shutdown handlers start independently so a stalled handler cannot block the other handlers.
+One 1-second timeout bounds the whole teardown before session disposal.
 
 Finished records retain their transcript for the conversation viewer. A steer of a finished agent
 creates a fresh session over the same transcript and reloads its extensions. Each continuation

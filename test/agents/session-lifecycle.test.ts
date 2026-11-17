@@ -14,6 +14,9 @@ const state = vi.hoisted(() => ({
   shutdowns: 0,
   resources: 0,
   behavior: "normal" as "normal" | "throw" | "hang",
+  firstBehavior: "normal" as "normal" | "throw" | "hang",
+  firstCalls: 0,
+  releaseFirst: undefined as (() => void) | undefined,
 }));
 
 // Use real SDK sessions and real extension factories, without user resources or a provider request.
@@ -29,6 +32,16 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
           noExtensions: true,
           noSkills: true,
           extensionFactories: [
+            (pi: ExtensionAPI) => {
+              pi.on("session_shutdown", () => {
+                state.firstCalls++;
+                if (state.firstBehavior === "throw") throw new Error("first extension failed");
+                if (state.firstBehavior === "hang")
+                  return new Promise<void>((resolve) => {
+                    state.releaseFirst = resolve;
+                  });
+              });
+            },
             (pi: ExtensionAPI) => {
               let resource: ReturnType<typeof setInterval> | undefined;
               pi.on("session_start", (event) => {
@@ -82,6 +95,9 @@ beforeEach(() => {
   state.starts = state.shutdowns = state.resources = 0;
   state.reasons = [];
   state.behavior = "normal";
+  state.firstBehavior = "normal";
+  state.firstCalls = 0;
+  state.releaseFirst = undefined;
   manager = new AgentManager();
   dispose = vi.spyOn(AgentSession.prototype, "dispose");
   prompt = vi.spyOn(AgentSession.prototype, "prompt").mockImplementation(async function (this: AgentSession, text) {
@@ -226,6 +242,34 @@ describe("subagent extension lifecycle (real createAgentSession)", () => {
     await gate(id);
     expect(manager.getRecord(id)!.lifecycle.status).toBe("completed");
     expect([state.starts, state.shutdowns, state.resources]).toEqual([1, 1, 0]);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["hang", "throw"] as const)(
+    "releases the second extension when the first handler will %s",
+    async (behavior) => {
+      state.firstBehavior = behavior;
+      const id = spawn();
+      await vi.waitFor(() => expect(state.shutdowns).toBe(1));
+      expect(state.resources).toBe(0);
+      if (behavior === "hang") expect(dispose).not.toHaveBeenCalled();
+      await gate(id);
+      expect(state.firstCalls).toBe(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      await manager.dispose();
+      expect(state.shutdowns).toBe(1);
+    },
+  );
+
+  it("does not invoke another handler after a timed-out handler resolves late", async () => {
+    state.firstBehavior = "hang";
+    const id = spawn();
+    await gate(id);
+    expect([state.firstCalls, state.shutdowns, state.resources]).toEqual([1, 1, 0]);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    state.releaseFirst!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect([state.firstCalls, state.shutdowns, state.resources]).toEqual([1, 1, 0]);
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 

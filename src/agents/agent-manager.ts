@@ -7,6 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { continueAgentSession, runAgent, type RunResult } from "./agent-runner.js";
+import { isAgentSessionShutdown, shutdownAgentSession } from "./session-lifecycle.js";
 import { AgentOutputLog } from "./output-file.js";
 import { Watchdog } from "./watchdog.js";
 import { getStore } from "../shell.js";
@@ -95,6 +96,8 @@ export interface SpawnOptions extends SpawnConfig, RunCallbacks {
 }
 
 export class AgentManager {
+  private disposed = false;
+  private restarting = new WeakSet<AgentRecord>();
   private agents = new Map<string, AgentRecord>();
   private watchdog = new Watchdog();
   private watchdogInterval: ReturnType<typeof setInterval>;
@@ -414,6 +417,7 @@ export class AgentManager {
       }),
       onSessionCreated: (session) => {
         record.execution.session = session;
+        if (this.disposed) void shutdownAgentSession(session);
         // Don fork: capture the real transcript path once it exists, so a
         // second spawn on the same key sees a busy file, not just a busy key.
         const sessionFile = session.sessionManager?.getSessionFile?.();
@@ -487,7 +491,10 @@ export class AgentManager {
         record.lifecycle.completedAt ??= Date.now();
         return "";
       })
-      .finally(() => {
+      .finally(async () => {
+        // Retain the transcript for viewers, but retire all extension resources.
+        if (record.execution.session) await shutdownAgentSession(record.execution.session);
+        this.restarting.delete(record);
         // Count this settlement before notifying, so the completion callback
         // can tell a continuation settlement (>= 2) from the first one.
         record.execution.settlementCount++;
@@ -654,12 +661,14 @@ export class AgentManager {
     if (!record) return false;
 
     if (record.lifecycle.status === "running") {
-      if (!record.execution.session) {
+      if (!record.execution.session || this.restarting.has(record)) {
         if (!record.execution.pendingSteers) record.execution.pendingSteers = [];
         record.execution.pendingSteers.push(message);
         return true;
       }
 
+      // A prompt can finish before extension teardown and the terminal transition.
+      if (isAgentSessionShutdown(record.execution.session)) return false;
       try {
         await record.execution.session.steer(message);
         return true;
@@ -711,10 +720,20 @@ export class AgentManager {
     this.watchdog.start(record.id);
 
     const previousTurns = record.stats.turnCount ?? 0;
+    this.restarting.add(record);
     const promise = continueAgentSession(session, message, {
       ...this.runTrackingCallbacks(record, record.execution.liveViewCallbacks, (turnCount) => {
         record.stats.turnCount = previousTurns + turnCount;
       }),
+      onSessionCreated: (nextSession) => {
+        record.execution.session = nextSession;
+        this.restarting.delete(record);
+        if (this.disposed) void shutdownAgentSession(nextSession);
+        for (const pending of record.execution.pendingSteers ?? []) {
+          void nextSession.steer(pending).catch(() => {});
+        }
+        record.execution.pendingSteers = undefined;
+      },
       maxTurns: record.stats.maxTurns,
       graceTurns: getStore().agent.graceTurns ?? DEFAULT_GRACE_TURNS,
       signal: abortController.signal,
@@ -779,7 +798,7 @@ export class AgentManager {
   }
 
   private removeRecord(id: string, record: AgentRecord): void {
-    record.execution.session?.dispose();
+    if (record.execution.session) void shutdownAgentSession(record.execution.session);
     record.execution.session = undefined;
     this.detachParentBinding(record);
     // A stopped record's run can still be settling (stopAgent flips status
@@ -802,7 +821,9 @@ export class AgentManager {
     }
   }
 
-  dispose() {
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    const shutdowns: Promise<void>[] = [];
     clearInterval(this.watchdogInterval);
     this.queue = [];
     for (const record of this.agents.values()) {
@@ -814,11 +835,13 @@ export class AgentManager {
         record.lifecycle.completedAt = Date.now();
         this.openGate(record.id, "");
       }
-      record.execution.session?.dispose();
+      record.execution.abortController?.abort();
+      if (record.execution.session) shutdowns.push(shutdownAgentSession(record.execution.session));
       this.detachParentBinding(record);
     }
     // Running records' gates open when their runs settle after this synchronous
     // pass — keep their resolvers so .finally can still resolve (no dangling gate).
     this.agents.clear();
+    await Promise.all(shutdowns);
   }
 }

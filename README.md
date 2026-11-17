@@ -188,3 +188,15 @@ Output transcripts are disabled by default. Enable them globally via the `output
 ## License
 
 MIT
+
+### Subagent extension resources
+
+Each subagent run emits `session_shutdown` with `reason: "quit"` before it disposes its session.
+This includes completion, failure, stop, and parent shutdown. Teardown runs once per session.
+A 1-second timeout prevents a stalled extension handler from blocking completion.
+
+Finished records retain their transcript for the conversation viewer. A steer of a finished agent
+creates a fresh session over the same transcript and reloads its extensions. Each continuation
+therefore has its own `session_start` with `reason: "resume"` and `session_shutdown` with
+`reason: "quit"`. Model and thinking settings carry forward; extensions must restore any other
+state from the transcript or their own storage.

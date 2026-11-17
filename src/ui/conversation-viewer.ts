@@ -98,7 +98,11 @@ export class ConversationViewer implements Component {
   ) {
     this.thinkingVisible = !getHideThinkingBlock();
     this.keys = createViewerKeys(keybindings);
-    this.unsubscribe = session.subscribe((event) => {
+    this.bindSession();
+  }
+
+  private bindSession(): void {
+    this.unsubscribe = this.session.subscribe((event) => {
       try {
         if (this.closed) return;
         if (event?.type === "message_update") {
@@ -232,6 +236,15 @@ export class ConversationViewer implements Component {
 
   render(width: number): string[] {
     if (this.closed) return []; // closing — framework may still call render after done()
+    const currentSession = this.record.execution.session;
+    if (currentSession && currentSession !== this.session) {
+      this.unsubscribe?.();
+      this.session = currentSession;
+      this.streamingThinking = "";
+      this.streamingText = "";
+      this.invalidate();
+      this.bindSession();
+    }
     if (width < 6) return []; // too narrow for any meaningful rendering
     const th = this.theme;
     const innerW = width - 4; // border + padding

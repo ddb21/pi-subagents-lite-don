@@ -212,6 +212,24 @@ describe("ConversationViewer", () => {
       expect(session.subscribe).toHaveBeenCalledTimes(1);
     });
 
+    it("follows a replacement session after continuation", () => {
+      const unsubscribe = vi.fn();
+      mockSubscribe.mockReturnValue(unsubscribe);
+      const session = makeMockSession([{ role: "user", content: "first turn" }]);
+      const record = makeMockRecord({ execution: { settled: true, settlementCount: 1, session } });
+      const viewer = new ConversationViewer(makeTui(), session, record, noopTheme, vi.fn());
+      expect(viewer.render(80).join("\n")).toContain("first turn");
+      const subscribe = vi.fn(() => () => {});
+      record.execution.session = asAgentSession({
+        messages: [{ role: "user", content: "second turn" }],
+        subscribe,
+      });
+      expect(viewer.render(80).join("\n")).toContain("second turn");
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+      expect(subscribe).toHaveBeenCalledTimes(1);
+      viewer.dispose();
+    });
+
     it("requests render on session events", () => {
       vi.useFakeTimers();
       let subscriber: (event?: unknown) => void;

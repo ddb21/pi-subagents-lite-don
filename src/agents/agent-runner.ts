@@ -38,7 +38,12 @@ import { getStore, enterSubagentSpawn, exitSubagentSpawn } from "../shell.js";
 import { DEFAULT_GRACE_TURNS, CUSTOM_PROMPT_PATH } from "../config/config-io.js";
 import { patchRetryClassifier } from "./stream-retry.js";
 import { getSubagentSessionDir, recordSessionKey, sanitizeDanglingToolCalls } from "./persistent-executor.js";
+import { isAgentSessionShutdown, shutdownAgentSession } from "./session-lifecycle.js";
 import { applyOutputLimit, resolveOutputLimit } from "./max-tokens-field.js";
+
+// A disposed session remains a transcript snapshot. Continuations get a fresh runtime
+// and extension factories, with the same SessionManager (also works in memory).
+const sessionRestarters = new WeakMap<AgentSession, (options: SessionPromptOptions) => Promise<AgentSession>>();
 
 // Cache: extension path → unscoped package name (lowercased), or undefined if not found
 const packageNameCache = new Map<string, string | undefined>();
@@ -611,6 +616,7 @@ async function initSession(
   extToolMap: Map<string, string[]>,
   settingsManager: SettingsManager,
   defaultTools: string[] | undefined,
+  sessionManager?: SessionManager,
 ): Promise<AgentSession> {
   const model = options.model ?? findModelInRegistry(agentConfig?.model, ctx.modelRegistry, ctx.model);
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinkingLevel;
@@ -618,7 +624,8 @@ async function initSession(
   const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd,
     agentDir,
-    sessionManager: resolveSessionManager(ctx, options, cwd, agentDir),
+    sessionManager: sessionManager ?? resolveSessionManager(ctx, options, cwd, agentDir),
+    ...(sessionManager ? { sessionStartEvent: { type: "session_start" as const, reason: "resume" as const } } : {}),
     settingsManager,
     model,
     tools: resolveSessionAllowedTools({
@@ -673,6 +680,7 @@ async function createAndConfigureSession(
   settingsManager: SettingsManager,
   defaultTools: string[] | undefined,
   notify: (msg: string) => void,
+  sessionManager?: SessionManager,
 ): Promise<AgentSession> {
   const session = await initSession(
     ctx,
@@ -684,27 +692,57 @@ async function createAndConfigureSession(
     extToolMap,
     settingsManager,
     defaultTools,
+    sessionManager,
   );
-  const baseName = agentConfig?.name ?? type;
-  session.setSessionName(options.agentId ? `${baseName}#${options.agentId.slice(0, SHORT_ID_LENGTH)}` : baseName);
-  await session.bindExtensions({
-    onError: (err) =>
-      options.onToolActivity?.({
-        type: "end",
-        toolName: `extension-error:${err.extensionPath}`,
-      }),
-  });
+  try {
+    const baseName = agentConfig?.name ?? type;
+    session.setSessionName(options.agentId ? `${baseName}#${options.agentId.slice(0, SHORT_ID_LENGTH)}` : baseName);
+    await session.bindExtensions({
+      onError: (err) =>
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:${err.extensionPath}`,
+        }),
+    });
 
-  const filteredTools = resolveVisibleTools({
-    activeTools: session.getActiveToolNames(),
-    tools: agentConfig?.tools,
-    excludeTools: agentConfig?.excludeTools,
-    extToolMap,
-    notify,
-  });
-  if (filteredTools) session.setActiveToolsByName(filteredTools);
-  options.onSessionCreated?.(session);
-  return session;
+    const filteredTools = resolveVisibleTools({
+      activeTools: session.getActiveToolNames(),
+      tools: agentConfig?.tools,
+      excludeTools: agentConfig?.excludeTools,
+      extToolMap,
+      notify,
+    });
+    if (filteredTools) session.setActiveToolsByName(filteredTools);
+    sessionRestarters.set(session, async (continuation) => {
+      await loader.reload();
+      const nextToolMap = buildExtToolMap(loader.getExtensions().extensions);
+      return createAndConfigureSession(
+        ctx,
+        {
+          ...options,
+          ...continuation,
+          signal: continuation.signal,
+          model: session.model,
+          thinkingLevel: session.thinkingLevel,
+        },
+        agentConfig,
+        type,
+        cwd,
+        loader,
+        nextToolMap,
+        settingsManager,
+        defaultTools,
+        notify,
+        session.sessionManager,
+      );
+    });
+    options.onSessionCreated?.(session);
+    if (options.signal?.aborted) throw new Error("Subagent stopped before session setup completed");
+    return session;
+  } catch (error) {
+    await shutdownAgentSession(session);
+    throw error;
+  }
 }
 function wireTurnTracking(session: AgentSession, options: Pick<RunOptions, "maxTurns" | "graceTurns" | "onTurnEnd">) {
   let turnCount = 0;
@@ -784,21 +822,31 @@ async function runSessionPrompt(
 }
 
 /**
- * Prompt an existing session after its original run settled (the fork's
- * continueAgentSession() shape).
- *
- * Unlike runAgent, the session already exists: onSessionCreated is never
- * called, and there is no session setup (model resolution, resource loader,
- * tool filtering). The result keeps the runAgent shape (including
- * modelError) so the manager classifies the continuation exactly like the
- * first run.
+ * Continue a subagent transcript after its original run settled.
+ * Retired sessions keep their messages for viewers. Reload extension factories
+ * and create a fresh session over the same SessionManager before the next prompt.
+ * Notify onSessionCreated so the manager and viewers follow the new session.
  */
 export async function continueAgentSession(
   session: AgentSession,
   prompt: string,
   options: SessionPromptOptions = {},
 ): Promise<RunResult> {
-  return runSessionPrompt(session, prompt, options);
+  if (isAgentSessionShutdown(session)) {
+    const restart = sessionRestarters.get(session);
+    if (!restart) throw new Error("Cannot restart this disposed subagent session");
+    enterSubagentSpawn();
+    try {
+      session = await restart(options);
+    } finally {
+      exitSubagentSpawn();
+    }
+  }
+  try {
+    return await runSessionPrompt(session, prompt, options);
+  } finally {
+    await shutdownAgentSession(session);
+  }
 }
 
 // ── main entry ─────────────────────────────────────────────────────
@@ -884,10 +932,15 @@ async function runAgentImpl(
     defaultTools,
     bufferNotify,
   );
-  const result = await runSessionPrompt(session, prompt, {
-    ...options,
-    maxTurns: options.maxTurns ?? agentConfig?.maxTurns,
-  });
+  let result: RunResult;
+  try {
+    result = await runSessionPrompt(session, prompt, {
+      ...options,
+      maxTurns: options.maxTurns ?? agentConfig?.maxTurns,
+    });
+  } finally {
+    await shutdownAgentSession(session);
+  }
 
   // Flush buffered warnings now that tool_result is in the session tree.
   for (const msg of warnings) {
